@@ -1,0 +1,24 @@
+# Environment & Keys
+.env
+venv/
+
+# Cache & Temporary Files
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Local Scripts & Data Files
+run-claude.sh
+pathfinder_dashboard.xlsx
+
+# Personal Resume
+profile/
+
+# Runtime Output
+jd_cache/
+tailored_resumes/
+archive/
