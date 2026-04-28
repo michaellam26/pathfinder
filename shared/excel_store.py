@@ -751,9 +751,19 @@ def batch_upsert_match_records(xlsx_path: str, records: list) -> int:
 
 
 # ── Tailored match helpers ───────────────────────────────────────────────────
-def get_scored_matches(xlsx_path: str = EXCEL_PATH) -> list:
-    """Return all match records with score >= 0.
-    Returns list of dicts: {resume_id, jd_url, score, stage, resume_hash}."""
+def get_scored_matches(xlsx_path: str = EXCEL_PATH,
+                       stage: str | None = "fine") -> list:
+    """Return match records from Match_Results.
+
+    By default only returns Stage 2 ('fine') Gemini-scored rows. Stage 1
+    ('coarse') heuristic scores are excluded because they are not
+    comparable to the tailored re-score (which always uses the fine prompt);
+    mixing them produces systemically inflated improvement deltas in
+    Tailored_Match_Results.
+
+    Pass stage=None to include all stages (used by tests / migration).
+    Returns list of dicts: {resume_id, jd_url, score, stage, resume_hash}.
+    """
     wb = load_workbook(xlsx_path, read_only=True)
     try:
         ws = wb["Match_Results"]
@@ -763,15 +773,18 @@ def get_scored_matches(xlsx_path: str = EXCEL_PATH) -> list:
             url   = ws.cell(r, 2).value
             score = ws.cell(r, 3).value or 0
             rhash = (ws.cell(r, 8).value or "") if ws.max_column >= 8 else ""
-            stage = (ws.cell(r, 9).value or "fine") if ws.max_column >= 9 else "fine"
-            if rid and url and isinstance(score, (int, float)) and int(score) >= 0:
-                results.append({
-                    "resume_id": str(rid),
-                    "jd_url": str(url),
-                    "score": int(score),
-                    "stage": str(stage),
-                    "resume_hash": str(rhash),
-                })
+            row_stage = (ws.cell(r, 9).value or "fine") if ws.max_column >= 9 else "fine"
+            if not (rid and url and isinstance(score, (int, float)) and int(score) >= 0):
+                continue
+            if stage is not None and str(row_stage) != stage:
+                continue
+            results.append({
+                "resume_id": str(rid),
+                "jd_url": str(url),
+                "score": int(score),
+                "stage": str(row_stage),
+                "resume_hash": str(rhash),
+            })
         return results
     finally:
         wb.close()

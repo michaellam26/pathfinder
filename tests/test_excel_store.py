@@ -898,16 +898,32 @@ class TestGetScoredMatches(unittest.TestCase):
         results = get_scored_matches(self.path)
         self.assertEqual(results, [])
 
-    def test_returns_non_negative_scores(self):
+    def test_default_returns_only_fine_stage(self):
+        """P0-6: by default get_scored_matches returns only Stage 2 'fine' rows.
+        Stage 1 'coarse' heuristic scores are excluded so they never enter
+        the tailored-resume score-delta computation."""
         upsert_match_record(self.path, "r1", "https://a.com/1", self._match_json(80), "h1", "fine")
         upsert_match_record(self.path, "r1", "https://a.com/2", self._match_json(0), "h1", "coarse")
         upsert_match_record(self.path, "r1", "https://a.com/3", self._match_json(45), "h1", "coarse")
         results = get_scored_matches(self.path)
         urls = [r["jd_url"] for r in results]
-        self.assertIn("https://a.com/1", urls)
-        self.assertIn("https://a.com/2", urls)
-        self.assertIn("https://a.com/3", urls)
-        self.assertEqual(len(urls), 3)
+        self.assertEqual(urls, ["https://a.com/1"])
+        self.assertEqual(results[0]["stage"], "fine")
+
+    def test_stage_none_returns_all_stages(self):
+        """P0-6: stage=None disables the filter (used by tests / migrations)."""
+        upsert_match_record(self.path, "r1", "https://a.com/1", self._match_json(80), "h1", "fine")
+        upsert_match_record(self.path, "r1", "https://a.com/2", self._match_json(45), "h1", "coarse")
+        results = get_scored_matches(self.path, stage=None)
+        urls = sorted(r["jd_url"] for r in results)
+        self.assertEqual(urls, ["https://a.com/1", "https://a.com/2"])
+
+    def test_explicit_stage_coarse_returns_only_coarse(self):
+        upsert_match_record(self.path, "r1", "https://a.com/1", self._match_json(80), "h1", "fine")
+        upsert_match_record(self.path, "r1", "https://a.com/2", self._match_json(45), "h1", "coarse")
+        results = get_scored_matches(self.path, stage="coarse")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["jd_url"], "https://a.com/2")
 
     def test_returns_correct_fields(self):
         upsert_match_record(self.path, "r1", "https://a.com/1", self._match_json(70), "hash1", "fine")
