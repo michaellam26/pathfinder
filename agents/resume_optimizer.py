@@ -19,7 +19,6 @@ import asyncio
 import logging
 import math
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
@@ -32,6 +31,15 @@ from shared.excel_store import (
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL
+from shared.prompts import (
+    FINE_SYSTEM_PROMPT, BATCH_FINE_SYSTEM_PROMPT,
+    TAILOR_SYSTEM_PROMPT, BATCH_TAILOR_SYSTEM_PROMPT,
+)
+from shared.schemas import (
+    MatchResult, TailoredResume,
+    BatchTailoredItem, BatchTailoredResult,
+    BatchMatchItem, BatchMatchResult,
+)
 
 # BUG-41: single shared limiter for all Gemini calls
 _GEMINI_LIMITER = _RateLimiter(rpm=13)
@@ -51,96 +59,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 _KEY_POOL: "_GeminiKeyPool | None" = None
 
 
-# ── Pydantic schemas ─────────────────────────────────────────────────────────
-class TailoredResume(BaseModel):
-    tailored_resume_markdown: str = Field(description="Complete tailored resume in Markdown.")
-    optimization_summary: str = Field(description="3-5 key changes made and which JD requirements they target.")
-
-
-class MatchResult(BaseModel):
-    compatibility_score:   int       = Field(description="0–100 fit score.")
-    key_strengths:         list[str]
-    critical_gaps:         list[str]
-    recommendation_reason: str       = Field(description="Specific, weighted analysis per criteria.")
-
-
-# ── Batch schemas ───────────────────────────────────────────────────────────
-class BatchTailoredItem(BaseModel):
-    index: int = Field(description="0-based index of the JD in the batch.")
-    tailored_resume_markdown: str = Field(description="Complete tailored resume in Markdown.")
-    optimization_summary: str = Field(description="3-5 key changes made and which JD requirements they target.")
-
-
-class BatchTailoredResult(BaseModel):
-    items: list[BatchTailoredItem] = Field(description="One entry per JD in the batch.")
-
-
-class BatchMatchItem(BaseModel):
-    index: int = Field(description="0-based index of the (resume, JD) pair in the batch.")
-    compatibility_score: int = Field(description="0-100 fit score.")
-    key_strengths: list[str]
-    critical_gaps: list[str]
-    recommendation_reason: str = Field(description="Specific, weighted analysis per criteria.")
-
-
-class BatchMatchResult(BaseModel):
-    items: list[BatchMatchItem] = Field(description="One entry per (resume, JD) pair in the batch.")
-
+# ── Pydantic schemas: see shared/schemas.py ───────────────────────────────────
+# ── Prompts: see shared/prompts.py ────────────────────────────────────────────
 
 BATCH_TAILOR_SIZE = 2   # JDs per batch for tailor (output is large — full Markdown resume each)
 BATCH_RESCORE_SIZE = 5  # pairs per batch for re-score (output is small — scores + short text)
-
-
-# ── Prompts ──────────────────────────────────────────────────────────────────
-_TAILOR_SYSTEM_PROMPT = (
-    "You are a Resume Optimization Specialist for ATS (Applicant Tracking System) optimization.\n\n"
-    "STRICT RULES:\n"
-    "1. ONLY use information already in the original resume.\n"
-    "2. NEVER fabricate skills, experiences, qualifications, or achievements.\n"
-    "3. You CAN: reorder sections, rephrase bullet points, emphasize relevant experience, "
-    "mirror keywords from the JD, adjust the professional summary, reorganize skills "
-    "to prioritize relevant ones.\n"
-    "4. You CAN: expand existing bullet points with context to better align with JD language. "
-    'Example: "led 20+ SDEs" → "Led cross-functional teams of 20+ engineers" '
-    "(if JD emphasizes cross-functional leadership).\n"
-    "5. Output the complete tailored resume in Markdown format.\n"
-    "6. Provide optimization_summary listing top 3-5 changes and which JD requirements they target."
-)
-
-_BATCH_TAILOR_SYSTEM_PROMPT = (
-    _TAILOR_SYSTEM_PROMPT + "\n\n"
-    "BATCH MODE:\n"
-    "You will receive multiple JDs numbered [JD 0], [JD 1], etc.\n"
-    "Tailor the resume independently for EACH JD.\n"
-    "Return a BatchTailoredResult JSON with one BatchTailoredItem per JD, "
-    "using the 0-based index to match each result to its input JD."
-)
-
-_FINE_SYSTEM_PROMPT = (
-    "You are a Brutally Honest Job Fit Analyzer evaluating a Senior TPM "
-    "transitioning into an AI TPM role.\n\n"
-    "Score using 4 weighted criteria:\n"
-    "  1. AI/ML Tech Depth (30%): hands-on LLM/GenAI production experience, "
-    "frameworks (PyTorch, TF, HuggingFace), MLOps, inference infra. "
-    "Penalize heavily if candidate has no GenAI production deployment evidence.\n"
-    "  2. TPM Function Match (30%): cross-functional program leadership, "
-    "roadmap ownership, eng/product/research coordination at scale.\n"
-    "  3. Industry & Domain Relevance (20%): alignment with company's AI "
-    "vertical (e.g. foundation models, agents, robotics, autonomous systems).\n"
-    "  4. Growth Trajectory (20%): evidence of rapid upskilling in AI, "
-    "certifications, side projects, open-source contributions.\n\n"
-    "Be brutally specific about GenAI production gaps. "
-    "Do not inflate scores for adjacent experience."
-)
-
-_BATCH_FINE_SYSTEM_PROMPT = (
-    _FINE_SYSTEM_PROMPT + "\n\n"
-    "BATCH MODE:\n"
-    "You will receive multiple (resume, JD) pairs numbered [PAIR 0], [PAIR 1], etc.\n"
-    "Evaluate each pair independently.\n"
-    "Return a BatchMatchResult JSON with one BatchMatchItem per pair, "
-    "using the 0-based index to match each result to its input pair."
-)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -193,7 +116,7 @@ def tailor_resume(resume_text: str, jd_content: str) -> str:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking tailor_resume()")
     cfg = types.GenerateContentConfig(
-        system_instruction=_TAILOR_SYSTEM_PROMPT,
+        system_instruction=TAILOR_SYSTEM_PROMPT,
         temperature=0.3,
         response_mime_type="application/json",
         response_schema=TailoredResume,
@@ -220,7 +143,7 @@ def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
         f"[JD {i}]\n{jd}" for i, jd in enumerate(jd_contents)
     )
     cfg = types.GenerateContentConfig(
-        system_instruction=_BATCH_TAILOR_SYSTEM_PROMPT,
+        system_instruction=BATCH_TAILOR_SYSTEM_PROMPT,
         temperature=0.3,
         response_mime_type="application/json",
         response_schema=BatchTailoredResult,
@@ -256,7 +179,7 @@ def batch_re_score(pairs: list[dict]) -> list[dict]:
         for i, p in enumerate(pairs)
     )
     cfg = types.GenerateContentConfig(
-        system_instruction=_BATCH_FINE_SYSTEM_PROMPT,
+        system_instruction=BATCH_FINE_SYSTEM_PROMPT,
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=BatchMatchResult,
@@ -288,7 +211,7 @@ def re_score(tailored_resume: str, jd_content: str) -> str:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking re_score()")
     cfg = types.GenerateContentConfig(
-        system_instruction=_FINE_SYSTEM_PROMPT,
+        system_instruction=FINE_SYSTEM_PROMPT,
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=MatchResult,
