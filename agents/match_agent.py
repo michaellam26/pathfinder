@@ -106,6 +106,11 @@ PROFILE_DIR = os.getenv("PROFILE_DIR", os.path.join(PROJECT_ROOT, "profile"))
 
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 
+# P0-1: optional Gemini Context Cache name (resume + FINE_SYSTEM_PROMPT).
+# Set by main() when caching is supported; evaluate_match uses it instead of
+# repeating the resume / system prompt in every per-JD call.
+_FINE_CACHE_NAME: str | None = None
+
 
 # ── Pydantic schemas: see shared/schemas.py ───────────────────────────────────
 
@@ -203,27 +208,44 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
 def evaluate_match(resume_text: str, jd_json: str) -> str | None:
     """Run Stage 2 fine evaluation. Returns Gemini JSON string on success.
 
+    P0-1: when _FINE_CACHE_NAME is set, uses Gemini Context Caching —
+    the resume + FINE_SYSTEM_PROMPT are referenced via cached_content
+    so only the JD is sent fresh per call (~30-40% input-token savings).
     P0-4: returns None on structural error so the caller can drop the
     record. Transient errors propagate as GeminiTransientError.
     """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking evaluate_match()")
-    cfg = types.GenerateContentConfig(
-        system_instruction=FINE_SYSTEM_PROMPT,
-        temperature=0.0,
-        response_mime_type="application/json",
-        response_schema=MatchResult,
-    )
+    if _FINE_CACHE_NAME:
+        cfg = types.GenerateContentConfig(
+            cached_content=_FINE_CACHE_NAME,
+            temperature=0.0,
+            response_mime_type="application/json",
+            response_schema=MatchResult,
+        )
+        contents = (
+            "--- TARGET JD ---\n"
+            f"<scraped_content>\n{jd_json}\n</scraped_content>\n\n"
+            "Provide MatchResult JSON."
+        )
+    else:
+        cfg = types.GenerateContentConfig(
+            system_instruction=FINE_SYSTEM_PROMPT,
+            temperature=0.0,
+            response_mime_type="application/json",
+            response_schema=MatchResult,
+        )
+        contents = (
+            "--- CANDIDATE PROFILE ---\n"
+            f"<scraped_content>\n{resume_text}\n</scraped_content>\n\n"
+            "--- TARGET JD ---\n"
+            f"<scraped_content>\n{jd_json}\n</scraped_content>\n\n"
+            "Provide MatchResult JSON."
+        )
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=(
-                "--- CANDIDATE PROFILE ---\n"
-                f"<scraped_content>\n{resume_text}\n</scraped_content>\n\n"
-                "--- TARGET JD ---\n"
-                f"<scraped_content>\n{jd_json}\n</scraped_content>\n\n"
-                "Provide MatchResult JSON."
-            ),
+            contents=contents,
             config=cfg,
         )
         return resp.text
@@ -255,7 +277,7 @@ async def main():
 
 
 async def _main_inner(summary: RunSummary):
-    global _KEY_POOL
+    global _KEY_POOL, _FINE_CACHE_NAME
     gemini_keys = [k for k in [
         os.getenv("GEMINI_API_KEY"),
         os.getenv("GEMINI_API_KEY_2"),
@@ -266,6 +288,7 @@ async def _main_inner(summary: RunSummary):
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
+    _FINE_CACHE_NAME = None  # reset between runs
 
     print("\n" + "="*60)
     print("MATCH AGENT")
@@ -410,6 +433,28 @@ async def _main_inner(summary: RunSummary):
         total_fine = len(to_fine)
         fine_records: list[tuple] = []
 
+        # P0-1: try Gemini Context Caching for the resume + FINE_SYSTEM_PROMPT.
+        # Many fine evaluations send the same resume + system prompt; caching
+        # cuts ~30-40% of input tokens. Falls back transparently if the model
+        # doesn't support caching (preview models often don't).
+        cache_contents = [types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=(
+                "--- CANDIDATE PROFILE ---\n"
+                f"<scraped_content>\n{resume_text}\n</scraped_content>"
+            ))],
+        )] if hasattr(types, "Content") else None
+        if cache_contents is not None and len(to_fine) >= 2:
+            _FINE_CACHE_NAME = _KEY_POOL.create_cache(
+                model=MODEL,
+                system_instruction=FINE_SYSTEM_PROMPT,
+                contents=cache_contents,
+                ttl="3600s",
+                display_name=f"match-{summary.run_id}",
+            )
+            if _FINE_CACHE_NAME:
+                summary.note(f"Using context cache: {_FINE_CACHE_NAME}")
+
         async def fine_one(key: tuple, i: int) -> None:
             async with sem:
                 url = key[1]
@@ -446,7 +491,13 @@ async def _main_inner(summary: RunSummary):
                 print(f"    Score: {score}/100")
 
         summary.attempted += len(to_fine)
-        await asyncio.gather(*[fine_one(k, i) for i, k in enumerate(to_fine, 1)])
+        try:
+            await asyncio.gather(*[fine_one(k, i) for i, k in enumerate(to_fine, 1)])
+        finally:
+            # P0-1: best-effort cache cleanup; never let teardown crash main.
+            if _FINE_CACHE_NAME:
+                _KEY_POOL.delete_cache(_FINE_CACHE_NAME)
+                _FINE_CACHE_NAME = None
         batch_upsert_match_records(xlsx_path, fine_records)
         logging.info(f"[Stage2] Wrote {len(fine_records)} fine records.")
 
