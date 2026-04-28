@@ -32,13 +32,19 @@ import google
 google.genai = MagicMock()
 google.genai.types = MagicMock()
 
-from agents.resume_optimizer import (
+from shared.prompts import (
+    TAILOR_SYSTEM_PROMPT as _TAILOR_SYSTEM_PROMPT,
+    FINE_SYSTEM_PROMPT as _FINE_SYSTEM_PROMPT,
+)
+from shared.schemas import (
     TailoredResume,
     MatchResult,
     BatchTailoredItem,
     BatchTailoredResult,
     BatchMatchItem,
     BatchMatchResult,
+)
+from agents.resume_optimizer import (
     BATCH_TAILOR_SIZE,
     BATCH_RESCORE_SIZE,
     load_resume,
@@ -50,8 +56,6 @@ from agents.resume_optimizer import (
     batch_tailor_resume,
     batch_re_score,
     _GeminiKeyPool,
-    _TAILOR_SYSTEM_PROMPT,
-    _FINE_SYSTEM_PROMPT,
 )
 from shared.excel_store import TAILORED_HEADERS
 import agents.resume_optimizer as optimizer_mod

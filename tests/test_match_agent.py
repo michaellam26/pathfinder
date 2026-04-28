@@ -34,20 +34,18 @@ import google
 google.genai = MagicMock()
 google.genai.types = MagicMock()
 
+from shared.prompts import COARSE_SYSTEM_PROMPT as _COARSE_SYSTEM_PROMPT
+from shared.schemas import CoarseItem, BatchCoarseResult, MatchResult
 from agents.match_agent import (
     _quick_keyword_score,
     _RateLimiter,
     load_resume,
     _load_jd_markdown,
     _GeminiKeyPool,
-    CoarseItem,
-    BatchCoarseResult,
-    MatchResult,
     batch_coarse_score,
     evaluate_match,
     _AI_TECH_TERMS,
     _KEYWORD_THRESHOLD,
-    _COARSE_SYSTEM_PROMPT,
 )
 import agents.match_agent as match_agent_mod
 
