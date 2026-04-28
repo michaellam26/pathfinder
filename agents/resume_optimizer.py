@@ -257,8 +257,10 @@ async def main():
     print(f"Resume: {resume_id}  (MD5: {resume_hash[:8]}...)")
 
     # 2. Load scored matches + existing tailored pairs
+    # P0-6: stage="fine" is the default but pass explicitly so the intent is
+    # visible: only Stage 2 Gemini fine-eval scores feed score-delta math.
     xlsx_path = get_or_create_excel()
-    scored = get_scored_matches(xlsx_path)
+    scored = get_scored_matches(xlsx_path, stage="fine")
     if not scored:
         print("No scored matches found. Run match_agent.py first.")
         return
