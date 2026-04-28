@@ -105,3 +105,51 @@ class _GeminiKeyPoolBase:
                 "or subclass and override generate_content()"
             )
         return self._do_generate(model, contents, config, self._genai_mod)
+
+    # ── P0-1: Context Caching ────────────────────────────────────────────────
+    def create_cache(self, model: str, system_instruction: str,
+                     contents: list, ttl: str = "3600s",
+                     display_name: str | None = None) -> str | None:
+        """Create a Gemini context cache (resume + system prompt) on the
+        current key. Returns the cache name (e.g. 'cachedContents/abc123')
+        or None if caching is unsupported for this model / content size.
+
+        Failures are intentionally non-fatal so callers fall back to
+        uncached generation rather than aborting the run.
+        """
+        if self._genai_mod is None:
+            return None
+        try:
+            with self._lock:
+                gc = self._get_client(self._genai_mod)
+            types_mod = getattr(self._genai_mod, "types", None)
+            if types_mod is None or not hasattr(types_mod, "CreateCachedContentConfig"):
+                return None
+            cfg = types_mod.CreateCachedContentConfig(
+                contents=contents,
+                system_instruction=system_instruction,
+                ttl=ttl,
+                display_name=display_name,
+            )
+            cache = gc.caches.create(model=model, config=cfg)
+            name = getattr(cache, "name", None)
+            if name:
+                logging.info(f"[KeyPool] Created cache: {name}")
+            return name
+        except Exception as e:
+            # Common reasons: model doesn't support caching, content too small,
+            # quota on caches API. None of these should kill the run.
+            logging.warning(f"[KeyPool] Context caching unavailable; falling back: {e}")
+            return None
+
+    def delete_cache(self, cache_name: str) -> None:
+        """Best-effort cache cleanup. Never raises."""
+        if not cache_name or self._genai_mod is None:
+            return
+        try:
+            with self._lock:
+                gc = self._get_client(self._genai_mod)
+            gc.caches.delete(name=cache_name)
+            logging.info(f"[KeyPool] Deleted cache: {cache_name}")
+        except Exception as e:
+            logging.warning(f"[KeyPool] Cache delete failed for {cache_name}: {e}")
