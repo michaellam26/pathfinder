@@ -29,21 +29,28 @@ import google
 google.genai = MagicMock()
 google.genai.types = MagicMock()
 
-from agents.match_agent import (
-    _FINE_SYSTEM_PROMPT as MATCH_FINE_PROMPT,
-    _COARSE_SYSTEM_PROMPT,
-    CoarseItem,
-    BatchCoarseResult,
+from shared.prompts import (
+    FINE_SYSTEM_PROMPT,
+    COARSE_SYSTEM_PROMPT as _COARSE_SYSTEM_PROMPT,
+    TAILOR_SYSTEM_PROMPT as _TAILOR_SYSTEM_PROMPT,
+    BATCH_FINE_SYSTEM_PROMPT as _BATCH_FINE_SYSTEM_PROMPT,
+)
+from shared.schemas import (
+    CoarseItem, BatchCoarseResult,
     MatchResult as MatchMatchResult,
+)
+
+# Both agents now reference the same shared FINE_SYSTEM_PROMPT object.
+MATCH_FINE_PROMPT = FINE_SYSTEM_PROMPT
+OPTIMIZER_FINE_PROMPT = FINE_SYSTEM_PROMPT
+
+from agents.match_agent import (
     batch_coarse_score,
     evaluate_match,
 )
 import agents.match_agent as match_mod
 
 from agents.resume_optimizer import (
-    _FINE_SYSTEM_PROMPT as OPTIMIZER_FINE_PROMPT,
-    _TAILOR_SYSTEM_PROMPT,
-    _BATCH_FINE_SYSTEM_PROMPT,
     MatchResult as OptimizerMatchResult,
     batch_re_score,
     re_score,

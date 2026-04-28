@@ -26,7 +26,6 @@ import asyncio
 import time
 import logging
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
@@ -36,6 +35,8 @@ from shared.excel_store import (
     get_jd_rows_for_match, get_match_pairs, upsert_match_record,
     batch_upsert_match_records, MATCH_HEADERS,
 )
+from shared.prompts import COARSE_SYSTEM_PROMPT, FINE_SYSTEM_PROMPT
+from shared.schemas import CoarseItem, BatchCoarseResult, MatchResult
 
 # ── JD Markdown cache ──────────────────────────────────────────────────────────
 JD_CACHE_DIR = os.path.join(PROJECT_ROOT, "jd_cache")
@@ -104,21 +105,7 @@ PROFILE_DIR = os.getenv("PROFILE_DIR", os.path.join(PROJECT_ROOT, "profile"))
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 
 
-# ── Pydantic schemas ──────────────────────────────────────────────────────────
-class CoarseItem(BaseModel):
-    index: int = Field(description="0-based index of the JD in the batch.")
-    score: int = Field(description="0-100 coarse fit score.")
-
-
-class BatchCoarseResult(BaseModel):
-    items: list[CoarseItem] = Field(description="One entry per JD in the batch.")
-
-
-class MatchResult(BaseModel):
-    compatibility_score:   int       = Field(description="0–100 fit score.")
-    key_strengths:         list[str]
-    critical_gaps:         list[str]
-    recommendation_reason: str       = Field(description="Specific, weighted analysis per criteria.")
+# ── Pydantic schemas: see shared/schemas.py ───────────────────────────────────
 
 
 # ── Resume loader ─────────────────────────────────────────────────────────────
@@ -162,24 +149,6 @@ def _format_jd_for_coarse(jd: dict) -> str:
         return jd["jd_json"]
 
 
-_COARSE_SYSTEM_PROMPT = (
-    "You are a rapid job-fit screener. For each numbered JD, assign a 1–100 "
-    "integer fit score for the candidate.\n\n"
-    "Score calibration:\n"
-    "  1-30  (Weak):   Few overlapping skills; different domain or seniority level; "
-    "minimal AI/ML relevance to candidate's background.\n"
-    "  31-60 (Medium): Some relevant skills but significant gaps; partial TPM "
-    "function match; adjacent but not core AI experience.\n"
-    "  61-100 (Strong): Strong AI/ML alignment; clear TPM function match; "
-    "matching seniority and domain expertise.\n\n"
-    "Key factors to evaluate:\n"
-    "  1. AI/ML Relevance — Does the JD require AI/ML skills the candidate has?\n"
-    "  2. TPM Function Match — Does the role align with TPM responsibilities?\n"
-    "  3. Seniority Fit — Does the required experience level match the candidate?\n\n"
-    "Return a BatchCoarseResult JSON. Minimum score is 1 (never return 0)."
-)
-
-
 def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
     """Send resume + up to 10 JDs in one Gemini call; return list of int scores."""
     if _KEY_POOL is None:
@@ -188,7 +157,7 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
         f"[JD {i}]\n{_format_jd_for_coarse(jd)}" for i, jd in enumerate(jds_batch)
     )
     cfg = types.GenerateContentConfig(
-        system_instruction=_COARSE_SYSTEM_PROMPT,
+        system_instruction=COARSE_SYSTEM_PROMPT,
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=BatchCoarseResult,
@@ -213,29 +182,11 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
 
 
 # ── Stage 2: fine match evaluation ───────────────────────────────────────────
-_FINE_SYSTEM_PROMPT = (
-    "You are a Brutally Honest Job Fit Analyzer evaluating a Senior TPM "
-    "transitioning into an AI TPM role.\n\n"
-    "Score using 4 weighted criteria:\n"
-    "  1. AI/ML Tech Depth (30%): hands-on LLM/GenAI production experience, "
-    "frameworks (PyTorch, TF, HuggingFace), MLOps, inference infra. "
-    "Penalize heavily if candidate has no GenAI production deployment evidence.\n"
-    "  2. TPM Function Match (30%): cross-functional program leadership, "
-    "roadmap ownership, eng/product/research coordination at scale.\n"
-    "  3. Industry & Domain Relevance (20%): alignment with company's AI "
-    "vertical (e.g. foundation models, agents, robotics, autonomous systems).\n"
-    "  4. Growth Trajectory (20%): evidence of rapid upskilling in AI, "
-    "certifications, side projects, open-source contributions.\n\n"
-    "Be brutally specific about GenAI production gaps. "
-    "Do not inflate scores for adjacent experience."
-)
-
-
 def evaluate_match(resume_text: str, jd_json: str) -> str:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking evaluate_match()")
     cfg = types.GenerateContentConfig(
-        system_instruction=_FINE_SYSTEM_PROMPT,
+        system_instruction=FINE_SYSTEM_PROMPT,
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=MatchResult,
