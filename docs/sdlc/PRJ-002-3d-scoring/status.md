@@ -1,10 +1,10 @@
 # PRJ-002: 3-Dimension Scoring (ATS / Recruiter / HM)
 
-**Phase**: Phase 5 — Launch Readiness (Conditional Go pending user verification)
-**Status**: 🟢 Code Ship-Ready, awaiting user empirical verification + P0 merge
+**Phase**: Complete
+**Status**: ✅ Completed (merged to main via PR #2 on 2026-04-29)
 **Priority**: P1
 **Created**: 2026-04-28
-**Last Updated**: 2026-04-28
+**Last Updated**: 2026-04-29
 
 ## Task Checklist
 
@@ -36,14 +36,14 @@
 - [ ] PM sign-off
 
 ### Phase 5: Launch Readiness
-- [x] TPM launch readiness report — see `reviews/phase4-review.md` and the in-session TPM run output (Conditional Go)
-- [x] Engineer Lead confirmation — 725 tests passing, ship-blocker fixed, branch pushed to origin
-- [ ] **User final sign-off** — gated on:
-    - (a) `fix/p0-review-2026-04-28` merged to `main` first
-    - (b) `feat/3d-scoring` rebased onto updated `main`
-    - (c) Empirical verification per `reviews/phase4-review.md` §5: re-run `job_agent` on at least 5 cached JDs, confirm `ATS Keywords` column populates, then run `match_agent` and confirm `ATS Coverage %` is non-None
-    - (d) PRJ-002 PR opened against `main`
-- [ ] PM confirmation (functional acceptance against BRD G1-G7; G4/G5 require post-launch sample data)
+- [x] TPM launch readiness report — Conditional Go issued; full details in `reviews/phase4-review.md` and in-session TPM run output
+- [x] Engineer Lead confirmation — 725 tests passing, ship-blocker fixed, branch rebased onto post-P0 main
+- [x] **User final sign-off** — all 4 launch conditions met:
+    - [x] (a) `fix/p0-review-2026-04-28` merged to `main` (PR #1, 2026-04-29 01:43 UTC)
+    - [x] (b) `feat/3d-scoring` rebased onto updated `main` — zero conflicts
+    - [x] (c) Empirical verification: user re-ran `job_agent` + `match_agent` on real JDs; confirmed ATS Keywords column populated AND ATS Coverage % column populated with real percentages (closes BUG-56 fix verification)
+    - [x] (d) PRJ-002 PR #2 opened, reviewed, merged 2026-04-29 02:14 UTC
+- [x] PM confirmation — functional acceptance against BRD G1-G3 + G6-G7 confirmed at merge; G4 (mean ATS delta > +30pp on 50 JDs) and G5 (HM delta in [-2, +5]) deferred to post-launch sample monitoring (logged in BUGS.md follow-ups for the observability agent)
 
 ## Risk Register
 
