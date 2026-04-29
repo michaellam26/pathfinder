@@ -6,19 +6,45 @@
 **SDLC**: `docs/sdlc/PRJ-002-3d-scoring/`
 **Started**: 2026-04-28
 
-### PR 1 — Foundation: ATS matcher + JD schema
-- [ ] `shared/ats_synonyms.py` — hand-curated synonym dict (≤20 entries to start)
-- [ ] `shared/ats_matcher.py` — `normalize()`, `expand_synonyms()`, `compute_coverage()`
-- [ ] `shared/schemas.py` — add `ATSCoverageResult`; extend `JobDetails` with `ats_keywords`
-- [ ] `agents/job_agent.py` — extraction prompt instructs Gemini to populate `ats_keywords`
-- [ ] `tests/test_ats_matcher.py` — case / stem / synonym / coverage edge cases
-- [ ] Run full test suite; verify 619+ pass
-- [ ] Commit + push
+### PR 1 — Foundation: ATS matcher + JD schema ✅ DONE (commit ba7ed51)
+- [x] `shared/ats_synonyms.py` — 18 entries
+- [x] `shared/ats_matcher.py` — normalize/expand_synonyms/compute_coverage
+- [x] `shared/schemas.py` — added `ATSCoverageResult`
+- [x] `agents/job_agent.py` — `JobDetails.ats_keywords` field + extraction prompt
+- [x] `tests/test_ats_matcher.py` — 50 new tests
+- [x] Full suite 669 passed (was 619, +50 new, 0 regression)
+- [x] Committed (not yet pushed — awaiting user review)
 
-### PR 2 — Excel + prompt rename (NOT STARTED)
-### PR 3 — Match agent 3-dim scoring (NOT STARTED)
-### PR 4 — Optimizer 3-dim rescore (NOT STARTED)
-### PR 5 — Documentation + alias cleanup (NOT STARTED)
+### PR 2 — Excel + prompt rename ✅ DONE (commit 28eee7e)
+- [x] `shared/prompts.py` — RECRUITER/HM names + back-compat aliases (pure rename, no content drift)
+- [x] `shared/excel_store.py` — MATCH_HEADERS +4 cols, TAILORED_HEADERS +9 cols, migration logic
+- [x] `tests/test_shared_prompts.py` — alias identity tests + content-drift guard
+- [x] `tests/test_excel_store.py` — migration tests for both sheets + headers tests
+- [x] Full suite 686 passed (was 669, +17 new, 0 regression)
+- [x] Committed (not yet pushed — awaiting user review)
+### PR 3 — Match agent 3-dim scoring ✅ DONE (commit 09df10b)
+- [x] `agents/match_agent.py` — ATS dim helpers + 3-dim coarse/fine record writes
+- [x] `shared/excel_store.py` — `batch_upsert_match_records` accepts dict (preserves on key-absent)
+- [x] `tests/test_match_agent.py` — 9 new tests (extract / compute_for_jds / threshold)
+- [x] `tests/test_excel_store.py` — 7 new tests (dict format, preservation, mixed)
+- [x] Full suite 703 passed (was 686, +17 new, 0 regression)
+- [x] Committed (not yet pushed — awaiting user review)
+### PR 4 — Optimizer 3-dim rescore ✅ DONE (commit 32afd46)
+- [x] `shared/excel_store.py` — `get_scored_matches` surfaces per-dim; `batch_upsert_tailored_records` accepts 9 per-dim keys; regression precedence (explicit > hm_delta > score_delta)
+- [x] `agents/resume_optimizer.py` — 3-dim rescore (ATS det. + Recruiter LLM + HM LLM); regression = `hm_delta < 0`; per-JD print shows all 3 dims; cross-agent key pool sharing
+- [x] `tests/test_resume_optimizer.py` — 5 new tests (imports / call sites / record keys / legacy mirroring / pool sharing) + updated regression test
+- [x] `tests/test_excel_store.py` — 10 new tests (per-dim writes, regression precedence, ATS drop ≠ regression)
+- [x] Full suite 718 passed (was 703, +15 new, 0 regression)
+- [x] Committed (not yet pushed — awaiting user review)
+### PR 5 — Documentation + alias deprecation ✅ DONE (commit 9834b46)
+- [x] `CHANGELOG.md` — 2026-04-28 entry covering PRJ-002 + 4 P0 follow-ups
+- [x] `REQUIREMENTS.md` — new section 9 (REQ-100~112), fixed REQ-033/035/052 drift, v1.9 history
+- [x] `ARCHITECTURE.md` — 3.3 Match / 3.4 Optimizer flows updated; Excel schema table; v1.6 history
+- [x] `shared/prompts.py` — alias DEPRECATED note (NOT removed; cross-cutting rename deferred to dedicated future PR)
+- [x] Full suite 718 passed (unchanged from PR 4)
+- [x] Committed (not yet pushed)
+
+## All 5 PRs complete. Awaiting decision: push branch + open PRs?
 
 ## Open lessons
 See `tasks/lessons.md` (created when first lesson lands).
