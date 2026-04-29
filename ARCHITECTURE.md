@@ -332,7 +332,7 @@ pathfinder/
 │   ├── gemini_pool.py         # Gemini API key rotation base class (client caching, round-robin, thread-safe)
 │   ├── rate_limiter.py        # Token-bucket async rate limiter
 │   └── config.py              # Shared constants (MODEL)
-├── tests/                     # Unit tests (485+ cases)
+├── tests/                     # Unit tests (725+ cases)
 ├── docs/
 │   └── sdlc/                  # SDLC project documents
 │       ├── index.md           # Project index table

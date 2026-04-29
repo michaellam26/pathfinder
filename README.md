@@ -6,9 +6,9 @@ PathFinder is an autonomous AI-powered job discovery and matching system designe
 
 ## At a Glance
 
-- **What it is:** A 4-agent LLM pipeline — **Discover → Extract → Match → Tailor** — that automates AI-TPM job search end-to-end.
+- **What it is:** A 4-agent LLM pipeline — **Discover → Extract → Match → Tailor** — that automates AI-TPM job search end-to-end. The match + tailor stages run a **3-dimension scoring funnel** (ATS keyword coverage / Recruiter scan / HM deep eval) that mirrors the real North American hiring filter cascade.
 - **How it was built:** I made all architecture, scope, and review decisions; used **Claude Code (Opus)** as implementation partner and designed an **11-agent Claude subagent review team** (PM, TPM, 9 QA/Eval/Cost reviewers) for parallel review across a full SDLC.
-- **Scale signals:** ~4K lines of Python · 485+ unit tests · Pydantic-typed inter-agent contracts · Gemini API pooling + token-bucket rate limiting · full BRD / Tech Design / Test / Launch artifacts under `docs/sdlc/`.
+- **Scale signals:** ~4K lines of Python · 725+ unit tests · Pydantic-typed inter-agent contracts · Gemini API pooling + token-bucket rate limiting · full BRD / Tech Design / Test / Launch artifacts under `docs/sdlc/`.
 - **Stack:** Python 3.11 · Gemini · Claude Code · Tavily · Firecrawl · Crawl4AI · Pydantic · openpyxl · pytest.
 
 ## How It Works
@@ -16,9 +16,9 @@ PathFinder is an autonomous AI-powered job discovery and matching system designe
 The system runs four independent agents in sequence:
 
 1. **Company Agent** — Discovers AI companies via web search (Tavily), finds their career/ATS pages, and validates URLs
-2. **Job Agent** — Scrapes career pages for TPM openings using ATS APIs (Greenhouse, Lever, Ashby) or web crawlers (Firecrawl, Crawl4AI), extracts structured JD data
-3. **Match Agent** — Two-stage resume-to-JD matching: keyword pre-filter → Gemini LLM batch scoring → top 20% fine evaluation (4-dimension weighted scoring)
-4. **Resume Optimizer** — Tailors resume for each matched JD using Gemini, then re-scores to measure improvement
+2. **Job Agent** — Scrapes career pages for TPM openings using ATS APIs (Greenhouse, Lever, Ashby) or web crawlers (Firecrawl, Crawl4AI), extracts structured JD data including 8-15 ATS-relevant keywords per role
+3. **Match Agent** — **3-dimension scoring funnel** modeled on the real NA hiring cascade: **ATS Coverage** (deterministic keyword match, no LLM) + **Recruiter Score** (Gemini batch coarse) + **HM Score** (Gemini fine, 4-dim weighted), with UNION-of-threshold-and-top-N% gating into the deep-eval stage
+4. **Resume Optimizer** — Tailors resume per JD using Gemini, then **re-scores all 3 dimensions independently** so per-application improvement is visible per filter (regression flag uses HM Delta only — ATS keyword gains aren't false-positive regressions)
 
 All results are persisted to a local Excel dashboard (`pathfinder_dashboard.xlsx`).
 
@@ -27,15 +27,21 @@ All results are persisted to a local Excel dashboard (`pathfinder_dashboard.xlsx
 ```
 agents/              # 4 Runtime Agents
   company_agent.py   # AI company discovery + career URL finding
-  job_agent.py       # TPM job discovery + JD extraction
-  match_agent.py     # Resume-to-JD matching (2-stage)
-  resume_optimizer.py # Resume tailoring + re-scoring
+  job_agent.py       # TPM job discovery + JD extraction (incl. ats_keywords)
+  match_agent.py     # 3-dim scoring (ATS / Recruiter / HM)
+  resume_optimizer.py # Resume tailoring + 3-dim re-scoring
 shared/              # Shared utilities
-  excel_store.py     # Unified Excel persistence layer
-  gemini_pool.py     # Gemini API key rotation
+  excel_store.py     # Unified Excel persistence layer + auto-migration
+  gemini_pool.py     # Gemini key rotation + transient retry backoff
   rate_limiter.py    # Token-bucket rate limiter
   config.py          # Shared constants
-tests/               # Unit tests (485+ cases)
+  prompts.py         # System prompts (Recruiter / HM / Tailor)
+  schemas.py         # Pydantic response schemas for Gemini
+  exceptions.py      # Transient vs. structural error classification
+  run_summary.py     # Structured per-run log dataclass
+  ats_matcher.py     # Deterministic ATS keyword coverage (PRJ-002)
+  ats_synonyms.py    # Hand-curated ATS keyword synonym table (PRJ-002)
+tests/               # Unit tests (725+ cases)
 profile/             # Candidate resume (.md/.txt)
 docs/                # SDLC project documents
 ```
