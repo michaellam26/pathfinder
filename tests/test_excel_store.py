@@ -1030,6 +1030,90 @@ class TestBatchUpsertTailoredRecords(unittest.TestCase):
         self.assertEqual(ws.cell(2, 7).value, 20)  # Score Delta
         self.assertIn("tailored_resumes", str(ws.cell(2, 8).value))  # Path
         self.assertEqual(ws.cell(2, 11).value, "hash1")  # Resume Hash
+        self.assertEqual(ws.cell(2, 12).value, False)  # Regression (delta=20 → False)
+
+    def test_regression_explicit_true(self):
+        """When caller passes regression=True, it round-trips."""
+        rec = self._rec("https://a.com/1", 80, 75)  # delta=-5
+        rec["regression"] = True
+        batch_upsert_tailored_records(self.path, [rec])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        self.assertEqual(ws.cell(2, 12).value, True)
+
+    def test_regression_inferred_from_negative_delta(self):
+        """If caller omits regression, it's inferred from score_delta < 0."""
+        rec = self._rec("https://a.com/1", 80, 75)  # delta=-5
+        rec.pop("regression", None)
+        batch_upsert_tailored_records(self.path, [rec])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        self.assertEqual(ws.cell(2, 12).value, True)
+
+    def test_regression_false_for_positive_delta(self):
+        """No regression when tailored >= original."""
+        rec = self._rec("https://a.com/1", 60, 75)  # delta=+15
+        rec.pop("regression", None)
+        batch_upsert_tailored_records(self.path, [rec])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        self.assertEqual(ws.cell(2, 12).value, False)
+
+    def test_regression_false_for_zero_delta(self):
+        """Tailored == base is not a regression."""
+        rec = self._rec("https://a.com/1", 70, 70)  # delta=0
+        rec.pop("regression", None)
+        batch_upsert_tailored_records(self.path, [rec])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        self.assertEqual(ws.cell(2, 12).value, False)
+
+
+class TestTailoredHeadersHasRegression(unittest.TestCase):
+    """TAILORED_HEADERS must include the Regression column."""
+
+    def test_regression_in_headers(self):
+        self.assertIn("Regression", TAILORED_HEADERS)
+
+    def test_regression_is_last_column(self):
+        """Migration appends Regression at the end so old col indices stay valid."""
+        self.assertEqual(TAILORED_HEADERS[-1], "Regression")
+
+
+class TestTailoredMigration(unittest.TestCase):
+    """Existing files without Regression column should auto-migrate on open."""
+
+    def test_migration_adds_regression_column(self):
+        path = _tmp_xlsx()
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Tailored_Match_Results"
+            old_headers = [h for h in TAILORED_HEADERS if h != "Regression"]
+            ws.append(old_headers)
+            ws.append(["r1", "https://a.com/1", "TPM", "Co", 80, 70, -10,
+                       "p", "s", "2026-01-01", "h"])
+            ws.append(["r1", "https://a.com/2", "TPM", "Co", 60, 80, 20,
+                       "p", "s", "2026-01-01", "h"])
+            for required in ("Company_List", "Company_Without_TPM", "JD_Tracker",
+                             "Match_Results"):
+                wb.create_sheet(required)
+            wb.save(path)
+            wb.close()
+
+            get_or_create_excel(path)
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["Tailored_Match_Results"]
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            self.assertIn("Regression", headers)
+            reg_col = headers.index("Regression") + 1
+            self.assertEqual(ws.cell(2, reg_col).value, True)   # delta=-10
+            self.assertEqual(ws.cell(3, reg_col).value, False)  # delta=+20
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
 
 
 class TestTailoredWorkbookClose(unittest.TestCase):

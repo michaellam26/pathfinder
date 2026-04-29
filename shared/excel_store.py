@@ -22,7 +22,7 @@ JD_HEADERS      = ["JD URL", "Job Title", "Company", "Location", "Salary", "Requ
 MATCH_HEADERS   = ["Resume ID", "JD URL", "Score", "Strengths", "Gaps", "Reason", "Updated At", "Resume Hash", "Stage"]
 TAILORED_HEADERS = ["Resume ID", "JD URL", "Job Title", "Company", "Original Score",
                     "Tailored Score", "Score Delta", "Tailored Resume Path",
-                    "Optimization Summary", "Updated At", "Resume Hash"]
+                    "Optimization Summary", "Updated At", "Resume Hash", "Regression"]
 
 # BUG-52: pre-computed 1-based column indices for JD_Tracker lookups
 _JD_COL = {h: i + 1 for i, h in enumerate(JD_HEADERS)}
@@ -145,6 +145,25 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     changed = True
                     import logging as _log
                     _log.info("[Excel] Migrated Match_Results: added 'Resume Hash' and 'Stage' columns.")
+            # Migrate Tailored_Match_Results: add "Regression" column if missing.
+            # Backfill: existing rows are marked TRUE iff Score Delta < 0.
+            if "Tailored_Match_Results" in wb.sheetnames:
+                ws_tm = wb["Tailored_Match_Results"]
+                tm_headers = [ws_tm.cell(1, c).value for c in range(1, ws_tm.max_column + 1)]
+                if "Regression" not in tm_headers:
+                    next_col = ws_tm.max_column + 1
+                    ws_tm.cell(1, next_col).value = "Regression"
+                    delta_col = tm_headers.index("Score Delta") + 1 if "Score Delta" in tm_headers else None
+                    for r in range(2, ws_tm.max_row + 1):
+                        if ws_tm.cell(r, 1).value:
+                            delta = ws_tm.cell(r, delta_col).value if delta_col else 0
+                            try:
+                                ws_tm.cell(r, next_col).value = bool(int(delta) < 0)
+                            except (TypeError, ValueError):
+                                ws_tm.cell(r, next_col).value = False
+                    changed = True
+                    import logging as _log
+                    _log.info("[Excel] Migrated Tailored_Match_Results: added 'Regression' column.")
             if changed:
                 wb.save(xlsx_path)
         finally:
@@ -819,7 +838,11 @@ def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
     records: list of dicts with keys:
         resume_id, jd_url, job_title, company, original_score,
         tailored_score, score_delta, tailored_resume_path,
-        optimization_summary, resume_hash
+        optimization_summary, resume_hash, regression
+
+    `regression` is a bool that flags Tailored Score < Original Score; when
+    True, the user should keep using the base resume in profile/. If the
+    caller omits `regression`, we infer it from score_delta < 0.
     Returns the number of records written.
     """
     if not records:
@@ -835,13 +858,16 @@ def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
             if rid and url:
                 idx[(str(rid), str(url))] = r
         for rec in records:
+            regression = rec.get("regression")
+            if regression is None:
+                regression = bool(int(rec.get("score_delta", 0)) < 0)
             row_data = [
                 rec["resume_id"], rec["jd_url"], rec.get("job_title", ""),
                 rec.get("company", ""), rec.get("original_score", 0),
                 rec.get("tailored_score", 0), rec.get("score_delta", 0),
                 rec.get("tailored_resume_path", ""),
                 rec.get("optimization_summary", ""), now,
-                rec.get("resume_hash", ""),
+                rec.get("resume_hash", ""), bool(regression),
             ]
             key = (str(rec["resume_id"]), str(rec["jd_url"]))
             if key in idx:
