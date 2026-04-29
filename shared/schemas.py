@@ -36,3 +36,16 @@ class BatchTailoredItem(BaseModel):
 
 class BatchTailoredResult(BaseModel):
     items: list[BatchTailoredItem] = Field(description="One entry per JD in the batch.")
+
+
+class ATSCoverageResult(BaseModel):
+    """Output of shared.ats_matcher.compute_coverage.
+
+    Not used as a Gemini response_schema — this models the deterministic
+    matcher's return value so downstream code can validate / round-trip
+    coverage data through Pydantic when needed.
+    """
+    percent: float | None = Field(description="matched / total * 100, or None when no keywords.")
+    matched: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    keyword_count: int = Field(description="Total keywords scored after de-dup.")
