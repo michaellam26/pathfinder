@@ -127,6 +127,9 @@ class JobDetails(BaseModel):
     requirements:             list[str]  # Must-have qualifications (inferred regardless of heading)
     additional_qualifications: list[str] # Nice-to-have / preferred (inferred regardless of heading)
     key_responsibilities:     list[str]
+    # PRJ-002 / REQ-100: 8-15 high-signal keywords that an ATS scanner / recruiter
+    # search would key on. Default empty so cached JDs without this field round-trip.
+    ats_keywords:             list[str] = Field(default_factory=list)
     is_ai_tpm:                bool
     data_quality:             str | None = None  # BUG-47: populated by _assess_jd_quality
 
@@ -1322,6 +1325,15 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
         " For 'key_responsibilities': extract job duties regardless of heading."
         " Treat 'Responsibilities', 'What you'll do', 'Key Duties', 'Your role', 'The role',"
         " 'What you will do', 'In this role', 'Job duties' as responsibilities."
+        " For 'ats_keywords': extract 8-15 high-signal keywords that an ATS scanner or"
+        " recruiter keyword search would key on for this role. Each keyword must be a"
+        " noun phrase or proper noun, 1-4 words, lowercase or canonical casing."
+        " Prefer named entities: tool / library / framework names (PyTorch, Kubernetes,"
+        " BigQuery, Airflow), specific technologies / techniques (LLM, RAG, MLOps, fine-tuning),"
+        " platforms (AWS, GCP), domains (computer vision, NLP), certifications (PMP, CSM),"
+        " methodologies (Agile, OKRs). EXCLUDE adjectives ('strong', 'excellent'),"
+        " generic verbs ('build', 'lead', 'collaborate'), full sentences, and soft skills."
+        " Deduplicate. If the JD explicitly lists tools or skills, prioritize those."
     )
     if cls == "ai_native":
         sys_instr = (f"Extract structured JD data. Company: {company} is AI-native; "
