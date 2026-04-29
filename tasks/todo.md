@@ -1,8 +1,24 @@
 # Task Tracker
 
-## Active: PRJ-002 — 3-Dimension Scoring (ATS / Recruiter / HM)
+## Active (2026-04-28 evening): REVIEW_2026-04-28 follow-up
 
-**Branch**: `feat/3d-scoring`
+**Source doc**: `docs/REVIEW_2026-04-28.md`
+**Status**: P0 done (7/8, P0-8 WONTFIX); P1 5 fixed today + 2 fixed earlier; P2 3 fixed earlier
+**Verification**: 8 read-only sub-agents re-checked remaining P1/P2 → results appended to `docs/REVIEW_2026-04-28.md` "验证回访" section
+**Remaining**: 15 P1 STILL + 4 P1 PARTIAL + 9 P2 STILL + 1 P2 PARTIAL (24 STILL items total)
+**Top-6 ROI** for next batch (per verification report):
+- [ ] P1-22 — refactor 27 `inspect.getsource` tests to behavioral
+- [ ] P1-7 + P1-8 — Excel header lookup + Resume Hash migration in `Tailored_Match_Results`
+- [ ] P1-15 — gate `is_ai_tpm` on JD content even for ai_native companies
+- [ ] P1-2 / P1-12 — RateLimiter: lazy Lock create + don't hold lock across `sleep`
+- [ ] P1-13 — Tailored vs original diff (substring containment + length ratio)
+- [ ] P2 doc drift — `excel_store.py:2` / `REQUIREMENTS.md:13` / `ARCHITECTURE.md archive/` (one commit)
+
+---
+
+## Completed: PRJ-002 — 3-Dimension Scoring (ATS / Recruiter / HM)
+
+**Branch**: `feat/3d-scoring` (merged via PR #2 → main)
 **SDLC**: `docs/sdlc/PRJ-002-3d-scoring/`
 **Started**: 2026-04-28
 
@@ -44,10 +60,7 @@
 - [x] Full suite 718 passed (unchanged from PR 4)
 - [x] Committed (not yet pushed)
 
-## All 5 PRs complete. Awaiting decision: push branch + open PRs?
+All 5 PRs complete; merged to `main` via PR #2 (commit 3a1f86b closed the SDLC project).
 
 ## Open lessons
 See `tasks/lessons.md` (created when first lesson lands).
-
-## Completed
-*(none yet)*
