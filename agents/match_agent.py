@@ -146,7 +146,10 @@ def _extract_ats_keywords(jd: dict) -> list[str]:
         d = json.loads(jd["jd_json"])
         kws = d.get("ats_keywords") or []
         return [str(k) for k in kws if k]
-    except Exception:
+    except Exception as e:
+        # Phase 4 review: surface the failure so a malformed jd_json doesn't
+        # silently degrade ATS coverage to 0 across many JDs unnoticed.
+        logging.debug(f"_extract_ats_keywords failed for {jd.get('url', '?')}: {e}")
         return []
 
 
@@ -155,6 +158,12 @@ def compute_ats_for_jds(resume_text: str, jds: list[dict]) -> dict[str, dict]:
 
     Deterministic, no LLM, no rate limiter. Skips JDs whose ats_keywords
     field is empty (legacy JDs); coverage_dict has percent=None for those.
+
+    Phase 4 perf note: compute_coverage internally normalizes the resume
+    once per call. For N JDs we'd re-normalize the same resume N times.
+    The matcher API doesn't expose a pre-normalized form, but normalize()
+    is O(text length) and ~100 JDs × small resume is still milliseconds —
+    not worth complicating the matcher API for.
     """
     out: dict[str, dict] = {}
     for jd in jds:

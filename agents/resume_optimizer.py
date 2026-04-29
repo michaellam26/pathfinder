@@ -488,9 +488,16 @@ async def _main_inner(summary: RunSummary):
         # HM dim — drives legacy Score / Score Delta / Regression columns.
         score_data    = score_results[url]
         tailored_hm   = score_data.get("compatibility_score", 0)
-        # Fallback chain: prefer hm_score (PR 3+), else legacy match["score"]
-        # (which equals HM for fine-stage rows after PR 3).
-        original_hm   = match.get("hm_score") or match.get("score") or 0
+        # Fallback chain (explicit None checks, not `or` — Phase 4 review):
+        # prefer hm_score (PR 3+), else legacy match["score"] (which equals
+        # HM for fine-stage rows after PR 3). Using `or` would mask any
+        # genuine zero-score (match_agent clamps to 1, but defense-in-depth).
+        if match.get("hm_score") is not None:
+            original_hm = match["hm_score"]
+        elif match.get("score") is not None:
+            original_hm = match["score"]
+        else:
+            original_hm = 0
         hm_delta      = tailored_hm - original_hm
 
         # ATS dim — percent or None (legacy JDs without ats_keywords).
