@@ -18,7 +18,12 @@ COMPANY_HEADERS          = ["Company Name", "AI Domain", "Business Focus", "Care
 WITHOUT_TPM_HEADERS      = ["Company Name", "AI Domain", "Business Focus", "Career URL", "Updated At", "TPM Jobs", "AI TPM Jobs"]
 JD_HEADERS      = ["JD URL", "Job Title", "Company", "Location", "Salary", "Requirements",
                    "Additional Qualifications", "Responsibilities", "Is AI TPM", "Updated At", "MD Hash",
-                   "Data Quality"]
+                   "Data Quality",
+                   # PRJ-002 Phase 4 fix: ats_keywords must be persisted in JD_Tracker
+                   # so it survives the round-trip from job_agent (Gemini extraction)
+                   # to match_agent / resume_optimizer (consumption). Without this column
+                   # the ATS dimension was always silently None.
+                   "ATS Keywords"]
 # PRJ-002 PR 2: 3-dimension scoring columns appended at end so existing
 # column indices stay valid. PR 3/PR 4 wire up the upsert paths to populate
 # them — for now they're added by migration and left blank for old rows.
@@ -108,6 +113,14 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     ws_jd.cell(1, next_col).value = "Data Quality"
                     changed = True
                     _log.info("[Excel] Migrated JD_Tracker: added 'Data Quality' column.")
+                # PRJ-002 Phase 4 fix: add "ATS Keywords" column if missing.
+                # Existing rows leave the cell blank — re-run job_agent to populate.
+                header_row = [ws_jd.cell(1, c).value for c in range(1, ws_jd.max_column + 1)]
+                if "ATS Keywords" not in header_row:
+                    next_col = ws_jd.max_column + 1
+                    ws_jd.cell(1, next_col).value = "ATS Keywords"
+                    changed = True
+                    _log.info("[Excel] Migrated JD_Tracker: added 'ATS Keywords' column.")
             # Migrate Company_List: add "TPM Jobs" and "AI TPM Jobs" columns if missing
             if "Company_List" in wb.sheetnames:
                 ws_co = wb["Company_List"]
@@ -500,6 +513,10 @@ def get_jd_rows_for_match(xlsx_path: str = EXCEL_PATH) -> list:
         c_addq  = _JD_COL["Additional Qualifications"]
         c_resp  = _JD_COL["Responsibilities"]
         c_tpm   = _JD_COL["Is AI TPM"]
+        # PRJ-002 Phase 4 fix: dynamic lookup so workbooks pre-migration (no column)
+        # don't crash here — they yield ats_keywords=[] which the matcher handles.
+        ws_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        c_ats = ws_headers.index("ATS Keywords") + 1 if "ATS Keywords" in ws_headers else None
         rows = []
         for r in range(2, ws.max_row + 1):
             url        = ws.cell(r, c_url).value
@@ -516,11 +533,14 @@ def get_jd_rows_for_match(xlsx_path: str = EXCEL_PATH) -> list:
             req_list  = [s.lstrip("• ").strip() for s in req_raw.split("\n") if s.strip()]
             addq_list = [s.lstrip("• ").strip() for s in addq_raw.split("\n") if s.strip()]
             resp_list = [s.lstrip("• ").strip() for s in resp_raw.split("\n") if s.strip()]
+            ats_raw   = ws.cell(r, c_ats).value if c_ats else ""
+            ats_list  = [s.lstrip("• ").strip() for s in (ats_raw or "").split("\n") if s.strip()]
             jd_json   = json.dumps({
                 "job_title": job_title, "company": company, "location": location,
                 "salary_range": salary, "requirements": req_list,
                 "additional_qualifications": addq_list,
                 "key_responsibilities": resp_list, "is_ai_tpm": True,
+                "ats_keywords": ats_list,
             })
             rows.append({"url": url, "jd_json": jd_json})
         return rows
@@ -539,15 +559,16 @@ def upsert_jd_record(xlsx_path: str, jd_url: str, jd_json: str, markdown_hash: s
             req   = "\n".join(f"• {x}" for x in (d.get("requirements") or [])) or "None"
             addq  = "\n".join(f"• {x}" for x in (d.get("additional_qualifications") or [])) or "None"
             resp  = "\n".join(f"• {x}" for x in (d.get("key_responsibilities") or [])) or "None"
+            ats   = "\n".join(f"• {x}" for x in (d.get("ats_keywords") or [])) or "None"
             row_data = [jd_url, d.get("job_title","N/A"), d.get("company","N/A"),
                         d.get("location","N/A"), d.get("salary_range","N/A"),
                         req, addq, resp,
                         str(d.get("is_ai_tpm", False)), now, markdown_hash,
-                        d.get("data_quality", "")]
+                        d.get("data_quality", ""), ats]
         except json.JSONDecodeError:
             row_data = [jd_url, "JSON ERROR", "JSON ERROR", "JSON ERROR", "JSON ERROR",
                         "JSON ERROR", "JSON ERROR", "JSON ERROR", "JSON ERROR", now, markdown_hash,
-                        "failed"]
+                        "failed", "None"]
         if jd_url in idx:
             for col, val in enumerate(row_data, 1):
                 ws.cell(idx[jd_url], col, val)
@@ -577,15 +598,16 @@ def batch_upsert_jd_records(xlsx_path: str, records: list) -> int:
                 req   = "\n".join(f"• {x}" for x in d.get("requirements", [])) or "None"
                 addq  = "\n".join(f"• {x}" for x in d.get("additional_qualifications", [])) or "None"
                 resp  = "\n".join(f"• {x}" for x in d.get("key_responsibilities", [])) or "None"
+                ats   = "\n".join(f"• {x}" for x in (d.get("ats_keywords") or [])) or "None"
                 row_data = [jd_url, d.get("job_title","N/A"), d.get("company","N/A"),
                             d.get("location","N/A"), d.get("salary_range","N/A"),
                             req, addq, resp,
                             str(d.get("is_ai_tpm", False)), now, markdown_hash,
-                            d.get("data_quality", "")]
+                            d.get("data_quality", ""), ats]
             except json.JSONDecodeError:
                 row_data = [jd_url, "JSON ERROR", "JSON ERROR", "JSON ERROR", "JSON ERROR",
                             "JSON ERROR", "JSON ERROR", "JSON ERROR", "JSON ERROR", now, markdown_hash,
-                            "failed"]
+                            "failed", "None"]
             if jd_url in idx:
                 for col, val in enumerate(row_data, 1):
                     ws.cell(idx[jd_url], col, val)

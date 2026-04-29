@@ -84,6 +84,7 @@ def _save_structured_jd_md(url: str, jd_dict: dict) -> None:
     reqs     = jd_dict.get("requirements", [])
     addqs    = jd_dict.get("additional_qualifications", [])
     resps    = jd_dict.get("key_responsibilities", [])
+    ats_kws  = jd_dict.get("ats_keywords", []) or []
 
     lines = [f"# {title} — {company}"]
     if location: lines.append(f"**Location:** {location}")
@@ -104,6 +105,14 @@ def _save_structured_jd_md(url: str, jd_dict: dict) -> None:
     if resps:
         lines.append("## Responsibilities")
         lines.extend(f"- {r}" for r in resps)
+        lines.append("")
+
+    # PRJ-002 Phase 4: persist Gemini-extracted ATS keywords here too so the
+    # structured.md is self-contained and human-readable. Excel JD_Tracker
+    # remains the canonical source for match_agent / resume_optimizer reads.
+    if ats_kws:
+        lines.append("## ATS Keywords")
+        lines.extend(f"- {k}" for k in ats_kws)
         lines.append("")
 
     with open(path, "w", encoding="utf-8") as f:
