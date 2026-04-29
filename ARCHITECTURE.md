@@ -170,7 +170,7 @@ Phase 1 — Batch tailor:
 Phase 2 — 3-dimension rescore (per JD, concurrency=3):
   ├── ATS:       compute_coverage(ats_keywords, tailored_md) — deterministic, no LLM
   ├── Recruiter: batch_coarse_score(tailored_md, [jd_dict]) — 1 Gemini call (cross-agent)
-  └── HM:        re_score(tailored_md, jd_content) — 1 Gemini call, FINE_SYSTEM_PROMPT
+  └── HM:        re_score(tailored_md, jd_content) — 1 Gemini call, HM_SYSTEM_PROMPT
   Per-JD prints: ATS o→t (Δ) | Rec o→t (Δ) | HM o→t (Δ)
 
 Phase 3 — Assemble + write:

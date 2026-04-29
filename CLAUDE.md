@@ -22,15 +22,21 @@ Load env vars in scripts with `python-dotenv` (`from dotenv import load_dotenv; 
 ```
 agents/              # 4 Runtime Agents (the product)
   company_agent.py   # AI company discovery + career URL finding
-  job_agent.py       # TPM job discovery + JD extraction
-  match_agent.py     # Resume-to-JD matching (2-stage)
-  resume_optimizer.py # Resume tailoring + re-scoring
+  job_agent.py       # TPM job discovery + JD extraction (incl. ats_keywords)
+  match_agent.py     # Resume-to-JD matching (3-dim: ATS / Recruiter / HM)
+  resume_optimizer.py # Resume tailoring + 3-dim re-scoring
 shared/              # Shared utilities reused across agents
   excel_store.py     # Unified Excel persistence layer
-  gemini_pool.py     # Gemini API key rotation
+  gemini_pool.py     # Gemini API key rotation + transient retry
   rate_limiter.py    # Token-bucket rate limiter
   config.py          # Shared constants (MODEL, AUTO_ARCHIVE_THRESHOLD)
-tests/               # Unit tests (485+ cases)
+  prompts.py         # Shared LLM system prompts (RECRUITER, HM, TAILOR)
+  schemas.py         # Pydantic response schemas for Gemini
+  exceptions.py      # GeminiTransientError / GeminiStructuralError
+  run_summary.py     # Structured run-log dataclass
+  ats_matcher.py     # Deterministic ATS keyword coverage (PRJ-002)
+  ats_synonyms.py    # Hand-curated ATS keyword synonym table (PRJ-002)
+tests/               # Unit tests (725+ cases)
 docs/
   sdlc/              # SDLC project documents (index + per-project dirs)
 .claude/

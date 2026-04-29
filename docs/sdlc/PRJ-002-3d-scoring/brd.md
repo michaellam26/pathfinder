@@ -66,7 +66,7 @@ Consequences of the current single-score model:
 | REQ-108 | Regression flag = `HM delta < 0` only (not single-score delta); ATS / Recruiter regressions not flagged | P0 |
 | REQ-109 | Excel migration: existing files auto-add new columns on next open; backfill `Regression` from existing Score Delta where possible; new ATS / Recruiter columns left blank for old rows (re-run match agent to populate) | P0 |
 | REQ-110 | ATS coverage <30% surfaces as ⚠️ marker in summary printout; JD is **not** dropped from pipeline | P1 |
-| REQ-111 | All 4 design decisions D1-D5 from status.md are reflected in code | P0 |
+| REQ-111 | All 5 design decisions D1-D5 from status.md are reflected in code | P0 |
 | REQ-112 | At least one regression test per design decision | P1 |
 
 ## 5. Dependencies & Constraints
