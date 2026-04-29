@@ -39,7 +39,7 @@ from shared.prompts import COARSE_SYSTEM_PROMPT, FINE_SYSTEM_PROMPT
 from shared.schemas import CoarseItem, BatchCoarseResult, MatchResult
 
 # ── JD Markdown cache ──────────────────────────────────────────────────────────
-JD_CACHE_DIR = os.path.join(PROJECT_ROOT, "jd_cache")
+# JD_CACHE_DIR sourced from shared.config (P1-5).
 
 def _load_jd_markdown(url: str) -> str | None:
     """Load JD Markdown from cache. Prefer _structured.md, fallback to raw .md."""
@@ -56,7 +56,7 @@ def _load_jd_markdown(url: str) -> str | None:
 
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
-from shared.config import MODEL
+from shared.config import MODEL, JD_CACHE_DIR
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
 from shared.run_summary import RunSummary
 from shared.ats_matcher import compute_coverage

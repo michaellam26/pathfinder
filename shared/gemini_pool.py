@@ -39,6 +39,45 @@ def _is_transient(err_text: str) -> bool:
     return any(p in low for p in _TRANSIENT_PATTERNS)
 
 
+# ── P1-17: cumulative token-usage tracker ────────────────────────────────────
+# Captures usage_metadata returned by every successful generate_content call.
+# Reads are cheap; callers (e.g. main()) call get_usage_summary() at run end.
+_TOKEN_USAGE = {
+    "prompt_tokens": 0,
+    "candidates_tokens": 0,
+    "cached_content_tokens": 0,
+    "total_calls": 0,
+}
+_TOKEN_LOCK = threading.Lock()
+
+
+def get_usage_summary() -> dict:
+    """Return a snapshot of cumulative Gemini token usage since last reset."""
+    with _TOKEN_LOCK:
+        return dict(_TOKEN_USAGE)
+
+
+def reset_usage_summary() -> None:
+    """Zero out the token counters. Call at the start of a fresh run."""
+    with _TOKEN_LOCK:
+        for k in _TOKEN_USAGE:
+            _TOKEN_USAGE[k] = 0
+
+
+def _record_usage(resp) -> None:
+    um = getattr(resp, "usage_metadata", None)
+    if um is None:
+        return
+    p = getattr(um, "prompt_token_count", 0) or 0
+    c = getattr(um, "candidates_token_count", 0) or 0
+    cached = getattr(um, "cached_content_token_count", 0) or 0
+    with _TOKEN_LOCK:
+        _TOKEN_USAGE["prompt_tokens"] += p
+        _TOKEN_USAGE["candidates_tokens"] += c
+        _TOKEN_USAGE["cached_content_tokens"] += cached
+        _TOKEN_USAGE["total_calls"] += 1
+
+
 class _GeminiKeyPoolBase:
     """Holds multiple Gemini API keys and rotates to the next on quota exhaustion.
 
@@ -89,7 +128,9 @@ class _GeminiKeyPoolBase:
             with self._lock:
                 gc = self._get_client(genai_mod)
             try:
-                return gc.models.generate_content(model=model, contents=contents, config=config)
+                resp = gc.models.generate_content(model=model, contents=contents, config=config)
+                _record_usage(resp)
+                return resp
             except Exception as e:
                 err = str(e)
                 # Quota-specific path: rotate keys, then bubble up as transient.

@@ -38,7 +38,7 @@ from shared.excel_store import (
 
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
-from shared.config import MODEL, AUTO_ARCHIVE_THRESHOLD
+from shared.config import MODEL, AUTO_ARCHIVE_THRESHOLD, JD_CACHE_DIR
 from shared.prompts import SECURITY_CLAUSE
 from shared.run_summary import RunSummary
 from shared.exceptions import GeminiTransientError
@@ -53,7 +53,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 FRESH_DAYS = 5
 
 # ── JD Markdown cache helpers ──────────────────────────────────────────────────
-JD_CACHE_DIR = os.path.join(PROJECT_ROOT, "jd_cache")
+# JD_CACHE_DIR sourced from shared.config (P1-5).
 
 def _cache_path(url: str) -> str:
     return os.path.join(JD_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".md")

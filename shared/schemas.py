@@ -4,12 +4,23 @@ Single source of truth — match_agent and resume_optimizer must reference
 the same MatchResult class so the original score and tailored re-score
 use identical schemas.
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _clamp_0_100(v: int) -> int:
+    """P1-16: enforce 0-100 range at the schema layer so out-of-range Gemini
+    output is normalized once instead of relying on each caller to clamp."""
+    return max(0, min(100, int(v)))
 
 
 class CoarseItem(BaseModel):
     index: int = Field(description="0-based index of the JD in the batch.")
     score: int = Field(description="0-100 coarse fit score.")
+
+    @field_validator("score")
+    @classmethod
+    def _clamp_score(cls, v: int) -> int:
+        return _clamp_0_100(v)
 
 
 class BatchCoarseResult(BaseModel):
@@ -21,6 +32,11 @@ class MatchResult(BaseModel):
     key_strengths:         list[str]
     critical_gaps:         list[str]
     recommendation_reason: str       = Field(description="Specific, weighted analysis per criteria.")
+
+    @field_validator("compatibility_score")
+    @classmethod
+    def _clamp_compat(cls, v: int) -> int:
+        return _clamp_0_100(v)
 
 
 class TailoredResume(BaseModel):
