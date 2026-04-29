@@ -33,5 +33,7 @@ SYNONYM_GROUPS: list[list[str]] = [
     ["ts", "typescript"],
     # ── Data / APIs ──────────────────────────────────────────────────────
     ["sql", "structured query language"],
-    ["api", "rest api"],
+    # Removed Phase 4: ["api", "rest api"] was too loose — "API" alone in a
+    # resume should NOT auto-match a JD asking for "REST API" specifically;
+    # different specificity levels, not synonyms.
 ]
