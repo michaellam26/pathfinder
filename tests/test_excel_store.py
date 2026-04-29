@@ -1467,6 +1467,139 @@ class TestTailoredMigration(unittest.TestCase):
                 os.remove(path)
 
 
+class TestPRJ002Phase4ATSKeywordsColumn(unittest.TestCase):
+    """PRJ-002 Phase 4 fix — ats_keywords must round-trip through JD_Tracker.
+
+    Pre-fix: job_agent extracted ats_keywords via Gemini, but the upsert path
+    silently dropped the field (JD_HEADERS had no column for it), and
+    get_jd_rows_for_match reconstructed jd_json without it. Result: every
+    call to _extract_ats_keywords returned [], so ATS Coverage % was always
+    None. The flagship dimension didn't actually work.
+    """
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _jd_payload(self, ats_keywords):
+        return json.dumps({
+            "job_title": "AI TPM", "company": "Acme",
+            "location": "Remote", "salary_range": "",
+            "requirements": ["LLM experience"],
+            "additional_qualifications": [],
+            "key_responsibilities": ["Lead roadmap"],
+            "is_ai_tpm": True,
+            "ats_keywords": ats_keywords,
+        })
+
+    def test_jd_headers_has_ats_keywords(self):
+        self.assertIn("ATS Keywords", JD_HEADERS)
+
+    def test_upsert_jd_record_persists_ats_keywords(self):
+        upsert_jd_record(self.path, "https://a.com/1",
+                         self._jd_payload(["PyTorch", "Kubernetes", "LLM"]),
+                         "h1")
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col = headers.index("ATS Keywords") + 1
+        cell = ws.cell(2, col).value or ""
+        for kw in ("PyTorch", "Kubernetes", "LLM"):
+            self.assertIn(kw, cell)
+        wb.close()
+
+    def test_batch_upsert_jd_records_persists_ats_keywords(self):
+        records = [
+            ("https://a.com/1", self._jd_payload(["PyTorch"]), "h1"),
+            ("https://a.com/2", self._jd_payload(["Kubernetes", "MLOps"]), "h2"),
+        ]
+        batch_upsert_jd_records(self.path, records)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col = headers.index("ATS Keywords") + 1
+        self.assertIn("PyTorch", ws.cell(2, col).value or "")
+        self.assertIn("Kubernetes", ws.cell(3, col).value or "")
+        self.assertIn("MLOps", ws.cell(3, col).value or "")
+        wb.close()
+
+    def test_empty_ats_keywords_writes_none_sentinel(self):
+        # Same pattern as requirements / additional_qualifications.
+        upsert_jd_record(self.path, "https://a.com/1",
+                         self._jd_payload([]), "h1")
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col = headers.index("ATS Keywords") + 1
+        self.assertEqual(ws.cell(2, col).value, "None")
+        wb.close()
+
+    def test_get_jd_rows_for_match_round_trips_ats_keywords(self):
+        """End-to-end: write JD with keywords → read back → keywords survive."""
+        upsert_jd_record(self.path, "https://a.com/1",
+                         self._jd_payload(["PyTorch", "Kubernetes", "LLM"]),
+                         "h1")
+        rows = get_jd_rows_for_match(self.path)
+        self.assertEqual(len(rows), 1)
+        parsed = json.loads(rows[0]["jd_json"])
+        self.assertEqual(parsed["ats_keywords"], ["PyTorch", "Kubernetes", "LLM"])
+
+    def test_match_agent_extract_ats_keywords_now_works_end_to_end(self):
+        """Regression test for the Phase 4 ship-blocker: this assertion would
+        have failed pre-fix because get_jd_rows_for_match dropped the field."""
+        from agents.match_agent import _extract_ats_keywords
+        upsert_jd_record(self.path, "https://a.com/1",
+                         self._jd_payload(["PyTorch", "Kubernetes"]),
+                         "h1")
+        rows = get_jd_rows_for_match(self.path)
+        self.assertEqual(_extract_ats_keywords(rows[0]),
+                         ["PyTorch", "Kubernetes"])
+
+
+class TestPRJ002Phase4JDTrackerMigration(unittest.TestCase):
+    """PRJ-002 Phase 4 — pre-fix workbooks (no ATS Keywords column) auto-migrate."""
+
+    def test_migration_adds_ats_keywords_column(self):
+        path = _tmp_xlsx()
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "JD_Tracker"
+            # Pre-Phase-4 JD_HEADERS (12 cols, no "ATS Keywords").
+            old_headers = [
+                "JD URL", "Job Title", "Company", "Location", "Salary",
+                "Requirements", "Additional Qualifications", "Responsibilities",
+                "Is AI TPM", "Updated At", "MD Hash", "Data Quality",
+            ]
+            ws.append(old_headers)
+            ws.append(["https://a.com/1", "TPM", "Acme", "Remote", "",
+                       "• Req 1", "None", "• Resp 1",
+                       "True", "2026-01-01", "h", ""])
+            for required in ("Company_List", "Company_Without_TPM",
+                             "Match_Results", "Tailored_Match_Results"):
+                wb.create_sheet(required)
+            wb.save(path)
+            wb.close()
+
+            get_or_create_excel(path)
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["JD_Tracker"]
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            self.assertIn("ATS Keywords", headers)
+            # Existing row's pre-existing data still intact in original positions.
+            self.assertEqual(ws.cell(2, 1).value, "https://a.com/1")
+            self.assertEqual(ws.cell(2, 2).value, "TPM")
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
 class TestPRJ002Headers(unittest.TestCase):
     """PRJ-002 PR 2 — 3-dimension scoring columns must be in headers."""
 
