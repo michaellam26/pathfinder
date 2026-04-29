@@ -238,7 +238,7 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 |----|----------|------|
 | REQ-107 | Resume optimizer rescores all 3 dimensions on each tailored resume: 1 deterministic ATS pass + 1 Recruiter Gemini call (via single-element `batch_coarse_score` batch) + 1 HM Gemini call (existing `re_score`). Per-dim deltas (ATS / Recruiter / HM) computed and persisted. | `[t]` |
 | REQ-108 | Regression flag = `(HM Delta < 0)` only. ATS / Recruiter drops do NOT trigger regression — a tailor that shifts emphasis away from a recruiter keyword while preserving HM fit is a valid trade-off. Regression precedence in `batch_upsert_tailored_records`: explicit `regression` field > `hm_delta` > legacy `score_delta` (back-compat fallback). | `[t]` |
-| REQ-112 | At least one regression test guards each design decision (D1-D5 in PRJ-002 status.md): ATS-as-parallel-dim (REQ-101), Gemini extracts `ats_keywords` (REQ-100), exact + stem + synonym matching (REQ-102), soft <30% flag (REQ-110), Coarse → Recruiter / Fine → HM rename (REQ-105). | `[t]` |
+| REQ-112 | At least one regression test guards each of the 5 design decisions (D1-D5 in PRJ-002 status.md): ATS-as-parallel-dim (REQ-101), Gemini extracts `ats_keywords` (REQ-100), exact + stem + synonym matching (REQ-102), soft <30% flag (REQ-110), Coarse → Recruiter / Fine → HM rename (REQ-105). | `[t]` |
 
 > **Code location (REQ-100)**: `agents/job_agent.py` — `JobDetails` Pydantic class (line ~122), `extract_jd()` function (`_common_instr` block, line ~1310).
 > **Code location (REQ-101 / REQ-102 / REQ-110)**: `shared/ats_matcher.py`, `shared/ats_synonyms.py`, `shared/schemas.py` (`ATSCoverageResult`).
