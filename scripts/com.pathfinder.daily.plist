@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pathfinder.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/michaelnomad/pathfinder/scripts/run_pipeline_scheduled.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/michaelnomad/pathfinder</string>
+
+    <!-- Fire daily at 04:00 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Don't run when first loaded; wait for the scheduled time. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd-level stdout/stderr (the wrapper script also writes its own
+         per-run log; these capture anything that escapes the wrapper). -->
+    <key>StandardOutPath</key>
+    <string>/Users/michaelnomad/pathfinder/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/michaelnomad/pathfinder/logs/launchd.err.log</string>
+</dict>
+</plist>

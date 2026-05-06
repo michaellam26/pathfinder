@@ -4,6 +4,7 @@ venv/
 
 # Claude Code local settings (per-machine, not shared)
 .claude/settings.local.json
+.claude/worktrees/
 
 # Cache & Temporary Files
 __pycache__/
@@ -26,3 +27,4 @@ jd_cache/
 tailored_resumes/
 archive/
 run_logs/
+logs/
