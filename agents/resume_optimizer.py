@@ -18,6 +18,7 @@ import hashlib
 import asyncio
 import logging
 import math
+import argparse
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -67,6 +68,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 
 _KEY_POOL: "_GeminiKeyPool | None" = None
 
+# PRJ-004 M1: when True, _save_tailored_resume bypasses the on-disk
+# tamper check and unconditionally overwrites. Set by --force-rewrite CLI.
+_FORCE_REWRITE: bool = False
+
 
 # ── Pydantic schemas: see shared/schemas.py ───────────────────────────────────
 # ── Prompts: see shared/prompts.py ────────────────────────────────────────────
@@ -96,18 +101,57 @@ def _load_jd_markdown(url: str) -> str | None:
 _RESUME_STYLE: dict | None = None  # populated by main() from input PDF (if any)
 
 
-def _save_tailored_resume(resume_id: str, url: str, content: str) -> str:
+def _compute_file_sha256(path: str) -> str | None:
+    """Return sha256 hex of file contents, or None if file does not exist."""
+    if not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _save_tailored_resume(resume_id: str, url: str, content: str,
+                          expected_hash: str | None = None,
+                          force: bool = False) -> str | None:
     """Save tailored resume to tailored_resumes/{resume_id}/{url_md5}.md.
 
     Also writes a sibling .pdf using shared.resume_io.markdown_to_pdf with the
     style captured from the input PDF (if any) — ATS-safe by construction.
-    Returns the .md path.
+
+    PRJ-004 M1 — user-edit protection: if the on-disk .md exists and its
+    sha256 does not match `expected_hash` (the hash we recorded the last
+    time we wrote this file, persisted in Tailored_Match_Results.Last
+    Written Hash), assume the user hand-edited it and skip both the .md
+    write and the .pdf render. Caller treats None as "skipped" and should
+    drop the pair from downstream Excel updates so the existing row stays
+    aligned with the on-disk (user-edited) file.
+
+    Args:
+      expected_hash: empty/None means "no prior-write record on file"
+        (legacy row or fresh pair) — write without tamper-checking.
+      force: True bypasses the tamper check (--force-rewrite CLI).
+
+    Returns the .md path on success, or None when skipped due to tamper
+    detection.
     """
     subdir = os.path.join(TAILORED_DIR, resume_id)
     os.makedirs(subdir, exist_ok=True)
     md5 = hashlib.md5(url.encode()).hexdigest()
     md_path = os.path.join(subdir, f"{md5}.md")
     pdf_path = os.path.join(subdir, f"{md5}.pdf")
+
+    if not force and expected_hash:
+        on_disk = _compute_file_sha256(md_path)
+        if on_disk is not None and on_disk != expected_hash:
+            logging.warning(
+                f"user_edit_detected: {md_path} (on-disk sha256={on_disk[:8]}… "
+                f"≠ expected={expected_hash[:8]}…). Skipping overwrite to "
+                f"preserve your edit. Use --force-rewrite to override."
+            )
+            return None
+
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(content)
     try:
@@ -351,8 +395,11 @@ async def _main_inner(summary: RunSummary):
     print(f"[Phase 1] Batch tailoring {len(job_items)} jobs in {n_tailor_batches} batches "
           f"(batch_size={BATCH_TAILOR_SIZE})...\n")
 
-    tailor_results: dict[str, dict] = {}   # url -> {"tailored_md", "opt_summary"}
+    tailor_results: dict[str, dict] = {}   # url -> {"tailored_md", "opt_summary", "last_written_hash"}
     tailor_fallback: list[dict] = []
+    # PRJ-004 M1: pairs whose on-disk .md was hand-edited since our last
+    # write. We skip writing and exclude them from rescore + Excel update.
+    tampered_urls: set[str] = set()
 
     for b in range(n_tailor_batches):
         batch = job_items[b * BATCH_TAILOR_SIZE : (b + 1) * BATCH_TAILOR_SIZE]
@@ -371,11 +418,21 @@ async def _main_inner(summary: RunSummary):
         for item, result in zip(batch, batch_results):
             if result and result.get("tailored_resume_markdown"):
                 url = item["url"]
+                content = result["tailored_resume_markdown"]
+                expected = existing_tailored.get((resume_id, url), {}).get("last_written_hash", "")
+                path = _save_tailored_resume(
+                    resume_id, url, content,
+                    expected_hash=expected, force=_FORCE_REWRITE,
+                )
+                if path is None:
+                    tampered_urls.add(url)
+                    continue
+                new_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 tailor_results[url] = {
-                    "tailored_md": result["tailored_resume_markdown"],
+                    "tailored_md": content,
                     "opt_summary": result.get("optimization_summary", ""),
+                    "last_written_hash": new_hash,
                 }
-                _save_tailored_resume(resume_id, url, result["tailored_resume_markdown"])
             else:
                 tailor_fallback.append(item)
 
@@ -397,16 +454,29 @@ async def _main_inner(summary: RunSummary):
                 md = data.get("tailored_resume_markdown", "")
                 if md:
                     url = item["url"]
+                    expected = existing_tailored.get((resume_id, url), {}).get("last_written_hash", "")
+                    path = _save_tailored_resume(
+                        resume_id, url, md,
+                        expected_hash=expected, force=_FORCE_REWRITE,
+                    )
+                    if path is None:
+                        tampered_urls.add(url)
+                        continue
+                    new_hash = hashlib.sha256(md.encode("utf-8")).hexdigest()
                     tailor_results[url] = {
                         "tailored_md": md,
                         "opt_summary": data.get("optimization_summary", ""),
+                        "last_written_hash": new_hash,
                     }
-                    _save_tailored_resume(resume_id, url, md)
             except Exception as e:
                 logging.error(f"  Fallback tailor parse failed for {item['url']}: {e}")
                 summary.structural_errors += 1
 
     print(f"\n[Phase 1 done] {len(tailor_results)}/{len(job_items)} resumes tailored.")
+    if tampered_urls:
+        print(f"  ⚠️  {len(tampered_urls)} pair(s) skipped: on-disk .md was hand-edited "
+              f"since our last write. Existing Excel rows preserved. "
+              f"Use --force-rewrite to override.")
 
     # ── Phase 2: 3-dim rescore — ATS (det.) + Recruiter (LLM) + HM (LLM) ───
     # Per JD: 1 deterministic ATS pass + 1 Recruiter Gemini call + 1 HM Gemini call.
@@ -545,6 +615,9 @@ async def _main_inner(summary: RunSummary):
             "optimization_summary": tailor_results[url]["opt_summary"],
             "resume_hash": resume_hash,
             "regression": regression,
+            # PRJ-004 M1: persist sha256 of the .md we just wrote so the
+            # next run can detect user hand-edits.
+            "last_written_hash": tailor_results[url]["last_written_hash"],
             # PR 4 per-dim:
             "original_ats": original_ats,
             "tailored_ats": tailored_ats,
@@ -633,4 +706,13 @@ def _print_summary(xlsx_path: str, resume_id: str):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Resume Optimizer Agent")
+    parser.add_argument(
+        "--force-rewrite", action="store_true",
+        help="Bypass user-edit detection and overwrite tailored resumes "
+             "unconditionally (use after intentionally rerunning a tailored "
+             "resume you'd previously hand-edited).",
+    )
+    args = parser.parse_args()
+    _FORCE_REWRITE = args.force_rewrite
     asyncio.run(main())

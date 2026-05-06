@@ -1318,6 +1318,83 @@ class TestGetTailoredMatchPairs(unittest.TestCase):
         self.assertEqual(pairs, {})
 
 
+class TestPRJ004LastWrittenHash(unittest.TestCase):
+    """PRJ-004 M1 — Tailored_Match_Results stores sha256 of last-written .md
+    so the optimizer can detect user hand-edits between runs."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_column_exists_after_migration(self):
+        self.assertIn("Last Written Hash", TAILORED_HEADERS)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        wb.close()
+        self.assertIn("Last Written Hash", headers)
+
+    def test_round_trip_persists_hash(self):
+        """Write a record with last_written_hash → read back via get_tailored_match_pairs."""
+        batch_upsert_tailored_records(self.path, [{
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "job_title": "TPM", "company": "TestCo",
+            "original_score": 60, "tailored_score": 80, "score_delta": 20,
+            "tailored_resume_path": "tailored_resumes/r1/abc.md",
+            "optimization_summary": "x", "resume_hash": "h1",
+            "last_written_hash": "a" * 64,
+        }])
+        pairs = get_tailored_match_pairs(self.path)
+        key = ("r1", "https://a.com/1")
+        self.assertIn(key, pairs)
+        self.assertEqual(pairs[key]["last_written_hash"], "a" * 64)
+
+    def test_missing_key_leaves_cell_untouched_on_update(self):
+        """Re-upserting without last_written_hash must NOT clobber the existing hash.
+
+        This matters for non-write code paths (not currently used, but the
+        contract should match per-dim columns: 'key absent → preserve')."""
+        batch_upsert_tailored_records(self.path, [{
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "job_title": "TPM", "company": "TestCo",
+            "original_score": 60, "tailored_score": 80, "score_delta": 20,
+            "tailored_resume_path": "/p", "optimization_summary": "x",
+            "resume_hash": "h1",
+            "last_written_hash": "b" * 64,
+        }])
+        # Second upsert WITHOUT the key
+        batch_upsert_tailored_records(self.path, [{
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "job_title": "TPM", "company": "TestCo",
+            "original_score": 60, "tailored_score": 85, "score_delta": 25,
+            "tailored_resume_path": "/p", "optimization_summary": "y",
+            "resume_hash": "h1",
+            # last_written_hash absent
+        }])
+        pairs = get_tailored_match_pairs(self.path)
+        self.assertEqual(pairs[("r1", "https://a.com/1")]["last_written_hash"], "b" * 64,
+                         "Hash must be preserved when key is absent from upsert dict")
+
+    def test_legacy_row_returns_empty_string(self):
+        """Rows written before this migration have blank cell → empty string."""
+        # Manually insert a row without populating the new column.
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        # Insert a stub row matching the legacy (pre-M1) column layout.
+        # Column 11 is Resume Hash; new column "Last Written Hash" is later
+        # and stays blank.
+        ws.append(["r2", "https://b.com/2", "PM", "Co", 50, 60, 10,
+                   "/p", "s", "2026-05-05", "h2"])
+        wb.save(self.path)
+        wb.close()
+        pairs = get_tailored_match_pairs(self.path)
+        self.assertEqual(pairs[("r2", "https://b.com/2")]["last_written_hash"], "")
+
+
 class TestBatchUpsertTailoredRecords(unittest.TestCase):
 
     def setUp(self):

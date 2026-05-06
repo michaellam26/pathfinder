@@ -36,7 +36,12 @@ TAILORED_HEADERS = ["Resume ID", "JD URL", "Job Title", "Company", "Original Sco
                     # 3-dimension per-stage scores + deltas (PRJ-002 PR 2):
                     "Original ATS", "Tailored ATS", "ATS Delta",
                     "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
-                    "Original HM", "Tailored HM", "HM Delta"]
+                    "Original HM", "Tailored HM", "HM Delta",
+                    # PRJ-004 M1: sha256 of the .md file content the optimizer
+                    # last wrote. Compared against the on-disk file before any
+                    # subsequent overwrite — mismatch means the user hand-edited
+                    # the file, so we skip the write to preserve their edit.
+                    "Last Written Hash"]
 
 # BUG-52: pre-computed 1-based column indices for JD_Tracker lookups
 _JD_COL = {h: i + 1 for i, h in enumerate(JD_HEADERS)}
@@ -215,6 +220,16 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     changed = True
                     import logging as _log
                     _log.info(f"[Excel] Migrated Tailored_Match_Results: added {_missing} columns.")
+                # PRJ-004 M1: add "Last Written Hash" column. Existing rows
+                # leave it blank — first re-run treats them as "no expected
+                # hash" and writes normally (no false-positive tamper detect).
+                tm_headers = [ws_tm.cell(1, c).value for c in range(1, ws_tm.max_column + 1)]
+                if "Last Written Hash" not in tm_headers:
+                    next_col = ws_tm.max_column + 1
+                    ws_tm.cell(1, next_col).value = "Last Written Hash"
+                    changed = True
+                    import logging as _log
+                    _log.info("[Excel] Migrated Tailored_Match_Results: added 'Last Written Hash' column.")
             if changed:
                 wb.save(xlsx_path)
         finally:
@@ -950,12 +965,20 @@ def get_scored_matches(xlsx_path: str = EXCEL_PATH,
 
 
 def get_tailored_match_pairs(xlsx_path: str = EXCEL_PATH) -> dict:
-    """Returns {(resume_id, jd_url): {"tailored_score": int, "resume_hash": str}}."""
+    """Returns {(resume_id, jd_url): {"tailored_score": int, "resume_hash": str,
+                                       "last_written_hash": str}}.
+
+    `last_written_hash` is the sha256 the optimizer recorded the last time it
+    wrote the .md file. Empty string for legacy rows (pre-PRJ-004 M1) — the
+    optimizer treats empty as "no expected hash, safe to write".
+    """
     wb = load_workbook(xlsx_path, read_only=True)
     try:
         if "Tailored_Match_Results" not in wb.sheetnames:
             return {}
         ws    = wb["Tailored_Match_Results"]
+        ws_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col_lwh = ws_headers.index("Last Written Hash") + 1 if "Last Written Hash" in ws_headers else None
         pairs = {}
         for r in range(2, ws.max_row + 1):
             rid = ws.cell(r, 1).value
@@ -963,9 +986,11 @@ def get_tailored_match_pairs(xlsx_path: str = EXCEL_PATH) -> dict:
             if rid and url:
                 t_score = ws.cell(r, 6).value or 0
                 rhash   = ws.cell(r, 11).value or ""
+                lwh     = (ws.cell(r, col_lwh).value or "") if col_lwh else ""
                 pairs[(str(rid), str(url))] = {
                     "tailored_score": int(t_score) if isinstance(t_score, (int, float)) else 0,
                     "resume_hash": str(rhash),
+                    "last_written_hash": str(lwh),
                 }
         return pairs
     finally:
@@ -1019,6 +1044,7 @@ def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
                 "Original ATS", "Tailored ATS", "ATS Delta",
                 "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
                 "Original HM", "Tailored HM", "HM Delta",
+                "Last Written Hash",
             )
         }
         for rec in records:
@@ -1061,6 +1087,11 @@ def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
             for rec_key, col_name in _dim_keys:
                 if rec_key in rec and _dim_cols[col_name]:
                     ws.cell(target_row, _dim_cols[col_name], rec[rec_key])
+            # PRJ-004 M1: sha256 of the .md content the optimizer just wrote.
+            # Same "key present → write" semantics as per-dim cols above.
+            if "last_written_hash" in rec and _dim_cols["Last Written Hash"]:
+                ws.cell(target_row, _dim_cols["Last Written Hash"],
+                        rec["last_written_hash"])
         wb.save(xlsx_path)
         return len(records)
     finally:

@@ -48,6 +48,7 @@ from agents.resume_optimizer import (
     load_resume,
     _load_jd_markdown,
     _save_tailored_resume,
+    _compute_file_sha256,
     _print_summary,
     tailor_resume,
     re_score,
@@ -163,6 +164,169 @@ class TestSaveTailoredResume(unittest.TestCase):
             md5 = hashlib.md5("https://a.com/1".encode()).hexdigest()
             self.assertIn(md5, path)
             self.assertTrue(path.endswith(".md"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPRJ004UserEditProtection(unittest.TestCase):
+    """PRJ-004 M1 — _save_tailored_resume protects user hand-edits via sha256.
+
+    Without protection, a daily scheduled re-run silently overwrites any
+    tailored resume the user has manually polished — that's the data-loss
+    risk this milestone fixes.
+    """
+
+    def _sha256(self, content: str) -> str:
+        import hashlib as _h
+        return _h.sha256(content.encode("utf-8")).hexdigest()
+
+    def test_no_expected_hash_writes_normally(self):
+        """First-time write (no prior hash on record) → write without check."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(optimizer_mod, "TAILORED_DIR", d):
+                path = _save_tailored_resume(
+                    "r1", "https://a.com/1", "# Fresh",
+                    expected_hash=None, force=False,
+                )
+            self.assertIsNotNone(path)
+            with open(path) as f:
+                self.assertEqual(f.read(), "# Fresh")
+
+    def test_matching_hash_overwrites(self):
+        """File untouched since last write (hash matches) → overwrite cleanly."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(optimizer_mod, "TAILORED_DIR", d):
+                # First write
+                path = _save_tailored_resume("r1", "https://a.com/1", "v1")
+                expected = self._sha256("v1")
+                # Second write with matching expected_hash
+                path2 = _save_tailored_resume(
+                    "r1", "https://a.com/1", "v2",
+                    expected_hash=expected, force=False,
+                )
+            self.assertEqual(path, path2)
+            with open(path2) as f:
+                self.assertEqual(f.read(), "v2")
+
+    def test_mismatched_hash_skips_overwrite(self):
+        """User edited the file (hash doesn't match) → skip, return None, file preserved."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(optimizer_mod, "TAILORED_DIR", d):
+                # Optimizer wrote v1 originally
+                path = _save_tailored_resume("r1", "https://a.com/1", "v1")
+                expected_for_v1 = self._sha256("v1")
+                # User hand-edits the file
+                with open(path, "w") as f:
+                    f.write("user's polished version")
+                # Optimizer tries to overwrite with v2; expected_hash still
+                # reflects v1 → mismatch detected.
+                result = _save_tailored_resume(
+                    "r1", "https://a.com/1", "v2",
+                    expected_hash=expected_for_v1, force=False,
+                )
+            self.assertIsNone(result, "Should return None to signal skip")
+            with open(path) as f:
+                self.assertEqual(f.read(), "user's polished version",
+                                 "User edit must be preserved")
+
+    def test_force_rewrite_bypasses_check(self):
+        """--force-rewrite overwrites even when user edited the file."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(optimizer_mod, "TAILORED_DIR", d):
+                path = _save_tailored_resume("r1", "https://a.com/1", "v1")
+                expected_for_v1 = self._sha256("v1")
+                with open(path, "w") as f:
+                    f.write("user edit")
+                result = _save_tailored_resume(
+                    "r1", "https://a.com/1", "v2",
+                    expected_hash=expected_for_v1, force=True,
+                )
+            self.assertIsNotNone(result)
+            with open(path) as f:
+                self.assertEqual(f.read(), "v2")
+
+    def test_missing_file_writes_even_with_expected_hash(self):
+        """Excel has hash but file was deleted — write fresh (no tamper to detect)."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(optimizer_mod, "TAILORED_DIR", d):
+                # Simulate: previous run wrote file, user deleted it.
+                # expected_hash points to old content but file doesn't exist.
+                result = _save_tailored_resume(
+                    "r1", "https://a.com/1", "fresh content",
+                    expected_hash="deadbeef" * 8, force=False,
+                )
+            self.assertIsNotNone(result)
+            with open(result) as f:
+                self.assertEqual(f.read(), "fresh content")
+
+    def test_empty_string_expected_hash_treated_as_no_hash(self):
+        """Legacy rows have empty Last Written Hash → treat as no record, write."""
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(optimizer_mod, "TAILORED_DIR", d):
+                # Pre-existing file with content the optimizer doesn't know about
+                subdir = os.path.join(d, "r1")
+                os.makedirs(subdir)
+                md5 = hashlib.md5("https://a.com/1".encode()).hexdigest()
+                with open(os.path.join(subdir, f"{md5}.md"), "w") as f:
+                    f.write("legacy content")
+                result = _save_tailored_resume(
+                    "r1", "https://a.com/1", "new",
+                    expected_hash="", force=False,
+                )
+            self.assertIsNotNone(result, "Empty expected_hash must not block write")
+            with open(result) as f:
+                self.assertEqual(f.read(), "new")
+
+
+class TestPRJ004ComputeFileSha256(unittest.TestCase):
+    def test_returns_hex_for_existing_file(self):
+        import hashlib as _h
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md") as f:
+            f.write("hello world")
+            path = f.name
+        try:
+            expected = _h.sha256(b"hello world").hexdigest()
+            self.assertEqual(_compute_file_sha256(path), expected)
+        finally:
+            os.unlink(path)
+
+    def test_returns_none_for_missing_file(self):
+        self.assertIsNone(_compute_file_sha256("/nonexistent/path/xyz.md"))
+
+
+class TestPRJ004OptimizerThreadsExpectedHash(unittest.TestCase):
+    """Source-inspection: Phase 1 batch + Phase 1.5 fallback must pass
+    expected_hash from existing_tailored to _save_tailored_resume so the
+    tamper check actually runs in production.
+    """
+
+    def test_main_inner_passes_expected_hash(self):
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        # Both call sites must thread expected_hash through.
+        self.assertIn("expected_hash=expected", src,
+                      "_main_inner must pass expected_hash to _save_tailored_resume")
+        # And reference last_written_hash from existing_tailored.
+        self.assertIn('"last_written_hash"', src)
+        self.assertIn("force=_FORCE_REWRITE", src,
+                      "_main_inner must pass _FORCE_REWRITE flag through")
+
+    def test_main_inner_records_new_hash(self):
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        # The new hash must be persisted in the result dict for Excel write.
+        self.assertIn("hashlib.sha256(", src)
+        self.assertIn('"last_written_hash": tailor_results[url]["last_written_hash"]', src)
+
+    def test_tampered_pairs_dropped_from_results(self):
+        """When _save_tailored_resume returns None, the URL must not enter
+        tailor_results — otherwise downstream would write Excel rows for a
+        pair whose on-disk file is the user's edit, producing inconsistent
+        scores."""
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        self.assertIn("tampered_urls", src)
+        # The skip path uses `continue` after tampered_urls.add(...).
+        self.assertIn("tampered_urls.add(url)", src)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
