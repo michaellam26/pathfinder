@@ -42,9 +42,12 @@ docs/
 .claude/
   agents/            # 11 Custom Agents (dev-time analysis, read-only)
   skills/            # 8 Skills (SDLC coordination + operational execution)
-profile/             # Candidate resume (.md/.txt)
+profile/             # Candidate resume (.md/.txt/.pdf — picker priority in that order)
+profile/.cache/      # Auto-generated MD from PDF input (deterministic, hash-keyed)
+templates/           # PDF rendering assets
+  resume.css         # ATS-safe CSS for tailored-resume PDF output
 jd_cache/            # JD Markdown cache (auto-created)
-tailored_resumes/    # Tailored resume output (auto-created)
+tailored_resumes/    # Tailored resume output (auto-created; .md + .pdf per JD)
 venv/                # Python 3.11 virtualenv
 .env                 # API keys (not committed)
 ```
@@ -72,6 +75,8 @@ This is a **multi-agent AI project**. The expected pattern:
 | `pydantic` | Structured output schemas for Gemini JSON response validation |
 | `requests` | HTTP requests for ATS API calls and JD scrape fallback |
 | `openpyxl` | Excel file read/write (core data store) |
+| `pdfplumber` | Deterministic PDF→text extraction with layout/font metadata (PRJ-003) |
+| `weasyprint` | MD→PDF rendering for tailored resumes (PRJ-003) — requires `brew install pango` on macOS |
 
 ## Running Agents
 

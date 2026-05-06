@@ -1,0 +1,97 @@
+/* ATS-safe resume PDF stylesheet.
+ *
+ * Rules baked in:
+ *   - single column, no floats / multi-column for layout
+ *   - standard fonts only (Helvetica/Arial/Times/Calibri/Georgia fallbacks)
+ *   - no images, no headers/footers, no text boxes
+ *   - real Unicode bullets (•), selectable text
+ *   - section headings use plain bold, not graphics
+ *
+ * Two CSS variables can be overridden inline by markdown_to_pdf() to mimic the
+ * source PDF typography (font_family, body_size). h1/h2 sizes scale off body.
+ */
+
+:root {
+    --resume-font-family: Helvetica, Arial, sans-serif;
+    --resume-body-size: 10.5pt;
+}
+
+@page {
+    size: Letter;
+    margin: 0.6in 0.7in;
+}
+
+html, body {
+    font-family: var(--resume-font-family);
+    font-size: var(--resume-body-size);
+    line-height: 1.32;
+    color: #111;
+    margin: 0;
+    padding: 0;
+}
+
+p {
+    margin: 0.18em 0 0.32em 0;
+}
+
+h1 {
+    font-size: calc(var(--resume-body-size) * 1.55);
+    font-weight: 700;
+    margin: 0 0 0.15em 0;
+    letter-spacing: 0.3px;
+    text-align: center;
+}
+
+h2 {
+    font-size: calc(var(--resume-body-size) * 1.08);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 0.85em 0 0.25em 0;
+    padding-bottom: 2px;
+    border-bottom: 0.7pt solid #222;
+}
+
+h3 {
+    font-size: calc(var(--resume-body-size) * 1.0);
+    font-weight: 700;
+    margin: 0.55em 0 0.15em 0;
+}
+
+ul {
+    margin: 0.15em 0 0.4em 0;
+    padding-left: 1.15em;
+}
+
+li {
+    margin: 0.1em 0;
+    /* Avoid mid-line breaks across pages on bullets when possible. */
+    break-inside: avoid-page;
+}
+
+a {
+    color: #111;
+    text-decoration: none;
+}
+
+strong, b { font-weight: 700; }
+em, i     { font-style: italic; }
+
+hr {
+    border: 0;
+    border-top: 0.7pt solid #555;
+    margin: 0.5em 0;
+}
+
+/* Tables, if any sneak in from markdown — render simply, no merged cells. */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.3em 0;
+}
+td, th {
+    border: 0.5pt solid #888;
+    padding: 3pt 5pt;
+    text-align: left;
+    vertical-align: top;
+}

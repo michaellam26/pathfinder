@@ -249,6 +249,23 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 
 ---
 
+## 9.5 PRJ-003: PDF Resume I/O
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-120 | `profile/` accepts `.pdf` resumes in addition to `.md` / `.txt`. Picker priority: `.md > .txt > .pdf` so a hand-edited `.md` always wins over an auto-converted PDF. | `[t]` |
+| REQ-121 | PDF → Markdown conversion is deterministic (no LLM). Uses `pdfplumber` for layout-aware text extraction; section headers detected via font-size hierarchy (≥1.15× body) and all-caps short lines; bullets normalized to `- ` markdown. | `[t]` |
+| REQ-122 | PDF→MD output cached at `profile/.cache/{stem}.{md5_short}.md` keyed by SHA-truncated PDF byte hash. Cache hit ⇒ zero recompute. PDF edits change hash ⇒ fresh conversion. | `[t]` |
+| REQ-123 | `resume_id` (Excel join key) is preserved across input formats: it equals the source file stem regardless of `.md` / `.txt` / `.pdf` extension. Existing Excel rows remain valid after switching input formats. | `[t]` |
+| REQ-124 | Each tailored resume Markdown at `tailored_resumes/{resume_id}/{md5}.md` is also rendered as a sibling `{md5}.pdf` via WeasyPrint. PDF generation failures log a warning but never block the pipeline; the `.md` remains source of truth. | `[t]` |
+| REQ-125 | Tailored PDF output is ATS-safe by construction: single column, standard fonts only (Helvetica / Arial / Times / Calibri / Georgia stack), no images / multi-column / headers / footers / text boxes, real Unicode bullets, selectable text. Enforced via `templates/resume.css`. | `[t]` |
+| REQ-126 | Tailored PDF typography mimics input PDF's font family + body size (read once at PDF→MD conversion, persisted to `profile/.cache/{stem}.{md5_short}.style.json`, injected as CSS variables). Body size clamped to [9pt, 12pt]. ATS-safe rules win where they conflict with input fidelity. | `[t]` |
+| REQ-127 | `load_resume()` is centralized in `shared/resume_io.py` and imported by both `agents/match_agent.py` and `agents/resume_optimizer.py` (single source of truth). | `[t]` |
+
+> **Code location (REQ-120 ~ REQ-127)**: `shared/resume_io.py` — `_pick_resume_file`, `pdf_to_markdown`, `_extract_with_layout`, `_lines_to_markdown`, `_convert_and_cache`, `load_resume`, `markdown_to_pdf`, `_md_to_html`, `_build_html_doc`, `get_style_for_resume`. Plus `templates/resume.css` (ATS-safe stylesheet) and `agents/resume_optimizer.py:_save_tailored_resume` (writes both `.md` and `.pdf`).
+
+---
+
 ## 10. Technical Decision Record
 
 ### DEC-001: LLM Model Selection — Retain Gemini flash-lite (2026-03-16)
@@ -290,3 +307,4 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 | v1.7 | 2026-03-16 | Added "Architecture Extensibility (P3)" subsection. REQ-062 (ATS declarative routing table refactor, P3), REQ-063 (automatic archival of companies with no TPM jobs, P3, automated implementation of REQ-029). |
 | v1.8 | 2026-03-16 | REQ-062, REQ-063 verified and passed; status updated to `[x]`. REQ-062: Added `ATS_PLATFORMS` declarative routing table (6 entries: greenhouse/lever/ashby/workday/google/tesla), `_match_ats()` route matching function, `_resolve_list_fn()` and `_discover_via_api()` helper functions, `_JD_FN_REGISTRY` JD routing registry; `API_ATS`/`WORKDAY_ATS`/`CRAWLER_ATS` auto-derived from routing table; 9 `_match_ats` tests + 5 routing table integrity tests all passed. REQ-063: `shared/config.py` added `AUTO_ARCHIVE_THRESHOLD=3`; `shared/excel_store.py` added `No TPM Count`/`Auto Archived` columns, migration logic, `get_archived_companies`/`update_archive_status`/`unarchive_company`/`get_company_archive_info`/`count_valid_tpm_jobs_by_company` five functions; `agents/job_agent.py` main() skips archived companies before iteration, updates archive status by threshold after iteration, `data_quality=failed` records excluded from count; 28 related tests (11 job_agent + 16 excel_store + 5 count_valid) all passed. |
 | v1.9 | 2026-04-28 | Added "9. PRJ-002: 3-Dimension Scoring Requirements" section: REQ-100~112 covering ATS dimension (deterministic keyword coverage, REQ-100~102, REQ-110), Excel schema extensions (REQ-103, REQ-104, REQ-109, REQ-111), prompt rename pivot (REQ-105), match_agent integration (REQ-106), resume_optimizer integration (REQ-107~108), test coverage (REQ-112). Implemented across 5 sequential PRs (`feat/3d-scoring` branch). Tests: 619 → 718 (+99). Also updated REQ-033 (marked obsolete: keyword pre-filter removed in P0-8), REQ-035 (top 20% → UNION threshold/top-N% per P0-9), REQ-052 (renamed FINE_SYSTEM_PROMPT to HM_SYSTEM_PROMPT, dropped batch_re_score reference per P0-10). |
+| v2.0 | 2026-05-05 | Added "9.5 PRJ-003: PDF Resume I/O" section: REQ-120~127 covering PDF→MD input via `pdfplumber` (deterministic, no LLM) with layout-aware section/bullet detection (REQ-120~123), MD→PDF output via WeasyPrint with ATS-safe CSS (REQ-124~126), and `load_resume` centralization in `shared/resume_io.py` (REQ-127). Tests: 736 → 749 (+13). Companion artifact: `docs/sdlc/PRJ-003-pdf-io-opus-eval/eval.md` — Claude Opus 4.7 vs Gemini 3.1 Flash Lite tailor-step memo (verdict: not as full swap; opt-in fallback only). |

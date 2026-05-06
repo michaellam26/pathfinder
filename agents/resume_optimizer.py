@@ -47,6 +47,7 @@ from shared.schemas import (
 #   - HM dim: existing re_score() with FINE_SYSTEM_PROMPT (kept identical
 #     to match_agent's Stage 2 so deltas are comparable per REQ-052).
 from shared.ats_matcher import compute_coverage
+from shared.resume_io import load_resume, get_style_for_resume, markdown_to_pdf
 from agents.match_agent import batch_coarse_score, _extract_ats_keywords
 
 # BUG-41: single shared limiter for all Gemini calls
@@ -75,22 +76,7 @@ RESCORE_CONCURRENCY = 3  # parallel single-JD re-score calls (matches match_agen
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-def load_resume(folder: str) -> tuple:
-    """Returns (resume_text, resume_id). resume_id = filename without extension."""
-    if not os.path.exists(folder):
-        logging.error(f"Profile folder not found: {folder}")
-        return "", ""
-    files = [f for f in os.listdir(folder)
-             if not f.startswith('.') and f.lower().endswith(('.md', '.txt'))]
-    if not files:
-        logging.error(f"No .md/.txt files in {folder}")
-        return "", ""
-    fname = files[0]
-    with open(os.path.join(folder, fname), encoding="utf-8") as fh:
-        text = fh.read()
-    resume_id = os.path.splitext(fname)[0]
-    logging.info(f"Loaded resume: {fname}  ({len(text)} chars)")
-    return text, resume_id
+# load_resume now lives in shared/resume_io.py and supports .md/.txt/.pdf.
 
 
 def _load_jd_markdown(url: str) -> str | None:
@@ -107,15 +93,29 @@ def _load_jd_markdown(url: str) -> str | None:
     return None
 
 
+_RESUME_STYLE: dict | None = None  # populated by main() from input PDF (if any)
+
+
 def _save_tailored_resume(resume_id: str, url: str, content: str) -> str:
-    """Save tailored resume to tailored_resumes/{resume_id}/{url_md5}.md. Returns path."""
+    """Save tailored resume to tailored_resumes/{resume_id}/{url_md5}.md.
+
+    Also writes a sibling .pdf using shared.resume_io.markdown_to_pdf with the
+    style captured from the input PDF (if any) — ATS-safe by construction.
+    Returns the .md path.
+    """
     subdir = os.path.join(TAILORED_DIR, resume_id)
     os.makedirs(subdir, exist_ok=True)
     md5 = hashlib.md5(url.encode()).hexdigest()
-    path = os.path.join(subdir, f"{md5}.md")
-    with open(path, "w", encoding="utf-8") as f:
+    md_path = os.path.join(subdir, f"{md5}.md")
+    pdf_path = os.path.join(subdir, f"{md5}.pdf")
+    with open(md_path, "w", encoding="utf-8") as f:
         f.write(content)
-    return path
+    try:
+        markdown_to_pdf(content, pdf_path, style=_RESUME_STYLE)
+    except Exception as e:
+        # PDF generation is a presentation aid, never block the pipeline on it.
+        logging.warning(f"PDF generation failed for {pdf_path}: {e}")
+    return md_path
 
 
 # ── Gemini calls ─────────────────────────────────────────────────────────────
@@ -271,11 +271,13 @@ async def _main_inner(summary: RunSummary):
     print("RESUME OPTIMIZER AGENT")
     print("=" * 60 + "\n")
 
-    # 1. Load resume
+    # 1. Load resume (supports .md / .txt / .pdf via shared.resume_io)
+    global _RESUME_STYLE
     resume_text, resume_id = load_resume(PROFILE_DIR)
     if not resume_text:
         print(f"No resume found in {PROFILE_DIR}")
         return
+    _RESUME_STYLE = get_style_for_resume(PROFILE_DIR)
 
     resume_hash = hashlib.md5(resume_text.encode("utf-8")).hexdigest()
     print(f"Resume: {resume_id}  (MD5: {resume_hash[:8]}...)")

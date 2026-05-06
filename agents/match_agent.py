@@ -60,6 +60,7 @@ from shared.config import MODEL, JD_CACHE_DIR
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
 from shared.run_summary import RunSummary
 from shared.ats_matcher import compute_coverage
+from shared.resume_io import load_resume
 
 # PRJ-002: Coverage % below this gets a ⚠️ marker in the printed summary.
 # Soft signal only — JDs are NOT dropped or excluded from fine eval.
@@ -99,22 +100,8 @@ _FINE_CACHE_NAME: str | None = None
 
 
 # ── Resume loader ─────────────────────────────────────────────────────────────
-def load_resume(folder: str) -> tuple:
-    """Returns (resume_text, resume_id). resume_id = filename without extension."""
-    if not os.path.exists(folder):
-        logging.error(f"Profile folder not found: {folder}")
-        return "", ""
-    files = [f for f in os.listdir(folder)
-             if not f.startswith('.') and f.lower().endswith(('.md', '.txt'))]
-    if not files:
-        logging.error(f"No .md/.txt files in {folder}")
-        return "", ""
-    fname = files[0]
-    with open(os.path.join(folder, fname), encoding="utf-8") as fh:
-        text = fh.read()
-    resume_id = os.path.splitext(fname)[0]
-    logging.info(f"Loaded resume: {fname}  ({len(text)} chars)")
-    return text, resume_id
+# load_resume now lives in shared/resume_io.py and supports .md/.txt/.pdf
+# (PDFs are converted via pdfplumber and cached under profile/.cache/).
 
 
 # ── Stage 1: batch coarse scoring ────────────────────────────────────────────
