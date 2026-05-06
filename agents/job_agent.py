@@ -33,7 +33,7 @@ from shared.excel_store import (
     get_jd_urls, upsert_jd_record, batch_upsert_jd_records,
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
     get_archived_companies, get_company_archive_info, update_archive_status,
-    count_valid_tpm_jobs_by_company,
+    count_valid_tpm_jobs_by_company, sort_jd_tracker_by_tier,
 )
 
 from shared.gemini_pool import _GeminiKeyPoolBase
@@ -124,6 +124,67 @@ _GEMINI_LIMITER = _RateLimiter(rpm=10)  # conservative: 15 RPM hard limit
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 _FC_MAP_LIMITER  = _RateLimiter(rpm=1)  # hard limit: 1 crawl/min (Firecrawl map)
 
+# ── HTTP retry helper (audit P1: ATS API silent failures) ─────────────────────
+# Transient 5xx and 429 used to return [] on first attempt with no retry,
+# making "API down" indistinguishable from "zero jobs." Exponential backoff
+# at 0.5/1.5/3.5s — total worst case ~5.5s per slug, acceptable for our
+# ~150 companies × weekly cadence.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRY_BASE_SLEEP_SECS = 0.5  # tests can monkey-patch to 0 to skip backoff
+
+def _http_request_with_retry(method: str, url: str, *, attempts: int = 3,
+                             timeout: int = 12, **kwargs) -> "requests.Response | None":
+    """Issue an HTTP request with exponential backoff on transient failures.
+
+    Returns the final Response on 2xx/4xx (caller decides), None if all
+    attempts hit a transient error or exception. Logs every retry with
+    URL + status + attempt number so silent failures become visible.
+
+    Dispatches to requests.get / requests.post (rather than requests.request)
+    so existing test patches that mock those names continue to work.
+    """
+    method_upper = method.upper()
+    if method_upper == "GET":
+        fn = requests.get
+    elif method_upper == "POST":
+        fn = requests.post
+    else:
+        fn = lambda u, **kw: requests.request(method_upper, u, **kw)  # noqa: E731
+    last_status: int | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = fn(url, timeout=timeout, **kwargs)
+            if r.status_code in _RETRY_STATUSES and attempt < attempts:
+                wait = _RETRY_BASE_SLEEP_SECS * (2 ** (attempt - 1))
+                logging.warning(
+                    f"[HTTP retry] {method} {url} → {r.status_code} "
+                    f"(attempt {attempt}/{attempts}); sleeping {wait:.1f}s"
+                )
+                time.sleep(wait)
+                last_status = r.status_code
+                continue
+            return r
+        except Exception as e:
+            # Broad except: network failures bubble up as requests.RequestException,
+            # builtin ConnectionError/TimeoutError, urllib3.* errors, or socket.timeout
+            # depending on transport layer. Distinguishing them at the call site has
+            # no value — all are "retry-able transient HTTP failure."
+            if attempt < attempts:
+                wait = _RETRY_BASE_SLEEP_SECS * (2 ** (attempt - 1))
+                logging.warning(
+                    f"[HTTP retry] {method} {url} → {type(e).__name__}: {e} "
+                    f"(attempt {attempt}/{attempts}); sleeping {wait:.1f}s"
+                )
+                time.sleep(wait)
+                continue
+            logging.error(f"[HTTP] {method} {url} failed after {attempts} attempts: "
+                          f"{type(e).__name__}: {e}")
+            return None
+    if last_status is not None:
+        logging.error(f"[HTTP] {method} {url} gave up after {attempts} attempts; last status={last_status}")
+    return None
+
+
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 class TargetJobURLs(BaseModel):
     urls: list[str] = Field(description="Filtered list of AI TPM job URLs.")
@@ -175,6 +236,14 @@ ATS_PLATFORMS = {
         "list_fn":            "_fetch_ashby_jobs",
         "jd_fn":              None,  # generic scrape_jd
     },
+    "workable": {
+        "domains":            ["workable.com", "apply.workable.com"],
+        "board_url_template": "https://apply.workable.com/{slug}/",
+        "slug_pattern":       r"workable\.com/([^/?#]+)",
+        "strategy":           "json_api",
+        "list_fn":            "_fetch_workable_jobs",
+        "jd_fn":              None,  # generic scrape_jd
+    },
     "workday": {
         "domains":            ["myworkdayjobs.com"],
         "board_url_template": None,
@@ -191,6 +260,19 @@ ATS_PLATFORMS = {
         "strategy":           "custom",
         "list_fn":            None,
         "jd_fn":              "_scrape_google_jd",
+    },
+    "microsoft": {
+        # Microsoft careers is a JS SPA at jobs.careers.microsoft.com (current)
+        # and careers.microsoft.com (legacy). Like Google, Crawl4AI captures
+        # the sidebar list which contaminates Gemini extraction. Firecrawl with
+        # only_main_content=True isolates the actual JD body.
+        "domains":            [],
+        "jd_domains":         ["jobs.careers.microsoft.com", "careers.microsoft.com"],
+        "board_url_template": None,
+        "slug_pattern":       None,
+        "strategy":           "custom",
+        "list_fn":            None,
+        "jd_fn":              "_scrape_microsoft_jd",
     },
     "tesla": {
         "domains":            [],  # Tesla has no ATS board URLs for discovery
@@ -229,6 +311,8 @@ ATS_SEARCH_PARAM = {
     "greenhouse": "keyword=Technical+Program+Manager",
     "lever":      "search=Technical+Program+Manager",
     "ashby":      "search=Technical+Program+Manager",
+    "workable":   "query=Technical+Program+Manager",
+    "workday":    "q=Technical+Program+Manager",
 }
 
 # ── Company classification (affects is_ai_tpm prompt logic) ──────────────────
@@ -253,13 +337,17 @@ def _classify(name: str) -> str:
 
 def _classify_by_domain(ai_domain: str) -> str:
     """Classify using the ai_domain field stored in the company Excel row.
-    Takes precedence over the hardcoded name-matching fallback."""
+    Takes precedence over the hardcoded name-matching fallback.
+
+    Big Tech AND Consumer ML Tech both classify as big_tech so the AI title
+    prefilter is applied — Netflix/Spotify/Pinterest etc. post many non-AI
+    TPM roles that should be filtered out before extraction.
+    """
     d = (ai_domain or "").lower().strip()
     if not d or d in ("n/a", "unknown", ""):
         return "unknown"
-    if "big tech" in d:
+    if "big tech" in d or "consumer ml" in d:
         return "big_tech"
-    # All explicit AI domain categories → treat as ai_native
     return "ai_native"
 
 # ── US location detection via pycountry (no hardcoded non-US lists) ───────────
@@ -395,10 +483,14 @@ def _fetch_ats_jobs(career_url: str) -> list:
         return []
     slug    = m.group(1).split('/')[0]
     api_url = cfg["api_template"].format(slug=slug)
+    r = _http_request_with_retry("GET", api_url, timeout=10,
+                                 headers={"User-Agent": "PathFinder/1.0"})
+    if r is None:
+        return []
+    if r.status_code != 200:
+        logging.warning(f"[ATS API] {r.status_code} for {api_url}")
+        return []
     try:
-        r    = requests.get(api_url, timeout=10, headers={"User-Agent": "PathFinder/1.0"})
-        if r.status_code != 200:
-            return []
         data     = r.json()
         job_list = data if cfg["jobs_key"] is None else data.get(cfg["jobs_key"], [])
         results  = []
@@ -414,8 +506,8 @@ def _fetch_ats_jobs(career_url: str) -> list:
                 results.append({"url": job_url, "title": title, "location": loc.strip()})
         logging.info(f"[ATS API] {len(results)} jobs for {slug}")
         return results
-    except Exception as e:
-        logging.error(f"[ATS API] {e}")
+    except (ValueError, KeyError, TypeError) as e:
+        logging.error(f"[ATS API] parse error for {api_url}: {type(e).__name__}: {e}")
         return []
 
 def _fetch_ashby_jobs(career_url: str) -> list:
@@ -432,11 +524,14 @@ def _fetch_ashby_jobs(career_url: str) -> list:
     slug = m.group(1).split('/')[0]
     api_url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
     logging.info(f"[Ashby API] GET {api_url}")
+    r = _http_request_with_retry("GET", api_url, timeout=10,
+                                 headers={"User-Agent": "PathFinder/1.0"})
+    if r is None:
+        return []
+    if r.status_code != 200:
+        logging.warning(f"[Ashby API] {r.status_code} for {api_url}")
+        return []
     try:
-        r = requests.get(api_url, timeout=10, headers={"User-Agent": "PathFinder/1.0"})
-        if r.status_code != 200:
-            logging.warning(f"[Ashby API] {r.status_code} for {api_url}")
-            return []
         data = r.json()
         jobs = data.get("jobs", [])
         results = []
@@ -454,8 +549,70 @@ def _fetch_ashby_jobs(career_url: str) -> list:
                 results.append({"url": job_url, "title": title, "location": loc})
         logging.info(f"[Ashby API] {len(results)} jobs for {slug}")
         return results
-    except Exception as e:
-        logging.error(f"[Ashby API] {e}")
+    except (ValueError, KeyError, TypeError) as e:
+        logging.error(f"[Ashby API] parse error for {api_url}: {type(e).__name__}: {e}")
+        return []
+
+def _format_workable_location(job: dict) -> str:
+    """Build a location string from Workable's multi-field shape.
+
+    Workable returns city / state / country plus an optional locations[] array
+    for multi-location postings, and a `telecommuting` bool for remote roles.
+    Multiple segments are joined with "; " so _is_us multi-location parsing works.
+    """
+    parts: list[str] = []
+    if job.get("telecommuting"):
+        parts.append("Remote")
+    locs = job.get("locations") or []
+    if locs:
+        for loc in locs:
+            seg = ", ".join(s for s in (loc.get("city"), loc.get("region"), loc.get("country")) if s)
+            if seg:
+                parts.append(seg)
+    else:
+        seg = ", ".join(s for s in (job.get("city"), job.get("state"), job.get("country")) if s)
+        if seg:
+            parts.append(seg)
+    return "; ".join(parts)
+
+def _fetch_workable_jobs(career_url: str) -> list:
+    """Fetch jobs from Workable's public widget API.
+
+    Endpoint: GET https://apply.workable.com/api/v1/widget/accounts/{slug}
+    Returns structured data matching Greenhouse/Lever/Ashby format:
+        [{"url": ..., "title": ..., "location": ...}, ...]
+    """
+    m = re.search(r"workable\.com/([^/?#]+)", career_url)
+    if not m:
+        logging.warning(f"[Workable API] Cannot extract slug from {career_url}")
+        return []
+    slug = m.group(1).split('/')[0]
+    api_url = f"https://apply.workable.com/api/v1/widget/accounts/{slug}"
+    logging.info(f"[Workable API] GET {api_url}")
+    r = _http_request_with_retry("GET", api_url, timeout=10,
+                                 headers={"User-Agent": "PathFinder/1.0"})
+    if r is None:
+        return []
+    if r.status_code != 200:
+        logging.warning(f"[Workable API] {r.status_code} for {api_url}")
+        return []
+    try:
+        data = r.json()
+        jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        results = []
+        for job in jobs:
+            title = (job.get("title") or "").strip()
+            shortcode = (job.get("shortcode") or "").strip()
+            job_url = (job.get("url") or job.get("shortlink") or "").strip()
+            if not job_url and shortcode:
+                job_url = f"https://apply.workable.com/j/{shortcode}"
+            location = _format_workable_location(job)
+            if job_url and title:
+                results.append({"url": job_url, "title": title, "location": location})
+        logging.info(f"[Workable API] {len(results)} jobs for {slug}")
+        return results
+    except (ValueError, KeyError, TypeError) as e:
+        logging.error(f"[Workable API] parse error for {api_url}: {type(e).__name__}: {e}")
         return []
 
 def _tpm_filter(links: list) -> list:
@@ -477,6 +634,7 @@ _TITLE_BLOCK_KW = frozenset([
     "logistics", "retail", "marketing", "sales", "operations",
     "recruiting", "facilities", "real estate", "accounting",
     "tax", "treasury", "procurement", "customer success",
+    "sox", "compliance", "audit", "governance", "grc",
 ])
 
 def _ai_title_prefilter(links: list, ai_domain: str) -> list:
@@ -519,14 +677,16 @@ def _fetch_workday_jobs(career_url: str) -> list:
     api_url = f"{host}/wday/cxs/{company_slug}/{site_slug}/jobs"
     payload = {"limit": 20, "offset": 0, "searchText": "Technical Program Manager"}
     logging.info(f"[Workday API] POST {api_url}")
+    r = _http_request_with_retry(
+        "POST", api_url, timeout=12, json=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "PathFinder/1.0"},
+    )
+    if r is None:
+        return []
+    if r.status_code != 200:
+        logging.warning(f"[Workday API] {r.status_code} for {api_url}")
+        return []
     try:
-        r = requests.post(
-            api_url, json=payload, timeout=12,
-            headers={"Content-Type": "application/json", "User-Agent": "PathFinder/1.0"},
-        )
-        if r.status_code != 200:
-            logging.warning(f"[Workday API] {r.status_code} for {api_url}")
-            return []
         base     = f"{host}/{site_slug}"
         postings = r.json().get("jobPostings", [])
         results  = []
@@ -545,8 +705,8 @@ def _fetch_workday_jobs(career_url: str) -> list:
                                  "_workday": True})
         logging.info(f"[Workday API] {len(results)} postings for {company_slug}/{site_slug}")
         return results
-    except Exception as e:
-        logging.error(f"[Workday API] {e}")
+    except (ValueError, KeyError, TypeError) as e:
+        logging.error(f"[Workday API] parse error for {api_url}: {type(e).__name__}: {e}")
         return []
 
 # ── ATS link detection in rendered pages ─────────────────────────────────────
@@ -585,7 +745,9 @@ async def _crawl_page(url: str, crawler) -> list:
     )
     try:
         res = await crawler.arun(url=url, config=cfg)
-        if not res.success: return []
+        if not res.success:
+            logging.warning(f"[Crawl4AI] render failed for {url}: success=False")
+            return []
         out = []
         if hasattr(res, "links") and isinstance(res.links, dict):
             for lnk in res.links.get("internal",[]) + res.links.get("external",[]):
@@ -595,7 +757,7 @@ async def _crawl_page(url: str, crawler) -> list:
                     out.append({"url": href.strip(), "title": text.strip()})
         return out
     except Exception as e:
-        logging.error(f"[Crawl4AI] {e}")
+        logging.error(f"[Crawl4AI] {url}: {type(e).__name__}: {e}")
         return []
 
 async def _crawl_ats_board(board_url: str, platform: str, crawler) -> list:
@@ -650,9 +812,10 @@ def _merge_filter(batches: list) -> list:
 def _resolve_list_fn(fn_name: str):
     """Resolve a list_fn name string to the actual callable."""
     return {
-        "_fetch_ats_jobs":     _fetch_ats_jobs,
-        "_fetch_ashby_jobs":   _fetch_ashby_jobs,
-        "_fetch_workday_jobs": _fetch_workday_jobs,
+        "_fetch_ats_jobs":      _fetch_ats_jobs,
+        "_fetch_ashby_jobs":    _fetch_ashby_jobs,
+        "_fetch_workable_jobs": _fetch_workable_jobs,
+        "_fetch_workday_jobs":  _fetch_workday_jobs,
     }[fn_name]
 
 
@@ -776,7 +939,8 @@ def llm_filter_jobs(company: str, links: list) -> list:
         )
         return json.loads(resp.text).get("urls", [])
     except Exception as e:
-        logging.error(f"LLM filter failed: {e}")
+        logging.error(f"[LLM filter] failed for {company} ({len(links)} links): "
+                      f"{type(e).__name__}: {e}")
         return []
 
 # ── Google Careers JD scraper (Firecrawl only_main_content avoids sidebar) ─────
@@ -869,6 +1033,75 @@ def _scrape_google_jd(url: str, fc_key: str = "") -> str:
                 return "\n".join(lines)
     except Exception as e:
         logging.debug(f"[Google JD] requests failed: {e}")
+
+    return ""
+
+
+# ── Microsoft Careers JD scraper (Firecrawl only_main_content) ────────────────
+def _scrape_microsoft_jd(url: str, fc_key: str = "") -> str:
+    """
+    Microsoft careers (jobs.careers.microsoft.com / careers.microsoft.com) are
+    JS SPAs whose server-rendered HTML is mostly navbar / theme JSON. Crawl4AI
+    captures the sidebar job list, contaminating Gemini's extraction with
+    "Other open roles" content (audit Line 2 — ~40-50% of MS cached JDs were
+    nav-chrome rather than JD bodies).
+
+    Mirrors _scrape_google_jd: Firecrawl with only_main_content=True is
+    primary; falls back to plain requests + JSON-LD if Firecrawl is
+    unavailable (Microsoft typically does not embed JSON-LD, so the fallback
+    will usually return "" — that's fine, the generic browser scraper picks
+    up downstream).
+    """
+    if fc_key:
+        try:
+            from firecrawl import FirecrawlApp
+            app = FirecrawlApp(api_key=fc_key)
+            result = app.scrape(url, formats=["markdown"], only_main_content=True)
+            md = getattr(result, "markdown", None) or (
+                result.get("markdown", "") if isinstance(result, dict) else "")
+            if md and len(md) > 200:
+                logging.info(f"[Microsoft JD] Firecrawl fetched: {url}")
+                return md[:8000]
+        except Exception as e:
+            logging.debug(f"[Microsoft JD] Firecrawl failed: {e}")
+
+    # Future-proof JSON-LD fallback (Microsoft doesn't currently embed one,
+    # but if they ever add it we'll pick it up automatically).
+    _headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    try:
+        r = requests.get(url, timeout=15, headers=_headers)
+        if r.status_code == 200:
+            blocks = re.findall(
+                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                r.text, re.DOTALL | re.IGNORECASE,
+            )
+            for block in blocks:
+                try:
+                    d = json.loads(block)
+                except Exception:
+                    continue
+                if d.get("@type") != "JobPosting":
+                    continue
+                desc = d.get("description", "")
+                if not desc:
+                    continue
+                desc = re.sub(r"<[^>]+>", " ", desc)
+                desc = re.sub(r"&[a-z]+;|&#\d+;", " ", desc)
+                desc = re.sub(r"\s+", " ", desc).strip()
+                title = d.get("title", "")
+                lines = []
+                if title: lines.append(f"Title: {title}")
+                lines.append("")
+                lines.append(desc[:6000])
+                logging.info(f"[Microsoft JD] JSON-LD fetched: {url}")
+                return "\n".join(lines)
+    except Exception as e:
+        logging.debug(f"[Microsoft JD] requests failed: {e}")
 
     return ""
 
@@ -1289,15 +1522,16 @@ async def scrape_jd(url: str, crawler) -> str:
     try:
         res = await crawler.arun(url=url, config=cfg)
         if not res.success or res.status_code == 404:
+            logging.warning(f"[Crawl] {url}: success={res.success} status={res.status_code}")
             return ""
         md = res.markdown or ""
         valid, reason = _is_valid_jd_content(md)
         if not valid:
-            logging.debug(f"[Crawl] Invalid JD content ({reason}): {url}")
+            logging.warning(f"[Crawl] Invalid JD content ({reason}, {len(md)} chars): {url}")
             return ""
         return md[:8000]
     except Exception as e:
-        logging.error(f"[Crawl] {e}")
+        logging.error(f"[Crawl] {url}: {type(e).__name__}: {e}")
         return ""
 
 def md5(text: str) -> str:
@@ -1353,8 +1587,12 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
                      "foundation models), AI products or platforms, AI/ML infrastructure "
                      "(model serving, MLOps, GPU clusters), compute or cloud infrastructure "
                      "for AI workloads, or chips/semiconductors. "
-                     "Be strict — TPM roles in Finance, HR, Legal, Marketing, or general "
-                     "software engineering do NOT qualify." + _common_instr)
+                     "Be strict — TPM roles in Finance, HR, Legal, Marketing, SOX, audit, "
+                     "compliance, governance, GRC, or general software engineering do NOT qualify. "
+                     "Examples: ACCEPT 'TPM, ML Infrastructure', 'Sr TPM, GPU Cluster Operations', "
+                     "'TPM, Foundation Models'. REJECT 'TPM, SOX Compliance', 'TPM, Marketing "
+                     "Technology' (unless NLP/ML is explicit), 'TPM, Trust & Safety' (unless AI "
+                     "moderation is explicit), 'Federal TPM' (clearance/DoD focus)." + _common_instr)
     sys_instr += SECURITY_CLAUSE  # P0-3: prompt-injection guard
     cfg = types.GenerateContentConfig(
         system_instruction=sys_instr,
@@ -1373,12 +1611,14 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
         )
         return resp.text
     except Exception as e:
-        logging.error(f"[Extract] {e}")
+        logging.error(f"[Extract] failed for {company} ({len(markdown)} chars, "
+                      f"class={cls}): {type(e).__name__}: {e}")
         return "{}"
 
 # ── JD scraper function registry (for routing table lookup) ──────────────────
 _JD_FN_REGISTRY = {
     "_scrape_google_jd":         lambda url, **kw: _scrape_google_jd(url, fc_key=kw.get("fc_key", "")),
+    "_scrape_microsoft_jd":      lambda url, **kw: _scrape_microsoft_jd(url, fc_key=kw.get("fc_key", "")),
     "_scrape_workday_jd":        lambda url, **kw: _scrape_workday_jd(url),
     "_scrape_tesla_jd":          lambda url, **kw: _scrape_tesla_jd(url, fc_key=kw.get("fc_key", "")),
     "_scrape_greenhouse_api_jd": None,  # special: needs (board, jid), handled separately
@@ -1812,6 +2052,19 @@ async def _main_inner(summary: RunSummary):
                 update_archive_status(xlsx_path, cname, new_count, "no")
                 logging.info(f"[Archive] {cname}: no TPM jobs ({new_count}/"
                              f"{AUTO_ARCHIVE_THRESHOLD}).")
+
+    # ── Phase: Sort JD_Tracker by location tier ───────────────────────────────
+    # Greater Seattle (green) → Remote (yellow) → Other, Updated At desc within tier.
+    # Wrapped in try/except so a sort failure (e.g. file open in Excel) does not
+    # discard the run's actual JD writes.
+    print(f"\n{'='*60}")
+    print("🗺️  Sorting JD_Tracker by location tier (Greater Seattle → Remote → Other)...")
+    try:
+        n_sorted = sort_jd_tracker_by_tier(xlsx_path)
+        print(f"   Sorted {n_sorted} JD rows + applied tier highlights.")
+    except Exception as e:
+        logging.warning(f"[LocationTier] Sort skipped: {type(e).__name__}: {e}")
+        print(f"   ⚠️  Sort skipped ({type(e).__name__}). Close the file in Excel and re-run if needed.")
 
     print("\n🎉 Job Agent complete.")
     print(f"📊 Results: {xlsx_path}")

@@ -14,11 +14,12 @@ URL discovery strategy (per company, in order):
   3. ATS slug probing (Greenhouse → Lever)
   4. Company homepage scraping → find careers link
 
-Search distribution (designed to surface TPM-heavy roles):
-  - Big Tech (AI Investment) : 50%
-  - Top AI Startups          : 25%
-  - AI Infra / Compute / GPU : 15%
-  - Large Model Labs         : 10%
+Search distribution (rebalanced 2026-05 toward AI-TPM yield):
+  - Big Tech (AI Investment)  : 25%
+  - Consumer ML Tech          : 20%
+  - AI Startups               : 25%
+  - AI Infra / Compute / GPU  : 20%
+  - Large Model Labs          : 10%
 
 Run:
   python agents/company_agent.py
@@ -29,6 +30,7 @@ import json
 import re
 import logging
 import time
+from typing import Literal
 import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -60,12 +62,29 @@ BATCH_SIZE = 50    # new companies to discover each run
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
+AI_DOMAIN_VALUES = (
+    "Big Tech (AI Investment)",
+    "Consumer ML Tech",
+    "AI Startups",
+    "AI Infrastructure & Compute",
+    "Large Model Labs",
+)
+
+
 class AICompanyInfo(BaseModel):
     """Company info extracted by Gemini — NO career URL (found separately)."""
     company_name:   str = Field(description="The official name of the AI company.")
-    ai_domain:      str = Field(
-        description="Exactly one of: AI Startups / Large Model Labs / "
-                    "Big Tech (AI Investment) / AI Infrastructure & Compute"
+    ai_domain:      Literal[
+        "Big Tech (AI Investment)",
+        "Consumer ML Tech",
+        "AI Startups",
+        "AI Infrastructure & Compute",
+        "Large Model Labs",
+    ] = Field(
+        description=(
+            "The category that best describes this company's role in the AI ecosystem. "
+            "Must be exactly one of the 5 listed values."
+        )
     )
     business_focus: str = Field(
         description=(
@@ -92,6 +111,18 @@ ATS_VALIDATORS = [
         "api_template":  "https://api.lever.co/v0/postings/{slug}?mode=json",
         "board_template":"https://jobs.lever.co/{slug}",
         "jobs_key":      None,
+    },
+    {
+        "platform":      "ashby",
+        "api_template":  "https://api.ashbyhq.com/posting-api/job-board/{slug}",
+        "board_template":"https://jobs.ashbyhq.com/{slug}",
+        "jobs_key":      "jobs",
+    },
+    {
+        "platform":      "workable",
+        "api_template":  "https://apply.workable.com/api/v1/widget/accounts/{slug}",
+        "board_template":"https://apply.workable.com/{slug}/",
+        "jobs_key":      "jobs",
     },
 ]
 
@@ -130,6 +161,16 @@ KNOWN_CAREER_URLS = {
     "Airbnb":          "https://careers.airbnb.com/",
     "Twitter/X":       "https://careers.x.com/",
     "LinkedIn":        "https://careers.linkedin.com/",
+    # Consumer ML Tech
+    "Netflix":         "https://jobs.netflix.com/",
+    "Spotify":         "https://www.lifeatspotify.com/jobs",
+    "Pinterest":       "https://www.pinterestcareers.com/",
+    "Disney":          "https://jobs.disneycareers.com/",
+    "Roblox":          "https://corp.roblox.com/careers/",
+    "eBay":            "https://careers.ebayinc.com/",
+    "Snap":            "https://careers.snap.com/",
+    "DoorDash":        "https://careers.doordash.com/",
+    "Reddit":          "https://www.redditinc.com/careers",
     "OpenAI":          "https://openai.com/careers",
     "Anthropic":       "https://www.anthropic.com/careers",
     "Cohere":          "https://cohere.com/about/careers",
@@ -139,7 +180,7 @@ KNOWN_CAREER_URLS = {
 
 # ── Tavily search queries (weighted by target distribution) ────────────────────
 TAVILY_QUERIES = [
-    # ── Big Tech AI Investment (50%) ──────────────────────────────────────────
+    # ── Big Tech (AI Investment) — 25% ────────────────────────────────────────
     (
         "big tech AI division jobs 2026 Google Microsoft Amazon Meta Apple IBM Oracle Salesforce "
         "AI investment hiring TPM product manager careers"
@@ -148,11 +189,12 @@ TAVILY_QUERIES = [
         "traditional tech companies AI transformation 2026 Intel Qualcomm AMD Cisco Adobe "
         "Salesforce ServiceNow Workday AI careers job openings"
     ),
+    # ── Consumer ML Tech — 20% (NEW) ──────────────────────────────────────────
     (
-        "enterprise software AI 2026 SAP Oracle IBM Palantir Databricks Snowflake DataRobot "
-        "C3.ai career page hiring technical program manager"
+        "consumer media tech ML AI 2026 Netflix Spotify Pinterest Disney Roblox eBay Snap "
+        "DoorDash Uber Lyft Airbnb LinkedIn Reddit machine learning hiring technical program manager"
     ),
-    # ── Top AI Startups (25%) ─────────────────────────────────────────────────
+    # ── AI Startups — 25% ─────────────────────────────────────────────────────
     (
         "top AI startups hiring 2026 North America Scale AI Cohere Adept Inflection Runway "
         "Midjourney Character.ai Perplexity Hugging Face careers job openings"
@@ -161,12 +203,12 @@ TAVILY_QUERIES = [
         "well-funded AI startups 2026 USA hiring TPM product manager Glean Harvey Writer "
         "Jasper Tome Imbue Pika Labs Sierra careers"
     ),
-    # ── AI Infra / Compute / GPU (15%) ────────────────────────────────────────
+    # ── AI Infra / Compute / GPU — 20% ────────────────────────────────────────
     (
         "AI infrastructure compute GPU cloud 2026 CoreWeave Lambda Labs Together AI Groq "
-        "Cerebras SambaNova Graphcore Mosaicml careers hiring"
+        "Cerebras SambaNova Crusoe Fireworks Modal careers hiring"
     ),
-    # ── Large Model Labs (10%) ────────────────────────────────────────────────
+    # ── Large Model Labs — 10% ────────────────────────────────────────────────
     (
         "frontier AI research labs 2026 OpenAI Anthropic xAI Google DeepMind Mistral "
         "Cohere Aleph Alpha careers hiring site:jobs.lever.co OR site:greenhouse.io"
@@ -175,7 +217,8 @@ TAVILY_QUERIES = [
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
 _CAREER_DOMAINS   = ["greenhouse.io", "lever.co", "ashbyhq.com", "myworkdayjobs.com",
-                     "job-boards.greenhouse.io", "jobs.lever.co"]
+                     "job-boards.greenhouse.io", "jobs.lever.co",
+                     "workable.com", "apply.workable.com"]
 _CAREER_PATH_KWDS = ["/careers", "/jobs", "/hiring", "/work-with-us",
                      "/join-us", "/join", "/opportunities", "/open-roles"]
 
@@ -184,6 +227,44 @@ def _is_likely_career_url(url: str) -> bool:
     u = url.lower()
     return (any(d in u for d in _CAREER_DOMAINS) or
             any(kw in u for kw in _CAREER_PATH_KWDS))
+
+
+# Hosts whose /jobs/<slug> path wraps a single underlying portfolio company.
+# When career_url points at one of these, the slug names the real company —
+# extract it and re-resolve to that company's actual ATS via slug-probing.
+_VC_PORTFOLIO_HOSTS = {
+    "jobs.a16z.com", "jobs.battery.com", "jobs.gaingels.com", "jobs.01a.com",
+}
+
+def _unwrap_career_url(url: str) -> str | None:
+    """Extract underlying company name hint from a wrapper career URL.
+
+    Handles two wrapper families that appear in our company list but aren't
+    real ATS endpoints:
+      - linkedin.com/jobs/<slug>-jobs           → "<slug>" (hyphens → spaces)
+      - linkedin.com/company/<slug>/jobs[/...]  → "<slug>"
+      - jobs.<vc>.com/jobs/<slug>[?...]         → "<slug>"  (vc in _VC_PORTFOLIO_HOSTS)
+
+    Returns None for normal ATS URLs, raw company sites, or unsupported
+    LinkedIn forms (e.g. linkedin.com/jobs/view/<id> has no name to extract).
+    """
+    if not url:
+        return None
+    u = url.lower().strip()
+    # LinkedIn jobs page: linkedin.com/jobs/<slug>-jobs (trailing "-jobs")
+    m = re.search(r"linkedin\.com/jobs/([a-z0-9][a-z0-9\-]*?)-jobs(?:/|$|\?)", u)
+    if m:
+        return m.group(1).replace("-", " ").strip()
+    # LinkedIn company-jobs page: linkedin.com/company/<slug>/jobs
+    m = re.search(r"linkedin\.com/company/([a-z0-9][a-z0-9\-]*)/jobs", u)
+    if m:
+        return m.group(1).replace("-", " ").strip()
+    # VC-portfolio wrappers: jobs.<vc>.com/jobs/<slug>
+    for host in _VC_PORTFOLIO_HOSTS:
+        m = re.search(re.escape(host) + r"/jobs/([^/?#]+)", u)
+        if m:
+            return m.group(1).replace("-", " ").strip()
+    return None
 
 
 def validate_career_url(url: str) -> bool:
@@ -354,6 +435,64 @@ def _tavily_extract_career_url(company_name: str, query: str, client) -> str | N
     return None
 
 
+def _workday_subdomain_matches_company(url: str, company_name: str) -> bool:
+    """Validate that a Workday URL's subdomain belongs to `company_name`.
+
+    Tavily's `site:myworkdayjobs.com` query happily returns URLs from
+    *other* companies that mention `company_name` somewhere in their JD
+    (e.g. "AMD" → `argonne.wd1.myworkdayjobs.com`, "Oracle" → `pwc.wd3...`).
+    Reject any result whose subdomain doesn't approximately match the
+    company name's slug candidates.
+    """
+    m = re.match(r"https?://([^.]+)\.wd\d+\.myworkdayjobs\.com", url, re.IGNORECASE)
+    if not m:
+        return False
+    sub = m.group(1).lower().strip()
+    sub_compact = re.sub(r'[^a-z0-9]', '', sub)
+    # Equality only — no substring/prefix matching. Substring rules let
+    # "apple" → "applebank", "clay" → "claycountybcc", "western" →
+    # "westernunion" all leak through, which produces wrong-company URLs.
+    for c in _slug_candidates(company_name):
+        c_lower = c.lower()
+        c_compact = re.sub(r'[^a-z0-9]', '', c_lower)
+        if c_lower == sub or (c_compact and c_compact == sub_compact):
+            return True
+    return False
+
+
+def _find_workday_url(company_name: str, tavily_client) -> str | None:
+    """Tavily-search for a company's Workday board URL.
+
+    Workday subdomains are unguessable (e.g. `nvidia.wd5`, `arista.wd1`,
+    `intel.wd1`) so slug-probing can't find them. This helper queries Tavily
+    with a Workday-scoped site filter and returns the first result whose URL
+    is on `myworkdayjobs.com` AND whose subdomain matches the company name.
+    The subdomain check is critical: Tavily will otherwise return any
+    Workday URL whose page mentions the company (e.g. "AMD" → Argonne Lab
+    job postings that reference AMD silicon).
+
+    Returns None if Tavily yields no validated Workday match or on any error.
+    """
+    if not tavily_client:
+        return None
+    query = f'"{company_name}" careers site:myworkdayjobs.com'
+    try:
+        r = tavily_client.search(query=query, search_depth="basic", max_results=5)
+        for item in r.get("results", []):
+            url = (item.get("url") or "").strip()
+            if ("myworkdayjobs.com" in url
+                    and _workday_subdomain_matches_company(url, company_name)
+                    and validate_career_url(url)):
+                return url
+    except Exception as e:
+        err_str = str(e)
+        if "402" in err_str or "429" in err_str or "quota" in err_str.lower():
+            logging.error(f"[Workday] Tavily quota exhausted for {company_name}: {e}")
+        else:
+            logging.warning(f"[Workday] Tavily query failed for {company_name}: {e}")
+    return None
+
+
 # ── Company name dedup helpers ────────────────────────────────────────────────
 _COMPANY_SUFFIXES = re.compile(
     r'\b(inc|corp|corporation|llc|ltd|technologies|labs?|'
@@ -452,19 +591,30 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
     config = types.GenerateContentConfig(
         system_instruction=(
             "You are an expert AI industry analyst. From the web search context, "
-            f"extract exactly {need} distinct AI companies headquartered in the United States "
-            "that are NOT in the EXISTING_COMPANIES list.\n"
-            "Follow this category distribution strictly:\n"
-            f"  - Big Tech (AI Investment): {round(need*0.50)} companies — large established tech "
-            "companies (Google, Microsoft, Amazon, Meta, Apple, IBM, Oracle, Salesforce, SAP, "
-            "Intel, Qualcomm, AMD, Cisco, Adobe, Palantir, Databricks, Snowflake, Stripe, etc.)\n"
-            f"  - Top AI Startups: {round(need*0.25)} companies — well-funded AI-native startups "
-            "with real headcount (not tiny pre-seed; must have public job boards)\n"
-            f"  - AI Infra/Compute/GPU: {round(need*0.15)} companies — GPU cloud, AI compute, "
-            "model serving, AI chip companies\n"
-            f"  - Large Model Labs: {round(need*0.10)} companies — frontier AI research labs "
-            "(OpenAI, Anthropic, xAI, DeepMind, Cohere, Mistral, etc.)\n"
+            f"extract exactly {need} distinct companies headquartered in the United States "
+            "that are NOT in the EXISTING_COMPANIES list. All five categories must be "
+            "companies that have substantial AI/ML engineering organizations and post "
+            "AI-relevant TPM roles.\n"
+            "Follow this category distribution strictly (use the EXACT label string for ai_domain):\n"
+            f"  - \"Big Tech (AI Investment)\": {round(need*0.25)} companies — large established "
+            "tech companies whose AI work is core strategy (NVIDIA, AMD, Intel, Qualcomm, Meta, "
+            "Microsoft, Google, Amazon, Apple, IBM, Oracle, Salesforce, Adobe, Databricks, "
+            "Snowflake, Palantir, Stripe, Cisco, ServiceNow, Workday, SAP, etc.)\n"
+            f"  - \"Consumer ML Tech\": {round(need*0.20)} companies — large consumer/media tech "
+            "with substantial ML organizations and AI-TPM hiring (Netflix, Spotify, Pinterest, "
+            "Disney, Roblox, eBay, Snap, DoorDash, Uber, Lyft, Airbnb, LinkedIn, Twitter/X, "
+            "Reddit, Yelp, Etsy, Wayfair, Instacart, etc.)\n"
+            f"  - \"AI Startups\": {round(need*0.25)} companies — well-funded AI-native startups "
+            "with real headcount and public job boards (Scale AI, Cohere, Glean, Harvey, Writer, "
+            "Sierra, Perplexity, Runway, etc.) — NO tiny pre-seed companies\n"
+            f"  - \"AI Infrastructure & Compute\": {round(need*0.20)} companies — GPU cloud, AI "
+            "compute, model serving, AI chip companies (CoreWeave, Lambda, Together AI, Groq, "
+            "Cerebras, SambaNova, Crusoe, Fireworks, Modal, etc.)\n"
+            f"  - \"Large Model Labs\": {round(need*0.10)} companies — frontier AI research labs "
+            "(OpenAI, Anthropic, xAI, DeepMind, Mistral, Cohere, etc.)\n"
             "STRICTLY exclude non-US companies (Canadian, European, Asian).\n"
+            "The ai_domain field MUST be one of these 5 exact strings — do not invent variants "
+            "like \"Top AI Startups\" or \"AI\" or \"NLP\".\n"
             "For business_focus: write 3-4 sentences covering what the company builds, "
             "who their customers are, their key competitive differentiator, and notable "
             "products/funding/traction.\n"
@@ -477,9 +627,8 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
     prompt = (
         f"Search context:\n{json.dumps(results)}\n\n"
         f"EXISTING_COMPANIES (DO NOT include these):\n{json.dumps(existing_list)}\n\n"
-        f"Extract exactly {need} NEW US-headquartered AI companies with: company_name, "
-        "ai_domain (one of: AI Startups / Large Model Labs / "
-        "Big Tech (AI Investment) / AI Infrastructure & Compute), "
+        f"Extract exactly {need} NEW US-headquartered companies with: company_name, "
+        f"ai_domain (one of: {' / '.join(AI_DOMAIN_VALUES)}), "
         "business_focus (3-4 sentences)."
     )
     try:
@@ -526,8 +675,15 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
 
 
 # ── ATS upgrade (Phase 1.5) ───────────────────────────────────────────────────
-def validate_and_upgrade_ats_url(company_name: str, current_url: str) -> str:
-    """Return upgraded ATS board URL, or original if no ATS found."""
+def validate_and_upgrade_ats_url(company_name: str, current_url: str,
+                                  tavily_client=None) -> str:
+    """Return upgraded ATS board URL, or original if no ATS found.
+
+    When `tavily_client` is provided, falls back to a Workday-scoped Tavily
+    search for companies whose slug-probe yields no Greenhouse/Lever/Ashby/
+    Workable match — recovers cos with unguessable Workday subdomains
+    (e.g. `nvidia.wd5`, `arista.wd1`).
+    """
     name_lower = company_name.lower().strip()
 
     # 1. Hard-coded overrides (highest priority)
@@ -537,12 +693,28 @@ def validate_and_upgrade_ats_url(company_name: str, current_url: str) -> str:
             logging.info(f"[Phase1.5] {company_name}: override → {url}")
             return url
 
+    # 1.5. Wrapper URL (LinkedIn / VC-portfolio) → re-resolve via underlying slug
+    hint = _unwrap_career_url(current_url)
+    if hint:
+        for slug in _slug_candidates(hint):
+            for v in ATS_VALIDATORS:
+                hit, n = _check_ats_slug(slug, v)
+                if hit:
+                    upgraded = v["board_template"].format(slug=slug)
+                    logging.info(f"[Phase1.5] {company_name}: unwrapped "
+                                 f"'{current_url}' → {v['platform']}/{slug} "
+                                 f"jobs={n} → {upgraded}")
+                    return upgraded
+                time.sleep(0.3)
+        logging.info(f"[Phase1.5] {company_name}: unwrap hint '{hint}' "
+                     f"yielded no ATS match")
+
     # 2. Already an ATS URL
     if any(d in current_url for d in ["greenhouse.io", "lever.co", "ashbyhq.com",
-                                       "myworkdayjobs.com"]):
+                                       "myworkdayjobs.com", "workable.com"]):
         return current_url
 
-    # 3. Probe Greenhouse + Lever slugs
+    # 3. Probe Greenhouse + Lever + Ashby + Workable slugs
     for slug in _slug_candidates(company_name):
         for v in ATS_VALIDATORS:
             hit, n = _check_ats_slug(slug, v)
@@ -553,20 +725,46 @@ def validate_and_upgrade_ats_url(company_name: str, current_url: str) -> str:
                 return upgraded
             time.sleep(0.3)
 
+    # 4. Workday-via-Tavily fallback (unguessable subdomains)
+    if tavily_client is not None:
+        wd_url = _find_workday_url(company_name, tavily_client)
+        if wd_url:
+            logging.info(f"[Phase1.5] {company_name}: workday-via-tavily → {wd_url}")
+            return wd_url
+
     return current_url
 
 
-def run_phase_1_5(xlsx_path: str):
+def run_phase_1_5(xlsx_path: str, tavily_client=None):
+    """Re-validate every non-ATS career URL in the companies sheet.
+
+    `tavily_client` enables the Workday-via-Tavily fallback (step 4 of
+    `validate_and_upgrade_ats_url`). When None and TAVILY_API_KEY is set in
+    env, a client is created automatically.
+    """
+    if tavily_client is None:
+        tavily_key = os.getenv("TAVILY_API_KEY")
+        if tavily_key:
+            try:
+                from tavily import TavilyClient
+                tavily_client = TavilyClient(api_key=tavily_key)
+            except Exception as e:
+                logging.warning(f"[Phase1.5] Tavily client init failed: {e}")
+                tavily_client = None
+
     print("\n" + "="*60)
     print("PHASE 1.5: ATS URL VALIDATION & UPGRADE")
     print("="*60)
+    if tavily_client is None:
+        print("  ⚠️  No Tavily client — Workday fallback disabled.")
     rows = get_company_rows_with_row_num(xlsx_path)
     if not rows:
         print("⚠️  No companies found. Skipping.")
         return
 
     upgraded = no_ats = 0
-    ATS_DOMAINS = ["greenhouse.io", "lever.co", "ashbyhq.com", "myworkdayjobs.com"]
+    ATS_DOMAINS = ["greenhouse.io", "lever.co", "ashbyhq.com", "myworkdayjobs.com",
+                   "workable.com"]
 
     for excel_row, row in rows:
         name = str(row[0]).strip() if row[0] else ""
@@ -579,7 +777,7 @@ def run_phase_1_5(xlsx_path: str):
             continue
 
         print(f"  🔍 {name}...")
-        new_url = validate_and_upgrade_ats_url(name, url)
+        new_url = validate_and_upgrade_ats_url(name, url, tavily_client=tavily_client)
         if new_url != url:
             update_company_career_url(xlsx_path, excel_row, new_url)
             print(f"  ✅ {name}: {url} → {new_url}")

@@ -45,6 +45,10 @@ google.genai.types = MagicMock()
 
 from agents.company_agent import (
     _is_likely_career_url,
+    _unwrap_career_url,
+    _find_workday_url,
+    _workday_subdomain_matches_company,
+    validate_and_upgrade_ats_url,
     _slug_candidates,
     validate_career_url,
     _check_ats_slug,
@@ -89,6 +93,324 @@ class TestIsLikelyCareerUrl(unittest.TestCase):
 
     def test_empty_false(self):
         self.assertFalse(_is_likely_career_url(""))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestUnwrapCareerUrl(unittest.TestCase):
+    """A″ — extract underlying company slug from LinkedIn / VC-portfolio wrappers."""
+
+    def test_linkedin_jobs_slug_pattern(self):
+        # Real example from current company sheet
+        self.assertEqual(
+            _unwrap_career_url("https://www.linkedin.com/jobs/arista-networks-jobs"),
+            "arista networks",
+        )
+
+    def test_linkedin_jobs_with_trailing_slash(self):
+        self.assertEqual(
+            _unwrap_career_url("https://www.linkedin.com/jobs/some-co-jobs/"),
+            "some co",
+        )
+
+    def test_linkedin_company_jobs_pattern(self):
+        self.assertEqual(
+            _unwrap_career_url("https://www.linkedin.com/company/arista-networks/jobs"),
+            "arista networks",
+        )
+
+    def test_linkedin_view_returns_none(self):
+        # No extractable name from a numeric job-id URL
+        self.assertIsNone(
+            _unwrap_career_url("https://www.linkedin.com/jobs/view/3854720198")
+        )
+
+    def test_vc_a16z_pattern(self):
+        self.assertEqual(
+            _unwrap_career_url("https://jobs.a16z.com/jobs/repl.it"),
+            "repl.it",
+        )
+
+    def test_vc_a16z_with_query_params(self):
+        self.assertEqual(
+            _unwrap_career_url("https://jobs.a16z.com/jobs/repl.it?trk=public_post"),
+            "repl.it",
+        )
+
+    def test_vc_battery_pattern(self):
+        self.assertEqual(
+            _unwrap_career_url("https://jobs.battery.com/jobs/semi-technologies"),
+            "semi technologies",
+        )
+
+    def test_vc_gaingels_pattern(self):
+        self.assertEqual(
+            _unwrap_career_url("https://jobs.gaingels.com/jobs/modal-labs"),
+            "modal labs",
+        )
+
+    def test_vc_01a_pattern(self):
+        self.assertEqual(
+            _unwrap_career_url("https://jobs.01a.com/jobs/baseten"),
+            "baseten",
+        )
+
+    def test_real_ats_url_returns_none(self):
+        self.assertIsNone(_unwrap_career_url("https://job-boards.greenhouse.io/openai"))
+        self.assertIsNone(_unwrap_career_url("https://jobs.lever.co/palantir"))
+        self.assertIsNone(_unwrap_career_url("https://jobs.ashbyhq.com/anthropic"))
+
+    def test_company_homepage_returns_none(self):
+        self.assertIsNone(_unwrap_career_url("https://www.anthropic.com/careers"))
+
+    def test_unknown_vc_host_returns_none(self):
+        # Other VC portfolio hosts not in our allow-list shouldn't trigger
+        self.assertIsNone(_unwrap_career_url("https://jobs.unknown-vc.com/jobs/some-co"))
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(_unwrap_career_url(""))
+        self.assertIsNone(_unwrap_career_url(None))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestValidateAndUpgradeUnwraps(unittest.TestCase):
+    """A″ — validate_and_upgrade_ats_url must re-resolve wrapper URLs to real ATS."""
+
+    def test_vc_wrapper_upgraded_when_underlying_is_on_greenhouse(self):
+        # jobs.a16z.com/jobs/repl.it → probe slugs → greenhouse hit on first slug
+        with patch("agents.company_agent._check_ats_slug") as mock_check:
+            # Greenhouse hit on first probe; subsequent calls won't run
+            mock_check.return_value = (True, 5)
+            with patch("agents.company_agent.time.sleep"):  # speed up
+                upgraded = validate_and_upgrade_ats_url(
+                    "Repl.it", "https://jobs.a16z.com/jobs/repl.it"
+                )
+        self.assertIn("greenhouse.io", upgraded)
+        # Should NOT return the wrapper URL
+        self.assertNotIn("a16z.com", upgraded)
+
+    def test_linkedin_wrapper_upgraded_when_underlying_is_on_lever(self):
+        # First validator (greenhouse) misses, second (lever) hits
+        def fake_check(slug, validator):
+            return (validator["platform"] == "lever", 3 if validator["platform"] == "lever" else 0)
+        with patch("agents.company_agent._check_ats_slug", side_effect=fake_check):
+            with patch("agents.company_agent.time.sleep"):
+                upgraded = validate_and_upgrade_ats_url(
+                    "Arista Networks",
+                    "https://www.linkedin.com/jobs/arista-networks-jobs",
+                )
+        self.assertIn("lever.co", upgraded)
+
+    def test_wrapper_no_ats_match_falls_through(self):
+        # Hint extracted but no validator hits → does NOT return upgraded URL from
+        # step 1.5; falls through to step 2/3. Step 2 short-circuits on ATS-domain
+        # check (linkedin.com isn't ATS), so step 3 runs slug-probing on company_name.
+        # Mock _check_ats_slug to always miss → final result = original URL.
+        with patch("agents.company_agent._check_ats_slug", return_value=(False, 0)):
+            with patch("agents.company_agent.time.sleep"):
+                result = validate_and_upgrade_ats_url(
+                    "Arista Networks",
+                    "https://www.linkedin.com/jobs/arista-networks-jobs",
+                )
+        self.assertEqual(result, "https://www.linkedin.com/jobs/arista-networks-jobs")
+
+    def test_non_wrapper_skips_unwrap_path(self):
+        # Already-ATS URL: step 1.5 returns None hint; step 2 short-circuits.
+        # _check_ats_slug must NOT be invoked.
+        with patch("agents.company_agent._check_ats_slug") as mock_check:
+            result = validate_and_upgrade_ats_url(
+                "OpenAI", "https://job-boards.greenhouse.io/openai"
+            )
+        self.assertEqual(result, "https://job-boards.greenhouse.io/openai")
+        mock_check.assert_not_called()
+
+    def test_workable_url_short_circuits_as_ats(self):
+        # A′ regression: workable.com must be recognized as already-ATS in step 2
+        with patch("agents.company_agent._check_ats_slug") as mock_check:
+            result = validate_and_upgrade_ats_url(
+                "Hugging Face", "https://apply.workable.com/huggingface/"
+            )
+        self.assertEqual(result, "https://apply.workable.com/huggingface/")
+        mock_check.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestWorkdaySubdomainMatch(unittest.TestCase):
+    """Critical false-positive guard: Tavily returns Workday URLs from OTHER
+    companies that mention the search term. Subdomain must match the co name."""
+
+    def test_exact_subdomain_match(self):
+        self.assertTrue(_workday_subdomain_matches_company(
+            "https://adobe.wd5.myworkdayjobs.com/external_experienced", "Adobe"))
+
+    def test_arista_compact_match(self):
+        # subdomain "aristanetworks" matches slug candidate "aristanetworks"
+        self.assertTrue(_workday_subdomain_matches_company(
+            "https://aristanetworks.wd1.myworkdayjobs.com/External", "Arista Networks"))
+
+    def test_amd_argonne_rejected(self):
+        # Real false positive observed in dry run — Argonne National Lab
+        # has Workday postings that mention AMD silicon
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://argonne.wd1.myworkdayjobs.com/Argonne_Careers", "AMD"))
+
+    def test_oracle_pwc_rejected(self):
+        # Real false positive — PwC has an Oracle-consulting job
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://pwc.wd3.myworkdayjobs.com/Global_Experienced_Careers", "Oracle"))
+
+    def test_non_workday_url_returns_false(self):
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://www.adobe.com/careers", "Adobe"))
+
+    def test_short_company_name_avoids_substring_false_positive(self):
+        # "AI" (len 2) must NOT match into "argonne" by substring rule
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://argonne.wd1.myworkdayjobs.com/Careers", "AI"))
+
+    def test_apple_applebank_rejected(self):
+        # "apple" is a strict prefix of "applebank" — substring matching would
+        # let this through, exact-compact-match must reject it
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://applebank.wd5.myworkdayjobs.com/applebankcareers", "Apple"))
+
+    def test_clay_claycountybcc_rejected(self):
+        # "clay" is a strict prefix of "claycountybcc"
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://claycountybcc.wd1.myworkdayjobs.com/External_Careers", "Clay"))
+
+    def test_western_digital_westernunion_rejected(self):
+        # "western" appears in both "westerndigital" (slug) and "westernunion"
+        # (subdomain) but they're different companies
+        self.assertFalse(_workday_subdomain_matches_company(
+            "https://westernunion.wd5.myworkdayjobs.com/WesternUnionJobs",
+            "Western Digital"))
+
+
+class TestFindWorkdayUrl(unittest.TestCase):
+    """Workday-via-Tavily discovery for unguessable subdomains."""
+
+    def _make_client(self, results):
+        client = MagicMock()
+        client.search.return_value = {"results": results}
+        return client
+
+    def test_returns_workday_url_when_tavily_finds_one(self):
+        client = self._make_client([
+            {"url": "https://aristanetworks.wd1.myworkdayjobs.com/External"},
+        ])
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            url = _find_workday_url("Arista Networks", client)
+        self.assertIn("myworkdayjobs.com", url or "")
+        # Verify the Tavily query is Workday-scoped
+        called_query = client.search.call_args[1]["query"]
+        self.assertIn("myworkdayjobs.com", called_query)
+        self.assertIn("Arista Networks", called_query)
+
+    def test_skips_wrong_company_workday_url(self):
+        # AMD search returns Argonne first, real AMD URL second — must skip Argonne
+        client = self._make_client([
+            {"url": "https://argonne.wd1.myworkdayjobs.com/Argonne_Careers"},
+            {"url": "https://amd.wd1.myworkdayjobs.com/External"},
+        ])
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            url = _find_workday_url("AMD", client)
+        self.assertIn("amd.wd1", url)
+        self.assertNotIn("argonne", url)
+
+    def test_returns_none_if_only_wrong_company_results(self):
+        # All results are wrong-company Workday URLs — return None, don't pick the first
+        client = self._make_client([
+            {"url": "https://argonne.wd1.myworkdayjobs.com/Argonne_Careers"},
+            {"url": "https://pwc.wd3.myworkdayjobs.com/Global_Experienced_Careers"},
+        ])
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            url = _find_workday_url("AMD", client)
+        self.assertIsNone(url)
+
+    def test_skips_non_workday_results(self):
+        client = self._make_client([
+            {"url": "https://www.linkedin.com/jobs/arista-networks-jobs"},
+            {"url": "https://aristanetworks.wd1.myworkdayjobs.com/External"},
+        ])
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            url = _find_workday_url("Arista Networks", client)
+        self.assertIn("myworkdayjobs.com", url)
+
+    def test_returns_none_when_no_workday_results(self):
+        client = self._make_client([
+            {"url": "https://www.linkedin.com/jobs/arista-networks-jobs"},
+            {"url": "https://www.aristanetworks.com/careers"},
+        ])
+        url = _find_workday_url("Arista Networks", client)
+        self.assertIsNone(url)
+
+    def test_skips_workday_url_that_fails_validation(self):
+        client = self._make_client([
+            {"url": "https://stale.wd1.myworkdayjobs.com/dead"},
+        ])
+        with patch("agents.company_agent.validate_career_url", return_value=False):
+            url = _find_workday_url("Stale", client)  # subdomain match: stale ↔ stale
+        self.assertIsNone(url)
+
+    def test_returns_none_when_client_is_none(self):
+        self.assertIsNone(_find_workday_url("Whatever", None))
+
+    def test_returns_none_on_tavily_exception(self):
+        client = MagicMock()
+        client.search.side_effect = Exception("network error")
+        url = _find_workday_url("Some Co", client)
+        self.assertIsNone(url)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestValidateAndUpgradeWorkdayFallback(unittest.TestCase):
+    """Step 4 — Workday-via-Tavily kicks in only when slug-probe misses."""
+
+    def test_workday_fallback_invoked_when_slug_probe_misses(self):
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"url": "https://aristanetworks.wd1.myworkdayjobs.com/External"},
+        ]}
+        with patch("agents.company_agent._check_ats_slug", return_value=(False, 0)), \
+             patch("agents.company_agent.validate_career_url", return_value=True), \
+             patch("agents.company_agent.time.sleep"):
+            result = validate_and_upgrade_ats_url(
+                "Arista Networks",
+                "https://www.linkedin.com/jobs/arista-networks-jobs",
+                tavily_client=client,
+            )
+        self.assertIn("myworkdayjobs.com", result)
+        client.search.assert_called_once()
+
+    def test_workday_fallback_skipped_when_slug_probe_hits(self):
+        # Step 3 finds a Greenhouse hit → step 4 must NOT call Tavily
+        client = MagicMock()
+        with patch("agents.company_agent._check_ats_slug", return_value=(True, 5)), \
+             patch("agents.company_agent.time.sleep"):
+            result = validate_and_upgrade_ats_url(
+                "OpenAI", "https://www.openai.com/careers", tavily_client=client,
+            )
+        self.assertIn("greenhouse.io", result)
+        client.search.assert_not_called()
+
+    def test_workday_fallback_skipped_when_no_tavily_client(self):
+        # Without client, step 4 is bypassed and original URL is returned
+        with patch("agents.company_agent._check_ats_slug", return_value=(False, 0)), \
+             patch("agents.company_agent.time.sleep"):
+            result = validate_and_upgrade_ats_url(
+                "Stuck Co", "https://stuckco.com/careers", tavily_client=None,
+            )
+        self.assertEqual(result, "https://stuckco.com/careers")
+
+    def test_workday_fallback_yields_no_match_returns_original(self):
+        client = MagicMock()
+        client.search.return_value = {"results": []}
+        with patch("agents.company_agent._check_ats_slug", return_value=(False, 0)), \
+             patch("agents.company_agent.time.sleep"):
+            result = validate_and_upgrade_ats_url(
+                "Stuck Co", "https://stuckco.com/careers", tavily_client=client,
+            )
+        self.assertEqual(result, "https://stuckco.com/careers")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +550,16 @@ class TestCheckAtsSlug(unittest.TestCase):
         with patch("agents.company_agent.requests.get", return_value=mock_resp):
             hit, n = _check_ats_slug("mistral", lever)
         self.assertTrue(hit)
+
+    def test_validators_cover_all_json_api_platforms(self):
+        # A″ regression: company_agent's slug-probe validators must include every
+        # json_api ATS that job_agent.py routes — otherwise unwrapped wrapper URLs
+        # for cos on a missing ATS (e.g. Ashby) silently fail to upgrade.
+        platforms = {v["platform"] for v in ATS_VALIDATORS}
+        self.assertIn("greenhouse", platforms)
+        self.assertIn("lever", platforms)
+        self.assertIn("ashby", platforms)
+        self.assertIn("workable", platforms)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,5 +1,73 @@
 # CHANGELOG
 
+## 2026-05-05
+
+### Discovery coverage: Workday-via-Tavily fallback (with strict subdomain guard)
+
+Follow-up to the Workable + URL-unwrap work below. Many big-tech and infra companies (Adobe, Cisco, Qualcomm, Salesforce, Dell, Broadcom, Cadence, DataRobot, Zendesk, PayPal, Equinix, etc.) use Workday with **unguessable subdomains** (`adobe.wd5`, `cisco.wd5`, `qualcomm.wd12`, `paypal.wd1`, …), so slug-probing can never find them. They were stuck at custom career pages or LinkedIn URLs.
+
+- **`_find_workday_url(company_name, tavily_client)`** in `agents/company_agent.py`: queries Tavily with `"<company>" careers site:myworkdayjobs.com` and returns the first hit on `myworkdayjobs.com` whose subdomain matches the company name.
+- **`_workday_subdomain_matches_company(url, company_name)`** — critical false-positive guard. Tavily's site filter happily returns URLs from *other* companies that happen to mention the search term in their JD pages: AMD → `argonne.wd1` (Argonne Lab JDs reference AMD silicon), Oracle → `pwc.wd3` (PwC Oracle-consulting roles), Apple → `applebank.wd5`, Western Digital → `westernunion.wd5`, Clay → `claycountybcc.wd1`. Initial fuzzy `c_compact in sub_compact` matching let the substring cases through; tightened to **exact compact-form equality** (each slug candidate must equal the subdomain after stripping non-alphanumerics — no prefix or substring rules).
+- Wired as **step 4** in `validate_and_upgrade_ats_url` (after slug-probe misses); only fires when a `tavily_client` is supplied. `run_phase_1_5` now auto-instantiates a Tavily client from `TAVILY_API_KEY` if none is passed.
+
+**Phase-1.5 re-run results** (against `pathfinder_dashboard.xlsx`, 75 non-ATS candidate rows): **26 upgrades, 0 false positives**.
+- Workday recoveries (11): Adobe, Cisco, Qualcomm, Salesforce, Dell Technologies, Broadcom, Cadence Design Systems, DataRobot, Zendesk, PayPal, Equinix — all → their real `*.wdN.myworkdayjobs.com` boards.
+- Plus 15 Ashby + unwrap wins from the prior iteration (Sierra, Cursor, Weaviate, Modal Labs, Baseten, Replit, Runway, Suno, Gamma, Applied Materials, ElevenLabs, Mercor, Nutanix, EliseAI, Physical Intelligence).
+
+**Tests**: +18 added (`TestWorkdaySubdomainMatch` 9 cases including the 3 real false-positive guards; `TestFindWorkdayUrl` 8 cases; `TestValidateAndUpgradeWorkdayFallback` 4 cases). Full suite 854/854 green.
+
+---
+
+### Discovery coverage: Workable ATS + LinkedIn / VC-portfolio URL unwrapping
+
+Audit of the 146-company `Company_List` sheet showed two coverage gaps that were *not* unsupported scrapers but unsupported *URL shapes*: 8 companies stuck at `linkedin.com/jobs/<slug>-jobs` and 4 stuck behind VC-portfolio job-listing wrappers (a16z / battery / gaingels / 01a). Plus Hugging Face routed through the Firecrawl crawl path despite Workable having a clean public API.
+
+- **A′ — Workable as first-class ATS**: added `workable` entry to `ATS_PLATFORMS` (`agents/job_agent.py`) and a dedicated `_fetch_workable_jobs` (mirrors `_fetch_ashby_jobs` — Workable's widget API uses multi-field `city/state/country/locations[]/telecommuting` rather than a single `location` dict). Endpoint: `https://apply.workable.com/api/v1/widget/accounts/{slug}` (the older `/api/v3/accounts/...` path 404s). Added Workable to `ATS_VALIDATORS` in `agents/company_agent.py` so slug-probing also covers it during phase 1.5.
+- **A″ — wrapper URL unwrapper**: new `_unwrap_career_url(url)` helper in `agents/company_agent.py` extracts the underlying company slug from `linkedin.com/jobs/<slug>-jobs`, `linkedin.com/company/<slug>/jobs`, and `jobs.<vc>.com/jobs/<slug>` for the four known VC-portfolio hosts. Wired into `validate_and_upgrade_ats_url` between the hard-coded-override step and the already-ATS short-circuit; on a wrapper match, the extracted slug feeds `_check_ats_slug` against all validators. If the underlying company is on a public ATS, `current_url` is rewritten to the real board URL.
+- **Ashby in `ATS_VALIDATORS`** (pre-existing gap, surfaced during A″ verification): `company_agent.py`'s slug-probe validators previously only covered Greenhouse + Lever, so any company on Ashby (a heavily-used AI-startup ATS) silently fell through to homepage scraping. Added Ashby to `ATS_VALIDATORS` — fixes both the new A″ unwrap path AND the existing `find_career_url` / `validate_and_upgrade_ats_url` step-3 slug-probe. Added regression test `test_validators_cover_all_json_api_platforms`.
+
+**Phase-1.5 re-run results** (against `pathfinder_dashboard.xlsx`, 75 non-ATS candidate rows): **16 upgrades**.
+- A″ unwrap wins (4): Modal Labs, Baseten, Replit, EliseAI — all → Ashby.
+- Ashby-validator wins (12): Snowflake, Sierra, Cursor, Weaviate, Runway, Suno, Gamma, Applied Materials, ElevenLabs, Mercor, Nutanix, Physical Intelligence — all were stuck on custom career URLs, now routed to their Ashby boards.
+
+**Tests**: +36 added by this work (17 Workable in `tests/test_job_agent.py`: `TestWorkableAtsConfig` / `TestFormatWorkableLocation` / `TestFetchWorkableSlugExtraction` / `TestFetchWorkableApiParsing` / `TestDiscoverJobsWorkableRouting`; 19 in `tests/test_company_agent.py`: `TestUnwrapCareerUrl` / `TestValidateAndUpgradeUnwraps` + `test_validators_cover_all_json_api_platforms`). Full suite 833/833 green. All mocked — no live network calls.
+
+### Self-audit fixes: TPM scraping coverage + classifier strictness
+
+Self-audit (two parallel `Explore` subagents) of the AI-TPM job pipeline surfaced three concrete defects, all fixed in `agents/job_agent.py`:
+
+- **Workable + Workday fallback search params** (`ATS_SEARCH_PARAM`): primary JSON-API path was already TPM-filtered, but the fallback `_crawl_ats_board` crawler had no search keyword for these two platforms, so when the API returned empty the crawler would scrape the entire job board un-filtered. Added `workable: query=…` and `workday: q=…` (the standard public search-URL syntax for each platform). Defense-in-depth — affects ~20 companies (Hugging Face, Intel, HPE, NVIDIA, Pinecone, etc.) when their JSON API hiccups.
+- **Compliance/SOX/audit/governance/GRC title block** (`_TITLE_BLOCK_KW`): Big-Tech title prefilter was admitting roles like "TPM, SOX Compliance" and "TPM, GRC Audit" as candidates. The downstream LLM classifier also accepted some as `is_ai_tpm=True` because the prompt's domain-exclusion list omitted compliance/audit. Added 5 keywords to the title prefilter so these never reach Gemini.
+- **Big Tech `is_ai_tpm` prompt**: appended explicit ACCEPT/REJECT few-shot examples (ML Infrastructure / GPU Cluster / Foundation Models vs. SOX / Marketing-Tech / Trust & Safety / Federal-clearance) and added the same compliance keywords to the natural-language exclusion list. Reduces false positives on JDs whose titles slipped past the title prefilter.
+
+**Tests**: 802 → 805 (+3). New `TestAiTitlePrefilter` class regression-tests the compliance keyword block; `test_search_params_exist_for_main_ats` extended to require Workable + Workday entries.
+
+### Self-audit P1 follow-up: silent-failure observability + retries + Microsoft JD
+
+Round-2 fixes for the P1 items the self-audit flagged but the first batch deferred. All in `agents/job_agent.py`.
+
+- **HTTP retry helper** (`_http_request_with_retry`): new module-level function with exponential backoff (0.5/1.0/2.0s) on 429 + 5xx + transient network exceptions. All 4 ATS API fetchers (`_fetch_ats_jobs` for Greenhouse/Lever, `_fetch_ashby_jobs`, `_fetch_workable_jobs`, `_fetch_workday_jobs`) routed through the helper — used to be `requests.get` once, return `[]` on any non-200, no retry, no URL in the error log. Now: 3 attempts, sleep between attempts, every retry/failure logs URL + status + attempt number. The helper dispatches to `requests.get` / `requests.post` (rather than `requests.request`) so the 50+ existing test patches that mock those names continue to work unchanged. Backoff base is the module-level constant `_RETRY_BASE_SLEEP_SECS` (default 0.5s, set to 0 in tests).
+- **Error-context logging** at the 4 remaining swallow sites: `_crawl_page` / `scrape_jd` / `llm_filter_jobs` / `extract_jd` previously logged just the exception message. Now log the URL (or company + JD char count + classification class for the LLM calls) and the exception type. "API down" no longer looks like "zero jobs" in the run log.
+- **Microsoft careers JD scraper** (`_scrape_microsoft_jd`): mirrors `_scrape_google_jd`. Routes URLs at `jobs.careers.microsoft.com` and `careers.microsoft.com` through Firecrawl with `only_main_content=True`, falls back to plain HTTP + JSON-LD if Firecrawl is unavailable, falls back further to the generic browser scraper if both miss. Closes the audit's "40-50% of cached MS JDs were nav-chrome" finding. Wired via the existing `ATS_PLATFORMS` table + `_JD_FN_REGISTRY` so no router code changed.
+
+**Confidence/reasoning fields on `JobDetails`** (audit P2): deliberately deferred. Adding it would touch `excel_store.py` (column migration) + `match_agent.py` + `resume_optimizer.py` (downstream consumers must read it); >3 files violates the project's task-size rule. Will land as its own PR.
+
+**Tests**: 805 → 832 (+27, includes prior parallel session's 805→820 baseline shift). New `TestHttpRetryHelper` (7) + `TestMicrosoftJdScraper` (5) classes in `tests/test_job_agent.py`. The retry helper is exercised against 200/4xx/429/5xx/exception scenarios; the Microsoft scraper is asserted to route via `_match_ats` and to call Firecrawl with `only_main_content=True`. Existing ATS fetcher tests still patch `requests.get`/`requests.post` directly; module-level `_RETRY_BASE_SLEEP_SECS = 0` keeps the suite snappy despite the new retries.
+
+### PRJ-003: PDF Resume I/O + Claude Opus Tailor Evaluation
+
+Three additions, all opt-in / passive:
+
+- **PDF → MD resume input** (no LLM): drop a `.pdf` into `profile/` and the agents auto-convert via `pdfplumber`. Conversion is deterministic, layout-aware (detects section headers by font size + all-caps, preserves bullet structure), and cached at `profile/.cache/{stem}.{md5}.md` — re-runs are zero-cost. Picker priority is `.md > .txt > .pdf` so a hand-edited `.md` always wins. `resume_id` is preserved across formats so existing Excel keys remain stable. Implemented in `shared/resume_io.py`; `agents/match_agent.py` and `agents/resume_optimizer.py` now import the shared loader (local copies removed).
+- **MD → PDF tailored output (ATS-safe)**: every tailored resume written to `tailored_resumes/{resume_id}/{md5}.md` now also gets a sibling `{md5}.pdf` rendered via WeasyPrint. The CSS template (`templates/resume.css`) enforces ATS-safe rules: single column, standard fonts (Helvetica / Arial / Times / Calibri / Georgia stack), no images / headers / footers / multi-column, real Unicode bullets, selectable text. Font family + body size are captured from the input PDF (when present) and injected as CSS variables so output mimics source typography while staying ATS-safe; body size clamps to [9pt, 12pt]. PDF generation failures log a warning but never block the pipeline — the `.md` remains source of truth for Excel records.
+- **Claude Opus 4.7 tailor evaluation memo** (`docs/sdlc/PRJ-003-pdf-io-opus-eval/eval.md`): cost / latency / quality analysis vs current Gemini 3.1 Flash Lite for the `tailor_resume` step. **Verdict**: not as a full swap — Opus is ~170× more expensive per call and ~2–3× slower; recommend opt-in fallback that fires only on regressions and user-flagged priority JDs.
+
+**System dependency**: WeasyPrint needs Pango/Cairo. On macOS: `brew install pango` (one-time).
+
+**Tests**: 736 → 749 (+13 in `tests/test_resume_io.py`), all passing.
+
+**Reference docs**: `docs/sdlc/PRJ-003-pdf-io-opus-eval/` (status + eval memo).
+
 ## 2026-04-28
 
 ### Major: 3-Dimension Scoring (PRJ-002)

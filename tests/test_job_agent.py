@@ -79,6 +79,10 @@ from agents.job_agent import (
     _classify,
     _classify_by_domain,
     _fetch_ashby_jobs,
+    _fetch_workable_jobs,
+    _format_workable_location,
+    _ai_title_prefilter,
+    _TITLE_BLOCK_KW,
     ATS_PLATFORMS,
     ATS_SEARCH_PARAM,
     API_ATS,
@@ -98,6 +102,11 @@ from agents.job_agent import (
     extract_jd,
 )
 import agents.job_agent as job_agent_mod
+
+# Skip exponential backoff sleeps during tests — the retry helper sleeps between
+# attempts in production, but every test that mocks an HTTP failure would otherwise
+# wait ~1.5s per call. Setting the base to 0 keeps the suite snappy.
+job_agent_mod._RETRY_BASE_SLEEP_SECS = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +286,9 @@ class TestClassifyByDomain(unittest.TestCase):
     def test_big_tech_domain(self):
         self.assertEqual(_classify_by_domain("Big Tech (AI Investment)"), "big_tech")
 
+    def test_consumer_ml_tech_domain(self):
+        self.assertEqual(_classify_by_domain("Consumer ML Tech"), "big_tech")
+
     def test_ai_startups_domain(self):
         self.assertEqual(_classify_by_domain("AI Startups"), "ai_native")
 
@@ -315,9 +327,141 @@ class TestAtsPlatformsConfig(unittest.TestCase):
         self.assertIsNone(ATS_PLATFORMS["workday"]["board_url_template"])
 
     def test_search_params_exist_for_main_ats(self):
-        for platform in ["greenhouse", "lever", "ashby"]:
+        for platform in ["greenhouse", "lever", "ashby", "workable", "workday"]:
             self.assertIn(platform, ATS_SEARCH_PARAM)
             self.assertIn("Technical+Program+Manager", ATS_SEARCH_PARAM[platform])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestAiTitlePrefilter(unittest.TestCase):
+    """Block-keyword expansion (PRJ self-audit 2026-05-05): SOX/compliance/audit/
+    governance/GRC titles must be filtered out for Big Tech companies. Reason:
+    LLM JD-level filter was admitting these as is_ai_tpm=True; title-level block
+    catches them before extraction."""
+
+    def test_compliance_keywords_blocked_for_big_tech(self):
+        links = [
+            {"url": "u1", "title": "Technical Program Manager, ML Infrastructure"},
+            {"url": "u2", "title": "Technical Program Manager - SOX Compliance"},
+            {"url": "u3", "title": "TPM, GRC and Audit"},
+            {"url": "u4", "title": "Senior TPM, Governance"},
+        ]
+        kept = _ai_title_prefilter(links, "Big Tech")
+        kept_urls = {l["url"] for l in kept}
+        self.assertEqual(kept_urls, {"u1"})
+
+    def test_ai_native_companies_pass_all_through(self):
+        links = [{"url": "u1", "title": "TPM, SOX Compliance"}]
+        self.assertEqual(_ai_title_prefilter(links, "AI Startups"), links)
+
+    def test_block_kw_includes_compliance_set(self):
+        for kw in ["sox", "compliance", "audit", "governance", "grc"]:
+            self.assertIn(kw, _TITLE_BLOCK_KW)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestHttpRetryHelper(unittest.TestCase):
+    """Audit P1: `_http_request_with_retry` must retry on 429/5xx and on
+    transient network exceptions, but pass through 4xx (callers decide) and
+    successful 2xx responses on the first attempt."""
+
+    def test_2xx_returns_immediately(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200)
+            r = job_agent_mod._http_request_with_retry("GET", "https://x.test")
+            self.assertEqual(mock_get.call_count, 1)
+            self.assertEqual(r.status_code, 200)
+
+    def test_4xx_returns_immediately_no_retry(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=404)
+            r = job_agent_mod._http_request_with_retry("GET", "https://x.test")
+            self.assertEqual(mock_get.call_count, 1)
+            self.assertEqual(r.status_code, 404)
+
+    def test_5xx_retries_until_success(self):
+        responses = [
+            MagicMock(status_code=503),
+            MagicMock(status_code=502),
+            MagicMock(status_code=200),
+        ]
+        with patch("agents.job_agent.requests.get", side_effect=responses) as mock_get:
+            r = job_agent_mod._http_request_with_retry("GET", "https://x.test", attempts=3)
+            self.assertEqual(mock_get.call_count, 3)
+            self.assertEqual(r.status_code, 200)
+
+    def test_429_retries(self):
+        responses = [MagicMock(status_code=429), MagicMock(status_code=200)]
+        with patch("agents.job_agent.requests.get", side_effect=responses) as mock_get:
+            r = job_agent_mod._http_request_with_retry("GET", "https://x.test", attempts=3)
+            self.assertEqual(mock_get.call_count, 2)
+            self.assertEqual(r.status_code, 200)
+
+    def test_persistent_5xx_returns_last_response(self):
+        # Helper returns the last 5xx response after exhausting attempts so the
+        # caller can log status; downstream then short-circuits on != 200.
+        responses = [MagicMock(status_code=503) for _ in range(3)]
+        with patch("agents.job_agent.requests.get", side_effect=responses):
+            r = job_agent_mod._http_request_with_retry("GET", "https://x.test", attempts=3)
+            self.assertEqual(r.status_code, 503)
+
+    def test_network_exception_returns_none_after_retries(self):
+        with patch("agents.job_agent.requests.get",
+                   side_effect=ConnectionError("timeout")) as mock_get:
+            r = job_agent_mod._http_request_with_retry("GET", "https://x.test", attempts=3)
+            self.assertEqual(mock_get.call_count, 3)
+            self.assertIsNone(r)
+
+    def test_post_method_dispatches_to_requests_post(self):
+        with patch("agents.job_agent.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            job_agent_mod._http_request_with_retry("POST", "https://x.test", json={"k": 1})
+            self.assertEqual(mock_post.call_count, 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestMicrosoftJdScraper(unittest.TestCase):
+    """Audit Line 2 P1: Microsoft careers SPA was returning navbar/theme JSON
+    instead of JD bodies via the generic browser scraper. Dedicated scraper
+    using Firecrawl `only_main_content=True` mirrors the Google fix."""
+
+    def test_microsoft_in_ats_platforms(self):
+        self.assertIn("microsoft", ATS_PLATFORMS)
+        cfg = ATS_PLATFORMS["microsoft"]
+        self.assertEqual(cfg["jd_fn"], "_scrape_microsoft_jd")
+        self.assertIn("jobs.careers.microsoft.com", cfg["jd_domains"])
+        self.assertIn("careers.microsoft.com", cfg["jd_domains"])
+
+    def test_match_ats_routes_microsoft_url(self):
+        result = _match_ats("https://jobs.careers.microsoft.com/global/en/job/12345")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "microsoft")
+
+    def test_match_ats_routes_legacy_microsoft_url(self):
+        result = _match_ats("https://careers.microsoft.com/professionals/us/en/job/12345/abc")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "microsoft")
+
+    def test_scrape_microsoft_jd_uses_firecrawl_with_only_main_content(self):
+        # Firecrawl FirecrawlApp.scrape must be called with only_main_content=True
+        # so the sidebar/nav is stripped (the audit's actual root cause).
+        from agents.job_agent import _scrape_microsoft_jd
+        fake_app = MagicMock()
+        fake_app.scrape.return_value = MagicMock(markdown="x" * 500)
+        with patch("firecrawl.FirecrawlApp", return_value=fake_app):
+            result = _scrape_microsoft_jd("https://jobs.careers.microsoft.com/global/en/job/1",
+                                          fc_key="fc-key")
+        self.assertTrue(len(result) > 200)
+        scrape_kwargs = fake_app.scrape.call_args.kwargs
+        self.assertTrue(scrape_kwargs.get("only_main_content"))
+
+    def test_scrape_microsoft_jd_returns_empty_without_fc_key(self):
+        # No fc_key + Microsoft pages have no JSON-LD → returns "".
+        # Generic browser scraper picks up downstream.
+        from agents.job_agent import _scrape_microsoft_jd
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, text="<html>no json-ld</html>")
+            self.assertEqual(_scrape_microsoft_jd("https://jobs.careers.microsoft.com/x", ""), "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -962,6 +1106,161 @@ class TestDiscoverJobsAshbyRouting(unittest.IsolatedAsyncioTestCase):
             result = await discover_jobs(ashby_url, "fc-key", MagicMock())
         # When API returns empty, should fall through to crawler path
         self.assertIsInstance(result, list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestWorkableAtsConfig(unittest.TestCase):
+    """A′ — Workable must be registered as a json_api ATS platform."""
+
+    def test_workable_in_ats_platforms(self):
+        self.assertIn("workable", ATS_PLATFORMS)
+        self.assertEqual(ATS_PLATFORMS["workable"]["strategy"], "json_api")
+        self.assertEqual(ATS_PLATFORMS["workable"]["list_fn"], "_fetch_workable_jobs")
+
+    def test_workable_in_api_ats(self):
+        self.assertIn("workable.com", API_ATS)
+
+    def test_match_ats_resolves_workable(self):
+        result = _match_ats("https://apply.workable.com/huggingface/")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "workable")
+
+
+class TestFormatWorkableLocation(unittest.TestCase):
+    """A′ — Workable's multi-field location collapses into _is_us-compatible string."""
+
+    def test_telecommuting_emits_remote(self):
+        loc = _format_workable_location({"telecommuting": True, "city": "", "country": ""})
+        self.assertIn("Remote", loc)
+
+    def test_single_location_city_state_country(self):
+        loc = _format_workable_location({
+            "telecommuting": False, "city": "San Francisco",
+            "state": "California", "country": "United States",
+        })
+        self.assertIn("San Francisco", loc)
+        self.assertIn("California", loc)
+
+    def test_multi_locations_joined_with_semicolon(self):
+        loc = _format_workable_location({
+            "telecommuting": False,
+            "locations": [
+                {"city": "Paris",  "region": "Île-de-France", "country": "France"},
+                {"city": "Austin", "region": "Texas",         "country": "United States"},
+            ],
+        })
+        self.assertIn(";", loc)  # multi-location separator for _is_us
+        self.assertIn("Austin", loc)
+        self.assertIn("Paris", loc)
+
+    def test_remote_plus_locations(self):
+        loc = _format_workable_location({
+            "telecommuting": True,
+            "locations": [{"city": "NYC", "region": "NY", "country": "US"}],
+        })
+        self.assertIn("Remote", loc)
+        self.assertIn("NYC", loc)
+
+    def test_empty_job_returns_empty_string(self):
+        self.assertEqual(_format_workable_location({}), "")
+
+
+class TestFetchWorkableSlugExtraction(unittest.TestCase):
+    """A′ — slug extraction from various Workable URL forms."""
+
+    def test_basic_apply_subdomain(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {"jobs": []})
+            _fetch_workable_jobs("https://apply.workable.com/huggingface/")
+            self.assertIn("/huggingface", mock_get.call_args[0][0])
+
+    def test_url_without_trailing_slash(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {"jobs": []})
+            _fetch_workable_jobs("https://apply.workable.com/myco")
+            self.assertIn("/myco", mock_get.call_args[0][0])
+
+    def test_invalid_url_no_slug(self):
+        result = _fetch_workable_jobs("https://example.com/not-workable")
+        self.assertEqual(result, [])
+
+
+class TestFetchWorkableApiParsing(unittest.TestCase):
+    """A′ — Workable widget API response parsing produces normalized output."""
+
+    SAMPLE = {
+        "name": "Hugging Face",
+        "jobs": [
+            {
+                "title": "Cloud ML DevRel Engineer - EMEA remote",
+                "shortcode": "922D2C6549",
+                "url": "https://apply.workable.com/j/922D2C6549",
+                "telecommuting": True,
+                "city": "Paris", "state": "Île-de-France", "country": "France",
+                "locations": [{"city": "Paris", "region": "Île-de-France",
+                               "country": "France", "countryCode": "FR"}],
+            },
+            {
+                "title": "Senior TPM",
+                "shortcode": "ABCDEF1234",
+                # url missing → must be built from shortcode
+                "telecommuting": False,
+                "city": "New York", "state": "NY", "country": "United States",
+            },
+            {
+                # Missing both url and shortcode → dropped
+                "title": "Ghost role",
+            },
+        ],
+    }
+
+    def test_returns_only_valid_jobs(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: self.SAMPLE)
+            result = _fetch_workable_jobs("https://apply.workable.com/huggingface/")
+        self.assertEqual(len(result), 2)
+
+    def test_url_falls_back_to_shortcode(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: self.SAMPLE)
+            result = _fetch_workable_jobs("https://apply.workable.com/huggingface/")
+        urls = [j["url"] for j in result]
+        self.assertIn("https://apply.workable.com/j/ABCDEF1234", urls)
+
+    def test_location_present_for_each(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: self.SAMPLE)
+            result = _fetch_workable_jobs("https://apply.workable.com/huggingface/")
+        for j in result:
+            self.assertTrue(j["location"], f"empty location in {j}")
+
+    def test_non_200_returns_empty(self):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=404, json=lambda: {})
+            result = _fetch_workable_jobs("https://apply.workable.com/missing/")
+        self.assertEqual(result, [])
+
+    def test_request_exception_returns_empty(self):
+        with patch("agents.job_agent.requests.get", side_effect=Exception("boom")):
+            result = _fetch_workable_jobs("https://apply.workable.com/huggingface/")
+        self.assertEqual(result, [])
+
+
+class TestDiscoverJobsWorkableRouting(unittest.IsolatedAsyncioTestCase):
+    """A′ — discover_jobs must route Workable URLs to _fetch_workable_jobs."""
+
+    async def test_workable_url_calls_fetch_workable(self):
+        from agents.job_agent import discover_jobs
+        url = "https://apply.workable.com/huggingface/"
+        jobs = [{"url": "https://apply.workable.com/j/X", "title": "TPM", "location": "Remote"}]
+        with patch("agents.job_agent._fetch_workable_jobs", return_value=jobs) as mw, \
+             patch("agents.job_agent._fetch_ats_jobs") as ma, \
+             patch("agents.job_agent._fetch_ashby_jobs") as mash:
+            result = await discover_jobs(url, "fc-key", MagicMock())
+        mw.assert_called_once_with(url)
+        ma.assert_not_called()
+        mash.assert_not_called()
+        self.assertEqual(len(result), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
