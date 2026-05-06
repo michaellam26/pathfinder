@@ -38,6 +38,7 @@ from shared.excel_store import (
     get_scored_matches, get_tailored_match_pairs, batch_upsert_tailored_records,
     get_archived_companies, update_archive_status, unarchive_company,
     get_company_archive_info, count_valid_tpm_jobs_by_company,
+    classify_location, sort_jd_tracker_by_tier,
     COMPANY_HEADERS, JD_HEADERS, MATCH_HEADERS, TAILORED_HEADERS, _JD_COL,
 )
 import openpyxl
@@ -2498,6 +2499,207 @@ class TestBug52JdTrackerDynamicColumns(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.remove(path)
+
+
+class TestClassifyLocation(unittest.TestCase):
+    """Unit tests for classify_location — pure function, no I/O."""
+
+    def test_empty_or_missing(self):
+        self.assertEqual(classify_location(""), "Other")
+        self.assertEqual(classify_location(None), "Other")
+        self.assertEqual(classify_location("N/A"), "Other")
+        self.assertEqual(classify_location("None"), "Other")
+
+    def test_seattle_single(self):
+        self.assertEqual(classify_location("Seattle, WA"), "Greater Seattle")
+        self.assertEqual(classify_location("Bellevue, WA"), "Greater Seattle")
+        self.assertEqual(classify_location("Redmond, WA - US"), "Greater Seattle")
+        self.assertEqual(classify_location("kirkland, wa"), "Greater Seattle")  # case-insensitive
+
+    def test_seattle_multi_segment(self):
+        self.assertEqual(
+            classify_location("San Francisco, CA; Seattle, WA"),
+            "Greater Seattle",
+        )
+        self.assertEqual(
+            classify_location("Bellevue, WA; Sunnyvale, CA"),
+            "Greater Seattle",
+        )
+        self.assertEqual(
+            classify_location("San Francisco, CA - US; Bellevue, WA - US; Sunnyvale, CA - US"),
+            "Greater Seattle",
+        )
+
+    def test_seattle_priority_over_remote(self):
+        # Seattle wins when both present.
+        self.assertEqual(
+            classify_location("Seattle, WA; Remote"),
+            "Greater Seattle",
+        )
+
+    def test_remote_us_variants(self):
+        # Bare "Remote" (US-default) and explicit US qualifiers all qualify.
+        self.assertEqual(classify_location("Remote"), "Remote")
+        self.assertEqual(classify_location("Remote, US"), "Remote")
+        self.assertEqual(classify_location("Remote, USA"), "Remote")
+        self.assertEqual(classify_location("Remote, United States"), "Remote")
+        self.assertEqual(classify_location("Remote, U.S."), "Remote")
+        self.assertEqual(classify_location("Remote, U.S.A."), "Remote")
+        self.assertEqual(classify_location("San Francisco, CA; New York, NY; Remote"), "Remote")
+
+    def test_remote_non_us_excluded(self):
+        # Explicit non-US country qualifiers do NOT qualify as Remote.
+        self.assertEqual(classify_location("Remote, Canada"), "Other")
+        self.assertEqual(classify_location("Remote, UK"), "Other")
+        self.assertEqual(classify_location("Remote, Germany"), "Other")
+
+    def test_washington_state_forms(self):
+        # Whitelisted Washington-state forms qualify as Greater Seattle.
+        self.assertEqual(classify_location("Washington, US"), "Greater Seattle")
+        self.assertEqual(classify_location("Washington, USA"), "Greater Seattle")
+        self.assertEqual(classify_location("Washington, United States"), "Greater Seattle")
+        self.assertEqual(classify_location("Washington State"), "Greater Seattle")
+        self.assertEqual(classify_location("washington, u.s."), "Greater Seattle")  # case-insensitive
+
+    def test_washington_dc_still_other(self):
+        # D.C. variants must remain Other — guards against accidental capture.
+        self.assertEqual(classify_location("Washington, D.C."), "Other")
+        self.assertEqual(classify_location("Washington, DC"), "Other")
+        self.assertEqual(classify_location("Washington, District of Columbia"), "Other")
+        # Bare "Washington" is intentionally ambiguous → Other (whitelist-only).
+        self.assertEqual(classify_location("Washington"), "Other")
+
+    def test_other(self):
+        self.assertEqual(classify_location("San Francisco, CA"), "Other")
+        self.assertEqual(classify_location("Mountain View, California"), "Other")
+        self.assertEqual(classify_location("United Kingdom"), "Other")
+
+    def test_kent_oh_not_seattle(self):
+        # Guards against false positive: city name 'Kent' without WA must not match.
+        self.assertEqual(classify_location("Kent, OH"), "Other")
+
+    def test_sample_real_locations(self):
+        # Sampled from production JD_Tracker data.
+        self.assertEqual(
+            classify_location("Livingston, NJ; New York, NY; Sunnyvale, CA; Bellevue, WA"),
+            "Greater Seattle",
+        )
+        self.assertEqual(
+            classify_location(
+                "Huntsville, AL; Oklahoma City, OK; Mechanicsburg, PA; Ogden, UT; "
+                "San Antonio, TX; Fort Meade, MD; Columbus, OH; Remote"
+            ),
+            "Remote",
+        )
+
+
+class TestSortJdTrackerByTier(unittest.TestCase):
+    """Integration: sort_jd_tracker_by_tier writes Location Tier, sorts rows,
+    applies fill colors, and is idempotent."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _add_jd(self, url: str, location: str, updated_at: str, company: str = "Acme"):
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        row = [None] * len(JD_HEADERS)
+        row[JD_HEADERS.index("JD URL")]     = url
+        row[JD_HEADERS.index("Company")]    = company
+        row[JD_HEADERS.index("Location")]   = location
+        row[JD_HEADERS.index("Updated At")] = updated_at
+        ws.append(row)
+        wb.save(self.path)
+        wb.close()
+
+    def test_sort_order_seattle_remote_other(self):
+        self._add_jd("u1", "San Francisco, CA",  "2026-05-01 10:00:00")
+        self._add_jd("u2", "Bellevue, WA",       "2026-05-02 10:00:00")
+        self._add_jd("u3", "Remote",             "2026-05-03 10:00:00")
+        self._add_jd("u4", "Seattle, WA",        "2026-05-04 10:00:00")
+        self._add_jd("u5", "Mountain View, CA",  "2026-05-05 10:00:00")
+        self._add_jd("u6", "Remote, USA",        "2026-05-06 10:00:00")
+
+        n = sort_jd_tracker_by_tier(self.path)
+        self.assertEqual(n, 6)
+
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        url_col  = JD_HEADERS.index("JD URL") + 1
+        tier_col = JD_HEADERS.index("Location Tier") + 1
+        ordered = [(ws.cell(r, url_col).value, ws.cell(r, tier_col).value)
+                   for r in range(2, ws.max_row + 1) if ws.cell(r, url_col).value]
+        wb.close()
+        # Greater Seattle first (Updated At desc within tier): u4 (May 4) before u2 (May 2)
+        # then Remote: u6 (May 6) before u3 (May 3)
+        # then Other: u5 (May 5) before u1 (May 1)
+        self.assertEqual(ordered, [
+            ("u4", "Greater Seattle"),
+            ("u2", "Greater Seattle"),
+            ("u6", "Remote"),
+            ("u3", "Remote"),
+            ("u5", "Other"),
+            ("u1", "Other"),
+        ])
+
+    def test_fill_colors_applied(self):
+        self._add_jd("u1", "Seattle, WA",       "2026-05-01 10:00:00")
+        self._add_jd("u2", "Remote",            "2026-05-02 10:00:00")
+        self._add_jd("u3", "San Francisco, CA", "2026-05-03 10:00:00")
+
+        sort_jd_tracker_by_tier(self.path)
+
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        # Row 2 = Seattle (green C6EFCE), Row 3 = Remote (yellow FFEB9C), Row 4 = Other (no fill)
+        self.assertIn("C6EFCE", str(ws.cell(2, 1).fill.start_color.rgb or ""))
+        self.assertIn("FFEB9C", str(ws.cell(3, 1).fill.start_color.rgb or ""))
+        # Row 4 should have no solid fill — fill_type is None or 'none'
+        row4_fill_type = ws.cell(4, 1).fill.fill_type
+        self.assertIn(row4_fill_type, (None, "none"))
+        wb.close()
+
+    def test_idempotent(self):
+        self._add_jd("u1", "Seattle, WA",       "2026-05-01 10:00:00")
+        self._add_jd("u2", "Remote",            "2026-05-02 10:00:00")
+        self._add_jd("u3", "San Francisco, CA", "2026-05-03 10:00:00")
+
+        sort_jd_tracker_by_tier(self.path)
+        sort_jd_tracker_by_tier(self.path)  # second call must not change order
+
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        url_col = JD_HEADERS.index("JD URL") + 1
+        urls = [ws.cell(r, url_col).value for r in range(2, ws.max_row + 1)
+                if ws.cell(r, url_col).value]
+        wb.close()
+        self.assertEqual(urls, ["u1", "u2", "u3"])
+
+    def test_empty_sheet(self):
+        # No data rows: sort returns 0 and does not crash.
+        n = sort_jd_tracker_by_tier(self.path)
+        self.assertEqual(n, 0)
+
+    def test_blank_updated_at_sinks_within_tier(self):
+        self._add_jd("u_old",   "Seattle, WA", "2026-05-01 10:00:00")
+        self._add_jd("u_blank", "Bellevue, WA", "")
+        self._add_jd("u_new",   "Redmond, WA", "2026-05-10 10:00:00")
+
+        sort_jd_tracker_by_tier(self.path)
+
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        url_col = JD_HEADERS.index("JD URL") + 1
+        urls = [ws.cell(r, url_col).value for r in range(2, ws.max_row + 1)
+                if ws.cell(r, url_col).value]
+        wb.close()
+        # All Greater Seattle. Newer first; blank sinks to bottom of tier.
+        self.assertEqual(urls, ["u_new", "u_old", "u_blank"])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 import openpyxl
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 # ── Path ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +24,10 @@ JD_HEADERS      = ["JD URL", "Job Title", "Company", "Location", "Salary", "Requ
                    # so it survives the round-trip from job_agent (Gemini extraction)
                    # to match_agent / resume_optimizer (consumption). Without this column
                    # the ATS dimension was always silently None.
-                   "ATS Keywords"]
+                   "ATS Keywords",
+                   # Location Tier: derived from Location, written by sort_jd_tracker_by_tier
+                   # at the end of each job_agent run. Values: Greater Seattle / Remote / Other.
+                   "Location Tier"]
 # PRJ-002 PR 2: 3-dimension scoring columns appended at end so existing
 # column indices stay valid. PR 3/PR 4 wire up the upsert paths to populate
 # them — for now they're added by migration and left blank for old rows.
@@ -126,6 +130,14 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     ws_jd.cell(1, next_col).value = "ATS Keywords"
                     changed = True
                     _log.info("[Excel] Migrated JD_Tracker: added 'ATS Keywords' column.")
+                # Location Tier: filled by sort_jd_tracker_by_tier; existing rows
+                # stay blank until the next job_agent run sorts the sheet.
+                header_row = [ws_jd.cell(1, c).value for c in range(1, ws_jd.max_column + 1)]
+                if "Location Tier" not in header_row:
+                    next_col = ws_jd.max_column + 1
+                    ws_jd.cell(1, next_col).value = "Location Tier"
+                    changed = True
+                    _log.info("[Excel] Migrated JD_Tracker: added 'Location Tier' column.")
             # Migrate Company_List: add "TPM Jobs" and "AI TPM Jobs" columns if missing
             if "Company_List" in wb.sheetnames:
                 ws_co = wb["Company_List"]
@@ -746,6 +758,152 @@ def update_company_job_counts(xlsx_path: str, counts: dict) -> None:
                 ws_co.cell(r, tpm_col).value    = counts[name]["tpm"]
                 ws_co.cell(r, ai_tpm_col).value = counts[name]["ai_tpm"]
         wb.save(xlsx_path)
+    finally:
+        wb.close()
+
+
+# ── Location tier (sort + highlight) ─────────────────────────────────────────
+# Greater Seattle / Puget Sound cities. A location segment qualifies as
+# "Greater Seattle" only if it pairs one of these names with the WA state
+# token (", WA") — guards against false positives like "Kent, OH".
+_GREATER_SEATTLE_CITIES = (
+    "seattle", "bellevue", "redmond", "kirkland", "bothell",
+    "sammamish", "issaquah", "renton", "tukwila", "kent",
+    "lynnwood", "everett", "tacoma",
+)
+
+# "Washington" without a city pairing is ambiguous (state vs D.C.). We accept
+# only forms that explicitly qualify it as the state — never bare "Washington".
+_WASHINGTON_STATE_FORMS = frozenset({
+    "washington state",
+    "washington, us",
+    "washington, usa",
+    "washington, united states",
+    "washington, u.s.",
+    "washington, u.s.a.",
+    "washington, united states of america",
+})
+
+# Remote tier accepts: bare "Remote" (US-default) + any explicit US qualifier.
+# Explicit non-US country (e.g. "Remote, Canada", "Remote, UK") → Other.
+_US_REMOTE_QUALIFIERS = frozenset({
+    "us", "usa", "united states", "u.s.", "u.s.a.", "united states of america",
+})
+
+_TIER_PRIORITY = {"Greater Seattle": 0, "Remote": 1, "Other": 2}
+_TIER_FILL = {
+    "Greater Seattle": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),  # Excel "Good" green
+    "Remote":          PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),  # Excel "Neutral" yellow
+}
+_NO_FILL = PatternFill(fill_type=None)
+
+
+def classify_location(location: str) -> str:
+    """Return 'Greater Seattle' / 'Remote' / 'Other' for a JD Location string.
+
+    Greater Seattle: any semicolon-separated segment that either
+      - names a Puget Sound city paired with ", WA" (e.g. "Bellevue, WA"), or
+      - matches a whitelisted Washington-state form (e.g. "Washington, US",
+        "Washington, USA", "Washington State"). Bare "Washington" is NOT
+        accepted because it collides with Washington, D.C.
+
+    Remote: any segment that is bare "Remote" (US-default) OR "Remote, <q>"
+    where <q> ∈ {US, USA, United States, U.S., U.S.A., United States of
+    America}. Explicit non-US country qualifiers (e.g. "Remote, Canada")
+    do NOT qualify.
+
+    Greater Seattle wins when both signals are present.
+    """
+    if not location:
+        return "Other"
+    text = str(location).strip()
+    if not text or text.lower() in _JD_MISSING:
+        return "Other"
+    has_seattle = False
+    has_remote  = False
+    for raw_seg in text.split(";"):
+        seg = raw_seg.strip().lower()
+        if not seg:
+            continue
+        # Greater Seattle: city + ", WA" pairing
+        if ", wa" in seg and any(city in seg for city in _GREATER_SEATTLE_CITIES):
+            has_seattle = True
+        # Greater Seattle: explicitly state-qualified Washington (whitelist)
+        elif seg in _WASHINGTON_STATE_FORMS:
+            has_seattle = True
+        # Remote: bare "remote" (US-default) or US-qualified form
+        if seg == "remote":
+            has_remote = True
+        elif seg.startswith("remote,"):
+            qualifier = seg[len("remote,"):].strip()
+            if qualifier in _US_REMOTE_QUALIFIERS:
+                has_remote = True
+            # explicit non-US country (e.g. "remote, canada") → not remote
+    if has_seattle:
+        return "Greater Seattle"
+    if has_remote:
+        return "Remote"
+    return "Other"
+
+
+def sort_jd_tracker_by_tier(xlsx_path: str = EXCEL_PATH) -> int:
+    """Sort JD_Tracker rows by location tier and apply row highlights.
+
+    Order: Greater Seattle → Remote → Other; within each tier, Updated At
+    descending (most recent first; blank/unsortable timestamps sink to the
+    bottom of their tier). Writes the 'Location Tier' column on every row
+    and applies row fill: green for Seattle, yellow for Remote, none for Other.
+
+    Returns the number of data rows sorted. Idempotent — safe to re-run.
+    """
+    wb = load_workbook(xlsx_path)
+    try:
+        ws = wb["JD_Tracker"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        if "Location Tier" not in headers:
+            ws.cell(1, ws.max_column + 1).value = "Location Tier"
+            headers.append("Location Tier")
+        n_cols = len(headers)
+        c_loc  = headers.index("Location") + 1
+        c_upd  = headers.index("Updated At") + 1
+        c_tier = headers.index("Location Tier") + 1
+
+        rows = []
+        for r in range(2, ws.max_row + 1):
+            url = ws.cell(r, 1).value
+            if not url:
+                continue
+            row_vals = [ws.cell(r, c).value for c in range(1, n_cols + 1)]
+            location = str(row_vals[c_loc - 1] or "")
+            updated  = str(row_vals[c_upd - 1] or "")
+            tier     = classify_location(location)
+            row_vals[c_tier - 1] = tier
+            rows.append((tier, updated, row_vals))
+
+        # Stable two-pass sort: Updated At desc first, then tier priority asc.
+        rows.sort(key=lambda x: x[1], reverse=True)
+        rows.sort(key=lambda x: _TIER_PRIORITY.get(x[0], 99))
+
+        # Clear all existing data rows (values + fills) before rewriting.
+        max_row_before = ws.max_row
+        for r in range(2, max_row_before + 1):
+            for c in range(1, n_cols + 1):
+                cell = ws.cell(r, c)
+                cell.value = None
+                cell.fill = _NO_FILL
+
+        # Rewrite sorted rows + apply tier fill.
+        for i, (tier, _upd, row_vals) in enumerate(rows):
+            r = 2 + i
+            for c in range(1, n_cols + 1):
+                ws.cell(r, c).value = row_vals[c - 1]
+            fill = _TIER_FILL.get(tier)
+            if fill is not None:
+                for c in range(1, n_cols + 1):
+                    ws.cell(r, c).fill = fill
+
+        wb.save(xlsx_path)
+        return len(rows)
     finally:
         wb.close()
 
