@@ -312,7 +312,7 @@ Within the 500 RPD limit, a single full run is safely manageable. Incremental ru
 | Tavily API 402 quota exhaustion | Medium: company discovery interrupted | Detect 402/429/quota error codes and early-terminate subsequent queries, output user warning (BUG-44) | Mitigated |
 | Firecrawl 429 quota exhaustion | Medium: crawler path disabled | 3 retries + exponential backoff (429: 30s x attempt, others: 5s x attempt) (BUG-17) | Mitigated |
 | Career site anti-crawling 403 / dynamic rendering | Medium: JD scraping failure | Crawl4AI + Playwright JS rendering; hardcoded ATS overrides for special companies; Firecrawl as fallback | Mitigated |
-| Gemini model version retirement | High: entire system unavailable | MODEL constant centrally managed in `shared/config.py`, change one place to switch globally; currently using `gemini-3.1-flash-lite-preview`, need to monitor Google model lifecycle announcements | Monitoring Required |
+| Gemini model version retirement | High: entire system unavailable | MODEL constant centrally managed in `shared/config.py`, change one place to switch globally; currently using `gemini-3.1-flash-lite`, need to monitor Google model lifecycle announcements | Monitoring Required |
 | Gemini batch coarse screen JSON parsing failure | Low: lost scoring | Each JD defaults to score=1 fallback, does not return empty dict (BUG-33 fix) | Mitigated |
 | Excel concurrent write conflict | High: data corruption | Single-process load-modify-save + job_agent asyncio.Lock | Mitigated |
 | New/changed ATS platform | Medium: jobs missed | Declarative routing table ATS_PLATFORMS + generic fallback (REQ-062) | Mitigated |

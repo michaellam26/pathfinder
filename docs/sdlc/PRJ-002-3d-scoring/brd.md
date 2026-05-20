@@ -73,7 +73,7 @@ Consequences of the current single-score model:
 
 **Depends on**:
 - P0 branch (`fix/p0-review-2026-04-28`) merged to main, OR feature branch rebased after merge
-- `gemini-3.1-flash-lite-preview` model availability for Recruiter/HM prompts
+- `gemini-3.1-flash-lite` model availability for Recruiter/HM prompts
 - Existing `JobDetails` extraction prompt structure in `agents/job_agent.py`
 
 **Constraints**:

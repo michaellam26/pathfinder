@@ -226,7 +226,7 @@ Phase 3 — Assemble + write:
 | Service | Purpose | Auth | Key Limitations |
 |---------|---------|------|-----------------|
 | Tavily API | AI company web search, Career URL search | `TAVILY_API_KEY` | Limited free quota |
-| Google Gemini (`gemini-3.1-flash-lite-preview`) | Company extraction, JD structuring, coarse screening, fine evaluation | `GEMINI_API_KEY` / `GEMINI_API_KEY_2` | Supports multi-key rotation; 13 RPM rate control |
+| Google Gemini (`gemini-3.1-flash-lite`) | Company extraction, JD structuring, coarse screening, fine evaluation | `GEMINI_API_KEY` / `GEMINI_API_KEY_2` | Supports multi-key rotation; 13 RPM rate control |
 | Greenhouse Public API | ATS job listings | No auth required | Public endpoint |
 | Lever Public API | ATS job listings | No auth required | Public endpoint |
 | Firecrawl | Web crawling/Map | `FIRECRAWL_API_KEY` | Has quota, retry on 429 |

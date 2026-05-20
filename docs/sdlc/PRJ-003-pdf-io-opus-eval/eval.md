@@ -1,6 +1,6 @@
 # Claude Opus 4.7 vs Gemini 3.1 Flash Lite — Tailor-Step Evaluation
 
-**Scope**: should we replace `MODEL = gemini-3.1-flash-lite-preview` with **Claude Opus 4.7** for the **`tailor_resume` / `batch_tailor_resume`** calls only? Match (Stage 1 coarse + Stage 2 fine), Recruiter rescore, and HM rescore stay on Gemini regardless — they are score-only and benefit from Gemini's high TPM/RPM headroom.
+**Scope**: should we replace `MODEL = gemini-3.1-flash-lite` with **Claude Opus 4.7** for the **`tailor_resume` / `batch_tailor_resume`** calls only? Match (Stage 1 coarse + Stage 2 fine), Recruiter rescore, and HM rescore stay on Gemini regardless — they are score-only and benefit from Gemini's high TPM/RPM headroom.
 
 **Verdict (TL;DR)**: **No — do not adopt Opus 4.7 for the tailor step**, in any form (full swap or opt-in fallback). The cost / latency penalty is too steep for the expected quality lift. The Gemini 3.1 Flash Lite tailor path stays as-is. Decision finalized 2026-05-05; no follow-up A/B planned. Cost / latency / integration analysis below is preserved as historical record so the decision can be revisited if Opus pricing or rate limits change materially.
 
@@ -71,7 +71,7 @@ LiteLLM is already in `requirements.txt` (see `CLAUDE.md`'s library table), so a
 
 ```python
 # shared/config.py
-MODEL = "gemini/gemini-3.1-flash-lite-preview"  # current
+MODEL = "gemini/gemini-3.1-flash-lite"  # current
 TAILOR_MODEL = os.getenv("TAILOR_MODEL", MODEL)  # new override
 ```
 
@@ -91,7 +91,7 @@ resp = litellm.completion(
 
 User decision after reviewing §1–§4: the cost (~170× per call) and latency (~2–3× slower) penalties are not justified by the expected quality lift, especially since the lift is concentrated in a small regression tail (5–15% of JDs).
 
-**Action items**: none. The tailor step stays on `gemini-3.1-flash-lite-preview` indefinitely. No `TAILOR_MODEL` / `TAILOR_FALLBACK` env override, no `claude_pool.py`, no schema adapter, no A/B run.
+**Action items**: none. The tailor step stays on `gemini-3.1-flash-lite` indefinitely. No `TAILOR_MODEL` / `TAILOR_FALLBACK` env override, no `claude_pool.py`, no schema adapter, no A/B run.
 
 **Re-open trigger**: revisit only if any of the following change:
 - Anthropic publishes a Haiku-tier or cached-input pricing that brings per-call cost within 3× of Gemini Flash Lite

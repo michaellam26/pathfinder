@@ -17,7 +17,7 @@ You are the code review expert for the PathFinder project. Your responsibility i
 - `shared/excel_store.py` — Unified Excel persistence layer (24 functions, 5 worksheets)
 - `shared/gemini_pool.py` — Gemini API Key rotation base class
 - `shared/rate_limiter.py` — Token-bucket async rate limiter
-- `shared/config.py` — `MODEL = "gemini-3.1-flash-lite-preview"`
+- `shared/config.py` — `MODEL = "gemini-3.1-flash-lite"`
 
 ## Review Checklist
 

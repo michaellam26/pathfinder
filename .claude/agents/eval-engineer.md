@@ -74,7 +74,7 @@ You are the AI output quality evaluation expert for the PathFinder project. Your
 | `agents/resume_optimizer.py` | Resume tailoring + re-scoring |
 | `agents/job_agent.py` | JD discovery + extraction + LLM filtering |
 | `agents/company_agent.py` | Company discovery + Career URL |
-| `shared/config.py` | `MODEL = "gemini-3.1-flash-lite-preview"` |
+| `shared/config.py` | `MODEL = "gemini-3.1-flash-lite"` |
 | `profile/` | Original resume |
 | `tailored_resumes/` | Tailored resume output |
 | `jd_cache/` | JD Markdown cache |

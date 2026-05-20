@@ -272,7 +272,7 @@ PathFinder is a multi-Agent AI automation system for TPM job seekers. The system
 
 | Service | Purpose | Authentication | Key Limitations |
 |------|------|----------|----------|
-| Google Gemini (`gemini-3.1-flash-lite-preview`) | Company info extraction, JD structuring, coarse scoring, fine evaluation, resume tailoring and re-scoring | `GEMINI_API_KEY` / `GEMINI_API_KEY_2` | Free tier: 15 RPM / 500 RPD / 250k TPM; supports multi-Key rotation |
+| Google Gemini (`gemini-3.1-flash-lite`) | Company info extraction, JD structuring, coarse scoring, fine evaluation, resume tailoring and re-scoring | `GEMINI_API_KEY` / `GEMINI_API_KEY_2` | Free tier: 15 RPM / 500 RPD / 250k TPM; supports multi-Key rotation |
 | Tavily API | AI company web search, Career URL search | `TAVILY_API_KEY` | Limited free quota; quota exhaustion returns 402/429 |
 | Firecrawl | Career page crawling/Map | `FIRECRAWL_API_KEY` | Has credits quota; 429 requires retry |
 | Crawl4AI + Playwright | JS rendering crawler (JD page scraping) | No authentication needed | Local run requires Chromium installation (`playwright install chromium`) |
