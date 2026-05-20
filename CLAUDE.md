@@ -58,6 +58,22 @@ This is a **multi-agent AI project**. The expected pattern:
 - `agents/` — each file or subdirectory is a self-contained agent with a specific role
 - `shared/` — cross-agent utilities: tool wrappers, prompt templates, common helpers
 
+### Manual-entry override rule
+
+The agents accept manually-inserted rows in `pathfinder_dashboard.xlsx` and
+will enrich them on the next pipeline run:
+
+- **Company_List** — insert a row with just `Company Name` + `AI Domain` (blank
+  Career URL). `company_agent.run_phase_1_5` detects the blank URL and calls
+  `find_career_url` to discover an ATS/Workday URL, writing it back. Tavily
+  must be available; rows that resist discovery are reported and left blank
+  for retry. `AI Domain` may use any of the 6 whitelisted buckets (Big Tech
+  AI Investment / Consumer ML Tech / AI Startups / AI Infrastructure & Compute
+  / Large Model Labs / Defense/Robotics AI), or a custom string (job_agent
+  treats unknown buckets as `ai_native`).
+- **JD_Tracker** — insert a row with just `JD URL` + `Company`. The job_agent
+  picks it up via `get_incomplete_jd_rows` and runs full extraction.
+
 ## Key Libraries Available (installed in venv)
 
 | Library | Purpose |

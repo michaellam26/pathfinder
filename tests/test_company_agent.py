@@ -930,6 +930,101 @@ class TestBug54KeyPoolNoneGuard(unittest.TestCase):
             company_agent_mod._KEY_POOL = original
 
 
+# ── Manual-row override: run_phase_1_5 backfills blank Career URLs ──────────
+class TestPhase15ManualBackfill(unittest.TestCase):
+    """Manually-inserted rows (Name + Domain only, blank Career URL) must be
+    picked up by run_phase_1_5 and have their Career URL backfilled via
+    find_career_url. Other rows (with existing URLs) continue down the
+    ATS-upgrade path unchanged.
+    """
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        # Two rows: one with blank URL (manual), one with an existing ATS URL.
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.append(["ManualCo", "Defense/Robotics AI", None, None, None, None, None, None, None])
+        ws.append(["AtsCo", "AI Startups", None,
+                   "https://job-boards.greenhouse.io/atsco", None, None, None, None, None])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    @patch("agents.company_agent.find_career_url")
+    def test_blank_url_row_is_backfilled(self, mock_find):
+        mock_find.return_value = "https://jobs.lever.co/manualco"
+        tavily_client = MagicMock()  # truthy, so backfill branch runs
+
+        company_agent_mod.run_phase_1_5(self.path, tavily_client=tavily_client)
+
+        import openpyxl
+        mock_find.assert_called_once_with("ManualCo", tavily_client)
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_List"]
+        rows = [(r[0], r[3]) for r in ws.iter_rows(min_row=2, values_only=True) if r[0]]
+        wb.close()
+        url_by_name = dict(rows)
+        self.assertEqual(url_by_name["ManualCo"], "https://jobs.lever.co/manualco")
+        # The ATS row should remain unchanged (already ATS, short-circuited).
+        self.assertEqual(url_by_name["AtsCo"], "https://job-boards.greenhouse.io/atsco")
+
+    @patch("agents.company_agent.find_career_url")
+    def test_blank_url_skipped_when_tavily_disabled(self, mock_find):
+        # No Tavily client → backfill cannot proceed; row stays blank.
+        with patch.dict(os.environ, {"TAVILY_API_KEY": ""}, clear=False):
+            company_agent_mod.run_phase_1_5(self.path, tavily_client=None)
+
+        import openpyxl
+        mock_find.assert_not_called()
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_List"]
+        rows = [(r[0], r[3]) for r in ws.iter_rows(min_row=2, values_only=True) if r[0]]
+        wb.close()
+        url_by_name = dict(rows)
+        self.assertIn(url_by_name["ManualCo"], (None, ""))
+
+    @patch("agents.company_agent.find_career_url")
+    def test_backfill_failure_leaves_row_blank(self, mock_find):
+        mock_find.return_value = None  # discovery fails
+        tavily_client = MagicMock()
+
+        company_agent_mod.run_phase_1_5(self.path, tavily_client=tavily_client)
+
+        import openpyxl
+        mock_find.assert_called_once()
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_List"]
+        rows = [(r[0], r[3]) for r in ws.iter_rows(min_row=2, values_only=True) if r[0]]
+        wb.close()
+        url_by_name = dict(rows)
+        self.assertIn(url_by_name["ManualCo"], (None, ""))
+
+
+class TestAIDomainWhitelist(unittest.TestCase):
+    """Defense/Robotics AI must be a recognized ai_domain for Gemini discovery."""
+
+    def test_defense_robotics_in_whitelist(self):
+        self.assertIn("Defense/Robotics AI", company_agent_mod.AI_DOMAIN_VALUES)
+
+    def test_aicompanyinfo_accepts_defense_robotics(self):
+        # Pydantic Literal must accept the new value without raising.
+        info = AICompanyInfo(
+            company_name="Anduril",
+            ai_domain="Defense/Robotics AI",
+            business_focus="Defense AI products for the US military and allies.",
+        )
+        self.assertEqual(info.ai_domain, "Defense/Robotics AI")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     unittest.main(verbosity=2)

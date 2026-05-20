@@ -68,6 +68,7 @@ AI_DOMAIN_VALUES = (
     "AI Startups",
     "AI Infrastructure & Compute",
     "Large Model Labs",
+    "Defense/Robotics AI",
 )
 
 
@@ -80,10 +81,11 @@ class AICompanyInfo(BaseModel):
         "AI Startups",
         "AI Infrastructure & Compute",
         "Large Model Labs",
+        "Defense/Robotics AI",
     ] = Field(
         description=(
             "The category that best describes this company's role in the AI ecosystem. "
-            "Must be exactly one of the 5 listed values."
+            "Must be exactly one of the 6 listed values."
         )
     )
     business_focus: str = Field(
@@ -596,7 +598,7 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
             "companies that have substantial AI/ML engineering organizations and post "
             "AI-relevant TPM roles.\n"
             "Follow this category distribution strictly (use the EXACT label string for ai_domain):\n"
-            f"  - \"Big Tech (AI Investment)\": {round(need*0.25)} companies — large established "
+            f"  - \"Big Tech (AI Investment)\": {round(need*0.23)} companies — large established "
             "tech companies whose AI work is core strategy (NVIDIA, AMD, Intel, Qualcomm, Meta, "
             "Microsoft, Google, Amazon, Apple, IBM, Oracle, Salesforce, Adobe, Databricks, "
             "Snowflake, Palantir, Stripe, Cisco, ServiceNow, Workday, SAP, etc.)\n"
@@ -604,7 +606,7 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
             "with substantial ML organizations and AI-TPM hiring (Netflix, Spotify, Pinterest, "
             "Disney, Roblox, eBay, Snap, DoorDash, Uber, Lyft, Airbnb, LinkedIn, Twitter/X, "
             "Reddit, Yelp, Etsy, Wayfair, Instacart, etc.)\n"
-            f"  - \"AI Startups\": {round(need*0.25)} companies — well-funded AI-native startups "
+            f"  - \"AI Startups\": {round(need*0.22)} companies — well-funded AI-native startups "
             "with real headcount and public job boards (Scale AI, Cohere, Glean, Harvey, Writer, "
             "Sierra, Perplexity, Runway, etc.) — NO tiny pre-seed companies\n"
             f"  - \"AI Infrastructure & Compute\": {round(need*0.20)} companies — GPU cloud, AI "
@@ -612,8 +614,11 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
             "Cerebras, SambaNova, Crusoe, Fireworks, Modal, etc.)\n"
             f"  - \"Large Model Labs\": {round(need*0.10)} companies — frontier AI research labs "
             "(OpenAI, Anthropic, xAI, DeepMind, Mistral, Cohere, etc.)\n"
+            f"  - \"Defense/Robotics AI\": {round(need*0.05)} companies — defense, aerospace, "
+            "humanoid robotics, and AI-physical-systems companies (Anduril, Shield AI, Saronic, "
+            "Figure AI, Apptronik, SpaceX, Neuralink, Blue Origin, etc.)\n"
             "STRICTLY exclude non-US companies (Canadian, European, Asian).\n"
-            "The ai_domain field MUST be one of these 5 exact strings — do not invent variants "
+            "The ai_domain field MUST be one of these 6 exact strings — do not invent variants "
             "like \"Top AI Startups\" or \"AI\" or \"NLP\".\n"
             "For business_focus: write 3-4 sentences covering what the company builds, "
             "who their customers are, their key competitive differentiator, and notable "
@@ -762,14 +767,33 @@ def run_phase_1_5(xlsx_path: str, tavily_client=None):
         print("⚠️  No companies found. Skipping.")
         return
 
-    upgraded = no_ats = 0
+    upgraded = no_ats = backfilled = backfill_failed = 0
     ATS_DOMAINS = ["greenhouse.io", "lever.co", "ashbyhq.com", "myworkdayjobs.com",
                    "workable.com"]
 
     for excel_row, row in rows:
         name = str(row[0]).strip() if row[0] else ""
         url  = str(row[3]).strip() if row[3] else ""
-        if not name or not url or url == "N/A":
+        if not name:
+            continue
+
+        # Manual-row override: row exists with a name but no Career URL
+        # (typically inserted by hand). Discover one via find_career_url.
+        if not url or url == "N/A":
+            if tavily_client is None:
+                print(f"  ⚠️  {name}: Career URL blank — Tavily disabled, skipping backfill.")
+                backfill_failed += 1
+                continue
+            print(f"  🆕 {name}: Career URL blank — backfilling...")
+            new_url = find_career_url(name, tavily_client)
+            if new_url:
+                update_company_career_url(xlsx_path, excel_row, new_url)
+                print(f"  ✅ {name}: backfilled → {new_url}")
+                backfilled += 1
+            else:
+                print(f"  ❌ {name}: backfill failed (no valid URL found).")
+                backfill_failed += 1
+            time.sleep(1)
             continue
 
         if any(d in url for d in ATS_DOMAINS):
@@ -787,7 +811,8 @@ def run_phase_1_5(xlsx_path: str, tavily_client=None):
             no_ats += 1
         time.sleep(1)
 
-    print(f"\n  Upgraded={upgraded}  No ATS={no_ats}")
+    print(f"\n  Upgraded={upgraded}  No ATS={no_ats}  "
+          f"Backfilled={backfilled}  Backfill failed={backfill_failed}")
     print("="*60 + "\n")
 
 
