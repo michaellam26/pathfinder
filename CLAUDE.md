@@ -15,6 +15,8 @@ API keys go in `.env` (already present but empty). Required keys:
 - `TAVILY_API_KEY` — Tavily search API
 - `FIRECRAWL_API_KEY` — Firecrawl web scraping
 
+Optional: `GEMINI_API_KEY_2` — second Gemini key for key-pool rotation (all 4 agents consume it when set).
+
 Load env vars in scripts with `python-dotenv` (`from dotenv import load_dotenv; load_dotenv()`).
 
 ## Project Structure
@@ -40,7 +42,7 @@ tests/               # Unit tests (859+ cases)
 docs/
   sdlc/              # SDLC project documents (index + per-project dirs)
 .claude/
-  agents/            # 11 Custom Agents (dev-time analysis, read-only)
+  agents/            # 11 Custom Agents (Planning / Quality / Evaluation groups; no Edit/Write tools)
   skills/            # 8 Skills (SDLC coordination + operational execution)
 profile/             # Candidate resume (.md/.txt/.pdf — picker priority in that order)
 profile/.cache/      # Auto-generated MD from PDF input (deterministic, hash-keyed)
@@ -105,23 +107,23 @@ python agents/<agent_name>.py
 
 ## Custom Agents (`.claude/agents/`)
 
-Development-time analysis agents invoked via the Agent tool:
+Development-time agents invoked via the Agent tool, organized into three groups under the user (Architect / Product Owner), alongside the Implementation group (the Claude Code main thread itself):
 
-| Agent | Model | Layer | Purpose |
+| Agent | Model | Group | Purpose |
 |---|---|---|---|
 | `product-manager` | sonnet | 📋 Planning | Research, feasibility analysis, BRD writing, testing sign-off, decision support |
-| `tpm` | opus | 🔄 Coordination | Task decomposition, coordination, risk management, progress reporting, launch readiness |
+| `tpm` | opus | 📋 Planning | Task decomposition, coordination, risk management, progress reporting, launch readiness |
 | `agent-reviewer` | opus | 🔍 Quality | Review agent code quality, prompt design, cross-agent consistency |
 | `api-debugger` | sonnet | 🔍 Quality | Debug Gemini/Tavily/Firecrawl/ATS API issues |
 | `schema-validator` | sonnet | 🔍 Quality | Validate Excel sheet schemas and inter-agent data contracts |
 | `test-analyzer` | sonnet | 🔍 Quality | Analyze test failures, identify coverage gaps |
 | `doc-sync` | sonnet | 🔍 Quality | Detect documentation drift (REQUIREMENTS/ARCHITECTURE/BUGS/CHANGELOG) |
 | `bug-tracker` | sonnet | 🔍 Quality | Manage BUGS.md: verify status, scan new bugs, suggest regression tests |
-| `eval-engineer` | sonnet | 🔍 Quality | AI output quality evaluation: scoring calibration, prompt regression, hallucination detection |
-| `observability` | sonnet | 🔍 Quality | Pipeline run reporting, output quality drift detection, anomaly alerting |
-| `cost` | sonnet | 🔍 Quality | API token usage estimation, quota monitoring, cost optimization recommendations |
+| `eval-engineer` | sonnet | 📊 Evaluation | AI output quality evaluation: scoring calibration, prompt regression, hallucination detection |
+| `observability` | sonnet | 📊 Evaluation | Pipeline run reporting, output quality drift detection, anomaly alerting |
+| `cost` | sonnet | 📊 Evaluation | API token usage estimation, quota monitoring, cost optimization recommendations |
 
-All agents are read-only (analysis/reporting only, no code modifications).
+All 11 agents carry no Edit/Write tools (analysis-only by design; `allowed-tools: Read, Grep, Glob, Bash`). Each group authors its own deliverables (Planning: requirements & milestones; Quality: test plans & review reports; Evaluation: eval & cost reports), drafted by the agents and persisted via the Claude Code main thread — which alone holds code write access.
 
 ## SDLC Workflow (`docs/sdlc/`)
 

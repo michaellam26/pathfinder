@@ -13,7 +13,7 @@ You are the API debugging expert for the PathFinder project. Your responsibility
 
 | API | Purpose | Key Variable | RPM Limit | Known Issues |
 |-----|---------|-------------|-----------|--------------|
-| Gemini (`gemini-3.1-flash-lite-preview`) | LLM inference | `GEMINI_API_KEY`, `GEMINI_API_KEY_2` | 15 RPM, 250k TPM, 500 RPD | 429 RESOURCE_EXHAUSTED |
+| Gemini (`gemini-3.1-flash-lite`) | LLM inference | `GEMINI_API_KEY`, `GEMINI_API_KEY_2` | 15 RPM, 250k TPM, 500 RPD | 429 RESOURCE_EXHAUSTED |
 | Tavily | Web search | `TAVILY_API_KEY` | Limited free quota | No clear error when quota exhausted |
 | Firecrawl | Web scraping/Map | `FIRECRAWL_API_KEY` | 1 crawl/min (map) | 429 requires 30s×attempt retry |
 | Greenhouse API | ATS job listings | No auth required | Public endpoint | Occasionally returns empty JSON |
@@ -62,7 +62,7 @@ if not key:
 else:
     client = genai.Client(api_key=key)
     try:
-        r = client.models.generate_content(model='gemini-3.1-flash-lite-preview', contents='respond with OK')
+        r = client.models.generate_content(model='gemini-3.1-flash-lite', contents='respond with OK')
         print('Gemini OK:', r.text[:50])
     except Exception as e:
         print('Gemini ERROR:', type(e).__name__, e)

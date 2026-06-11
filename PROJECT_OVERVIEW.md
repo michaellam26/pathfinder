@@ -6,7 +6,7 @@
 
 ## TL;DR
 
-**PathFinder is an end-to-end, multi-agent AI system I designed and shipped to automate the AI-TPM job search** — it discovers AI companies, extracts TPM job postings, scores resume-to-JD fit, and produces per-role tailored resumes. The match + tailor stages run a **3-dimension scoring funnel** (ATS keyword coverage / Recruiter scan / HM deep eval) that mirrors the real North American hiring filter cascade — so the user sees exactly which filter their tailoring moved, instead of a single conflated score. It also demonstrates AI-augmented delivery: I designed an **11-agent Claude subagent review team** and used **Claude Code (Opus)** as my implementation partner across a full Software Development Life Cycle (BRD → Tech Design → Implementation → Testing → Launch).
+**PathFinder is an end-to-end, multi-agent AI system I designed and shipped to automate the AI-TPM job search** — it discovers AI companies, extracts TPM job postings, scores resume-to-JD fit, and produces per-role tailored resumes. The match + tailor stages run a **3-dimension scoring funnel** (ATS keyword coverage / Recruiter scan / HM deep eval) that mirrors the real North American hiring filter cascade — so the user sees exactly which filter their tailoring moved, instead of a single conflated score. It also demonstrates AI-augmented delivery: I directed a **four-group AI agent team** — Planning (PM + TPM), Implementation (**Claude Code Opus**, sole code write access), Quality (6 agents), and Evaluation (3 agents) — across a full Software Development Life Cycle (BRD → Tech Design → Implementation → Testing → Launch).
 
 **Live repo:** https://github.com/michaellam26/pathfinder
 **Stack:** Python 3.11 · Gemini · Claude Code · Tavily · Firecrawl · Crawl4AI · Pydantic · openpyxl · pytest
@@ -17,7 +17,7 @@
 
 I'm a Technical Program Manager at a North American big-tech company, targeting **TPM roles at AI-native companies** and **AI-TPM roles at big-tech**. PathFinder exists to demonstrate hands-on AI engineering depth — LLM orchestration, multi-agent coordination, evaluation rigor, and AI-assisted SDLC — that typically isn't visible from a TPM's day-job artifacts.
 
-Every architectural choice, scoring design, SDLC gate, and review standard in this repo is mine. Claude Code (Opus) served as my implementation partner; an 11-agent Claude review team I designed ran parallel code / prompt / schema / eval / cost review. The runtime pipeline is one AI system; the way it was delivered is another. Both are showcased here.
+Every architectural choice, scoring design, SDLC gate, and review standard in this repo is mine. I directed four AI agent groups: Planning (PM + TPM) authored requirements and milestones, Claude Code (Opus) implemented with sole code write access, and the Quality and Evaluation groups ran parallel test planning, specialist review, and eval/cost reporting. The runtime pipeline is one AI system; the way it was delivered is another. Both are showcased here.
 
 ---
 
@@ -36,37 +36,35 @@ All agents share a Pydantic-typed contract and persist to a single Excel workboo
 
 ## How It Was Built — AI-Augmented Delivery
 
-I structured delivery as AI-augmented program management: I made all architecture, scope, and review decisions; Claude Code implemented under my direction; and an 11-agent Claude review team I designed handled parallel QA across specialized domains.
+I structured delivery as AI-augmented program management: I made all architecture, scope, and review decisions, directing four AI agent groups — Planning, Implementation, Quality, and Evaluation.
 
 ### The Team
 
 ```
             ┌──────────────────────────────────────────┐
-            │   Me — Architect, PM, Reviewer           │
+            │   Me — Architect / Product Owner         │
             │   (all design, scope & review decisions) │
             └────────────────────┬─────────────────────┘
-                                 │ direction + specs
-            ┌────────────────────▼─────────────────────┐
-            │   Claude Code (Opus)                     │
-            │   Implementation Partner                 │
-            │   (sole write access; executes my spec)  │
-            └────────────────────┬─────────────────────┘
-                                 │ dispatches for parallel review
-       ┌─────────────────────────┼─────────────────────────┐
-       │                         │                         │
-   Planning                  Quality                   Evaluation
-   ─────────               ─────────                 ───────────
-   Product Manager         Agent Reviewer            Eval Engineer
-   TPM                     API Debugger              Observability
-                           Schema Validator          Cost
-                           Test Analyzer
-                           Doc Sync
-                           Bug Tracker
+                                 │  direction + specs
+       ┌───────────────┬─────────┴────────┬───────────────────┐
+       ▼               ▼                  ▼                   ▼
+   Planning       Implementation       Quality            Evaluation
+   ─────────      ──────────────       ─────────          ──────────
+   Product        Claude Code          Agent Reviewer     Eval Engineer
+   Manager        (Opus)               API Debugger       Observability
+   TPM                                 Schema Validator   Cost
+                  sole code            Test Analyzer
+   authors reqs   write access         Doc Sync           authors eval
+   & milestones                        Bug Tracker        & cost reports
+
+                                       authors test
+                                       plans & reviews
 ```
 
-- **1 director, 1 writer, 11 reviewers.** I held design and review authority. Claude Code held sole write access. The 11 specialist subagents were strictly read-only — they analyzed, evaluated, and reported; change recommendations flowed through me for prioritization, then to Claude Code for execution.
+- **1 owner, 4 groups, 12 agents.** I hold all design and review authority. Each group authors its own deliverables — requirements and milestones (Planning), test plans and specialist reviews (Quality), eval and cost reports (Evaluation) — while **Claude Code holds sole code write access** and serves as the runtime harness that dispatches the 11 specialist subagents (no Edit/Write tools — analysis-only by design) on my priorities.
+- **Delivery path:** I define architecture and scope → PM authors the BRD → TPM decomposes milestones → Claude Code implements → Quality group tests → Evaluation group reports → launch review.
 - **8 reproducible skills** I designed (`/pipeline`, `/run-agent`, `/test-all`, `/sdlc-init`, `/sdlc-review`, etc.) encode the operational workflow so every run is deterministic and every review stage is repeatable.
-- **Full SDLC artifacts** under [`docs/sdlc/`](docs/sdlc/): BRD, Tech Design, Test Plan, Test Execution Report, Launch Review — authored by agents against my specs and acceptance criteria.
+- **Full SDLC artifacts** under [`docs/sdlc/`](docs/sdlc/): BRD, Tech Design, Test Plan, Test Execution Report, Launch Review — authored by the owning group against my specs and acceptance criteria.
 
 ---
 
@@ -93,7 +91,7 @@ For an **AI-TPM hiring manager**, PathFinder is evidence of:
 | **Multi-agent system design** | `agents/` — 4 runtime agents (Discover → Extract → Match → Tailor) with clean role separation and Pydantic-typed contracts at every hand-off; a single Excel workbook serves as the durable, human-inspectable shared state store |
 | **LLM orchestration** | `match_agent.py` 3-dimension funnel — deterministic ATS coverage + Gemini recruiter coarse pass (batched 10 JDs per call) + Gemini HM fine eval (4-dim weighted, gated on UNION of score≥threshold and top-N%); `resume_optimizer.py` re-scores all 3 dimensions independently after tailoring so each lever is observable; `job_agent.py` extracts 8-15 ATS-relevant keywords per JD as a one-shot LLM call cached on JD_Tracker |
 | **Cost awareness at scale** | Deterministic ATS dim runs at zero LLM cost; recruiter scoring batched 10 JDs per call; ATS keywords extracted once at JD ingest and cached so match re-runs are free; `shared/gemini_pool.py` Gemini key pooling + `shared/rate_limiter.py` token-bucket rate limiter + bounded exponential-backoff retry on 5xx / UNAVAILABLE / timeout sustain throughput inside free-tier quotas; `.claude/agents/cost.md` |
-| **AI-augmented program management (Claude Code harness)** | `.claude/agents/` — 11 read-only review subagents I designed (agent-reviewer, eval-engineer, schema-validator, cost, observability, doc-sync, …); `.claude/skills/` — 8 reproducible skills I authored (`/pipeline`, `/run-agent`, `/test-all`, `/sdlc-init`, `/sdlc-review`, …) that encode the operational workflow; parallel multi-reviewer dispatch model caught 1 production ship-blocker + 5 quality risks before launch |
+| **AI-augmented program management (Claude Code harness)** | `.claude/agents/` — a four-group agent team I designed: 11 specialist subagents (Planning / Quality / Evaluation) + Claude Code (Implementation; sole code write access); `.claude/skills/` — 8 reproducible skills I authored (`/pipeline`, `/run-agent`, `/test-all`, `/sdlc-init`, `/sdlc-review`, …) that encode the operational workflow; parallel multi-reviewer dispatch model flagged 1 production ship-blocker (fixed pre-launch) + 4 quick wins (applied) + 5 deferred quality risks before launch |
 | **Structured output discipline** | Pydantic response schemas on every Gemini call (`shared/schemas.py`); strict validation surfaces malformed JSON at the LLM boundary instead of three stages downstream; `JobDetails.ats_keywords` uses `default_factory=list` for clean back-compat round-trip on JDs ingested before the field existed |
 | **TPM-grade process discipline** | Full BRD → Tech Design → Implementation → Testing → Launch artifacts under `docs/sdlc/`; risk registers, decision logs, multi-phase reviews, regression test gating, launch readiness checklists — applied to a personal project; `REQUIREMENTS.md` / `ARCHITECTURE.md` / `BUGS.md` / `CHANGELOG.md` maintained continuously |
 | **Schema-first inter-agent contracts (Pydantic)** | Every cross-agent data hand-off is a typed Pydantic model — no dict-passing between stages; idempotent auto-migration on every Excel column addition so existing user dashboards survive each release; 859+ unit tests cover scoring logic, schema migrations, scrape fallbacks, geo-filter edge cases, and the 3-dimension scoring funnel |
@@ -103,7 +101,7 @@ For an **AI-TPM hiring manager**, PathFinder is evidence of:
 
 ## Resume One-liner
 
-> *AI-TPM portfolio project — designed and shipped an end-to-end multi-agent LLM pipeline (Gemini + Pydantic-typed inter-agent contracts) that automates AI-company discovery, JD extraction, resume-to-JD matching, and per-role tailoring. Engineered a cost-aware 3-dimension scoring funnel — deterministic ATS keyword coverage (zero LLM cost) + Gemini recruiter coarse pass (batched 10 JDs/call) + Gemini hiring-manager fine eval — modeled on the real ATS → recruiter → HM hiring cascade. Drove full SDLC (BRD → Tech Design → Implementation → Testing → Launch) using Claude Code as implementation harness, with 11 read-only review subagents I designed running parallel QA across code, prompts, schemas, evaluation, and cost; 859+ unit tests, idempotent Excel schema migrations, Gemini key pooling + token-bucket rate limiting + transient-error backoff retry.*
+> *AI-TPM portfolio project — designed and shipped an end-to-end multi-agent LLM pipeline (Gemini + Pydantic-typed inter-agent contracts) that automates AI-company discovery, JD extraction, resume-to-JD matching, and per-role tailoring. Engineered a cost-aware 3-dimension scoring funnel — deterministic ATS keyword coverage (zero LLM cost) + Gemini recruiter coarse pass (batched 10 JDs/call) + Gemini hiring-manager fine eval — modeled on the real ATS → recruiter → HM hiring cascade. Drove full SDLC (BRD → Tech Design → Implementation → Testing → Launch) by directing a four-group AI agent team I designed — Planning (PM/TPM) authored requirements and milestones, Claude Code (Opus) implemented with sole code write access, Quality and Evaluation groups ran parallel test planning, QA review, and eval/cost reporting; 859+ unit tests, idempotent Excel schema migrations, Gemini key pooling + token-bucket rate limiting + transient-error backoff retry.*
 
 ---
 

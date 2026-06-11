@@ -2,6 +2,7 @@
 name: agent-reviewer
 description: Review agent code quality, prompt design, and cross-agent consistency
 allowed-tools: Read, Glob, Grep, Bash
+model: opus
 ---
 
 # Agent Code Reviewer

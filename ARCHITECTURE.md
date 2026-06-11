@@ -22,11 +22,11 @@ PathFinder is a multi-agent AI system for TPM job seekers, consisting of four in
 │  │                │ │                │ │             │ │                  ││
 │  │· Company       │ │· Path A (ATS)  │ │· Resume     │ │· Resume tailoring││
 │  │  discovery     │ │· Path B        │ │  loading    │ │  and rewriting   ││
-│  │· Career URL    │ │  (crawler)     │ │· Coarse     │ │· Re-scoring      ││
-│  │  finding       │ │· JD extraction │ │  screening  │ │  verification    ││
-│  │· ATS URL       │ │  + caching     │ │  (batch)    │ │· Score comparison││
-│  │  upgrade       │ │                │ │· Fine eval  │ │                  ││
-│  │                │ │                │ │  (Top 20)   │ │                  ││
+│  │· Career URL    │ │  (crawler)     │ │· ATS cover. │ │· Re-scoring      ││
+│  │  finding       │ │· JD extraction │ │· Recruiter  │ │  verification    ││
+│  │· ATS URL       │ │  + caching     │ │  scan(batch)│ │· Score comparison││
+│  │  upgrade       │ │                │ │· HM eval    │ │                  ││
+│  │                │ │                │ │  (UNION 60%)│ │                  ││
 │  └───────┬────────┘ └───────┬────────┘ └──────┬──────┘ └────────┬─────────┘│
 │          │                  │                  │                 │          │
 │          └─────────┬────────┘                  └────────┬───────┘          │
@@ -213,7 +213,7 @@ Phase 3 — Assemble + write:
 |-----------|-------------|--------|
 | `Company_List` | Company Name | Company Name, AI Domain, Business Focus, Career URL, Updated At, TPM Jobs, AI TPM Jobs, No TPM Count, Auto Archived |
 | `Company_Without_TPM` | Company Name | Company Name, AI Domain, Business Focus, Career URL, Updated At, TPM Jobs, AI TPM Jobs |
-| `JD_Tracker` | JD URL | JD URL, Job Title, Company, Location, Salary, Requirements, Additional Qualifications, Responsibilities, Is AI TPM, Updated At, MD Hash, Data Quality, **Location Tier** (Greater Seattle / Remote / Other — used for post-run auto-sort) |
+| `JD_Tracker` | JD URL | JD URL, Job Title, Company, Location, Salary, Requirements, Additional Qualifications, Responsibilities, Is AI TPM, Updated At, MD Hash, Data Quality, **ATS Keywords** (8-15 per JD, extracted once at ingest — PRJ-002), **Location Tier** (Greater Seattle / Remote / Other — used for post-run auto-sort) |
 | `Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Score, Strengths, Gaps, Reason, Updated At, Resume Hash, Stage, **ATS Coverage %, Recruiter Score, HM Score, ATS Missing** (PRJ-002) |
 | `Tailored_Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Job Title, Company, Original Score, Tailored Score, Score Delta, Tailored Resume Path, Optimization Summary, Updated At, Resume Hash, Regression, **Original ATS, Tailored ATS, ATS Delta, Original Recruiter, Tailored Recruiter, Recruiter Delta, Original HM, Tailored HM, HM Delta** (PRJ-002), **Last Written Hash** (sha256 of last-written .md — used by optimizer to detect user hand-edits) |
 
@@ -244,33 +244,33 @@ Phase 3 — Assemble + write:
 
 ## 6. Development Tool Layer & SDLC Workflow
 
-PathFinder's development is supported by four tool layers, coordinated through the SDLC workflow, forming a complete AI-assisted development cycle:
+PathFinder's development is organized as four agent groups under the user (Architect / Product Owner), coordinated through the SDLC workflow, forming a complete AI-assisted development cycle. Each group authors its own deliverables (requirements & milestones / code / test plans & reviews / eval reports); the Claude Code main thread alone holds code write access and serves as the runtime harness dispatching the other groups:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                   User (Business Owner)                       │
+│              User (Architect / Product Owner)                 │
 └──────────────────────┬───────────────────────────────────────┘
-                       │ High-level goals, business decisions, final sign-off
+                       │ Architecture, scope & review decisions
                        ▼
 ┌──────────────────────────────────────────────────────────────┐
-│              Claude Code Main Thread (Engineer Lead)          │
-├──────────┬──────────────┬────────────────────┬───────────────┤
-│          │              │                    │               │
-│ Planning │ Coordination │   Quality          │  Operations   │
-│ Layer    │ Layer        │   Layer            │  Layer        │
-│          │              │                    │               │
-│ product- │ tpm   (opus) │ agent-reviewer     │ /pipeline     │
-│ manager  │              │ schema-validator   │ /run-agent    │
-│ (sonnet) │ /sdlc-init   │ test-analyzer      │ /test-all     │
-│          │ /sdlc-status │ api-debugger       │ /test-one     │
-│          │ /sdlc-review │ doc-sync           │ /check-env    │
-│          │              │ bug-tracker        │               │
-│          │              │ eval-engineer      │               │
-│          │              │ observability      │               │
-│          │              │ cost               │               │
-│          │              │                    │               │
-│ Agent    │ Agent+Skill  │ Agent              │ Skill         │
-└──────────┴──────────────┴────────────────────┴───────────────┘
+│  Claude Code Main Thread (Engineer Lead / Implementation —    │
+│  sole code write access; dispatches the groups below)         │
+├──────────────┬────────────────────┬─────────────┬────────────┤
+│              │                    │             │            │
+│ Planning     │   Quality          │ Evaluation  │ Operations │
+│ Group        │   Group            │ Group       │ (Skills)   │
+│              │                    │             │            │
+│ product-     │ agent-reviewer     │ eval-       │ /pipeline  │
+│ manager      │ schema-validator   │ engineer    │ /run-agent │
+│ (sonnet)     │ test-analyzer      │ observ-     │ /test-all  │
+│ tpm (opus)   │ api-debugger       │ ability     │ /test-one  │
+│              │ doc-sync           │ cost        │ /check-env │
+│ /sdlc-init   │ bug-tracker        │             │            │
+│ /sdlc-status │                    │             │            │
+│ /sdlc-review │                    │             │            │
+│              │                    │             │            │
+│ Agent+Skill  │ Agent              │ Agent       │ Skill      │
+└──────────────┴────────────────────┴─────────────┴────────────┘
 ```
 
 ### SDLC Workflow (`docs/sdlc/`)
@@ -285,7 +285,7 @@ Phase 4: Testing   → TPM notifies QA + PM to test → bug report → Engineer 
 Phase 5: Launch    → TPM writes launch assessment → User + Engineer Lead + PM review → complete
 ```
 
-Each project's documents are located in `docs/sdlc/PRJ-xxx-<name>/`, containing `status.md` (single source of truth), `brd.md`, `tech-design.md`, `launch-readiness.md`, and a `reviews/` directory.
+Each project's documents are located in `docs/sdlc/PRJ-xxx-<name>/`, anchored by `status.md` (single source of truth); stage artifacts (`brd.md`, `tech-design.md`, test plans, launch assessment, `reviews/`) are added as each phase completes, so the artifact set varies by project.
 
 Escalation mechanism:
 - L1 Info → Engineer Lead
@@ -293,29 +293,31 @@ Escalation mechanism:
 - L3 Business (`[ESCALATE]`) → User
 - L4 Blocker (`[BLOCKED]`) → User + Engineer Lead
 
-### Custom Agents (`.claude/agents/`) — Analysis and diagnostics, read-only
+### Custom Agents (`.claude/agents/`) — Planning / Quality / Evaluation groups, no Edit/Write tools
 
-| Agent | Model | Layer | Responsibilities |
+Each group authors its own deliverables; drafts are persisted via the Claude Code main thread, which alone holds code write access.
+
+| Agent | Model | Group | Responsibilities |
 |-------|-------|-------|------------------|
 | `product-manager` | sonnet | Planning | Requirements analysis, BRD writing, progress tracking, impact assessment, testing sign-off |
-| `tpm` | opus | Coordination | Task decomposition, cross-team coordination, risk management, progress reporting, launch assessment |
+| `tpm` | opus | Planning | Task decomposition, cross-team coordination, risk management, progress reporting, launch assessment |
 | `agent-reviewer` | opus | Quality | Review code quality, prompt design, cross-agent consistency |
 | `schema-validator` | sonnet | Quality | Validate Excel schema and inter-agent data contracts |
 | `test-analyzer` | sonnet | Quality | Analyze test failure causes, identify coverage blind spots |
 | `api-debugger` | sonnet | Quality | Debug Gemini/Tavily/Firecrawl/ATS API issues |
 | `doc-sync` | sonnet | Quality | Detect drift between code and docs (REQ/ARCH/BUGS/CHANGELOG) |
 | `bug-tracker` | sonnet | Quality | Manage BUGS.md: verify status, scan for new bugs, suggest regression tests |
-| `eval-engineer` | sonnet | Quality | AI output quality evaluation: scoring calibration, prompt regression detection, hallucination detection |
-| `observability` | sonnet | Quality | Pipeline run reporting, output quality drift detection, anomaly alerting |
-| `cost` | sonnet | Quality | API token usage estimation, quota monitoring, cost optimization recommendations |
+| `eval-engineer` | sonnet | Evaluation | AI output quality evaluation: scoring calibration, prompt regression detection, hallucination detection |
+| `observability` | sonnet | Evaluation | Pipeline run reporting, output quality drift detection, anomaly alerting |
+| `cost` | sonnet | Evaluation | API token usage estimation, quota monitoring, cost optimization recommendations |
 
 ### Skills (`.claude/skills/`) — Operational execution
 
-| Skill | Layer | Purpose |
+| Skill | Group | Purpose |
 |-------|-------|---------|
-| `/sdlc-init` | Coordination | Initialize SDLC project (assign ID, create directory and template files) |
-| `/sdlc-status` | Coordination | View project status (single project details or global overview) |
-| `/sdlc-review` | Coordination | Trigger stage-specific reviews (BRD/Design/Testing/Launch) |
+| `/sdlc-init` | Planning | Initialize SDLC project (assign ID, create directory and template files) |
+| `/sdlc-status` | Planning | View project status (single project details or global overview) |
+| `/sdlc-review` | Planning | Trigger stage-specific reviews (BRD/Design/Testing/Launch) |
 | `/pipeline` | Operations | Run complete pipeline of all 4 Agents in sequence |
 | `/run-agent` | Operations | Run a single specified Agent |
 | `/test-all` | Operations | Run full test suite |
@@ -331,7 +333,7 @@ pathfinder/
 ├── agents/                    # 4 Runtime Agents (the product)
 │   ├── company_agent.py       # Company discovery + ATS URL upgrade
 │   ├── job_agent.py           # Job discovery + JD extraction
-│   ├── match_agent.py         # Resume matching (two-stage)
+│   ├── match_agent.py         # Resume matching (3-dim: ATS / Recruiter / HM)
 │   └── resume_optimizer.py    # Resume tailoring optimization + re-scoring
 ├── shared/                    # Cross-agent shared modules
 │   ├── __init__.py
@@ -349,8 +351,10 @@ pathfinder/
 ├── templates/                 # PDF rendering assets (PRJ-003)
 │   └── resume.css             # ATS-safe CSS for tailored-resume PDF output
 ├── scripts/                   # Operational scripts
-│   ├── run_daily_pipeline.sh  # Daily full-pipeline runner (launchd)
-│   └── com.pathfinder.daily.plist  # Sample launchd job definition
+│   ├── run_pipeline_scheduled.sh   # Daily full-pipeline runner (launchd)
+│   ├── com.pathfinder.daily.plist  # Sample launchd job definition
+│   ├── setup_schedule.md      # launchd scheduling setup guide
+│   └── audit_subset_run.py    # One-off 3-company subset run for self-audit validation
 ├── tests/                     # Unit tests (859+ cases)
 ├── docs/
 │   └── sdlc/                  # SDLC project documents
@@ -359,12 +363,12 @@ pathfinder/
 │           ├── status.md      # Project status (single source of truth)
 │           ├── brd.md         # Business Requirements Document
 │           ├── tech-design.md # Technical Design Document
-│           ├── launch-readiness.md
+│           ├── ...            # Other stage artifacts (test plans, launch assessment — set varies by project)
 │           └── reviews/       # Review records
 ├── .claude/
-│   ├── agents/                # 11 Custom Agents (dev-time helpers, read-only)
+│   ├── agents/                # 11 Custom Agents (Planning / Quality / Evaluation groups, no Edit/Write tools)
 │   │   ├── product-manager.md # Planning: requirements analysis, BRD, testing sign-off
-│   │   ├── tpm.md             # Coordination: task decomposition, risk management, launch assessment
+│   │   ├── tpm.md             # Planning: task decomposition, risk management, launch assessment
 │   │   ├── agent-reviewer.md
 │   │   ├── schema-validator.md
 │   │   ├── test-analyzer.md
@@ -375,9 +379,9 @@ pathfinder/
 │   │   ├── observability.md    # Quality: run reporting, drift detection, anomaly alerting
 │   │   └── cost.md             # Quality: token estimation, quota monitoring, optimization recommendations
 │   └── skills/                # 8 Skills (coordination + operations)
-│       ├── sdlc-init/         # Coordination: SDLC project initialization
-│       ├── sdlc-status/       # Coordination: project status viewing
-│       ├── sdlc-review/       # Coordination: stage-specific reviews
+│       ├── sdlc-init/         # Planning: SDLC project initialization
+│       ├── sdlc-status/       # Planning: project status viewing
+│       ├── sdlc-review/       # Planning: stage-specific reviews
 │       ├── pipeline/
 │       ├── run-agent/
 │       ├── test-all/
@@ -390,6 +394,8 @@ pathfinder/
 ├── logs/                      # Pipeline logs (auto-created by launchd runner, gitignored)
 ├── pathfinder_dashboard.xlsx  # Main data file (auto-created)
 ├── .env                       # API Keys (not committed)
+├── README.md                  # Setup, usage, and team overview
+├── PROJECT_OVERVIEW.md        # Curated technical overview for recruiters/reviewers
 ├── CLAUDE.md                  # Development guide
 ├── REQUIREMENTS.md            # Requirements tracking (130+ REQ + DEC entries)
 ├── ARCHITECTURE.md            # System architecture (this document)

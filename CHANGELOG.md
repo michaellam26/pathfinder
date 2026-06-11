@@ -1,5 +1,44 @@
 # CHANGELOG
 
+## 2026-06-10
+
+### Docs: accuracy pass across README / PROJECT_OVERVIEW / ARCHITECTURE / REQUIREMENTS / CHANGELOG
+
+Five-doc review against the codebase fixed every factual error found:
+script name `run_daily_pipeline.sh` → `run_pipeline_scheduled.sh` (4 docs);
+Workday-via-Tavily fallback re-attributed from Job Agent to Company Agent
+(README); "~4K lines of Python" → "~6K" (README); `GEMINI_API_KEY_2` and the
+macOS `brew install pango` prerequisite added to setup docs; "read-only"
+subagent claims reworded to "no Edit/Write tools (analysis-only by design)"
+(4 docs — `Bash` is in `allowed-tools`, so read-only was not tool-enforced);
+`agent-reviewer.md` pinned `model: opus` to match its documented tier;
+`api-debugger.md` stale `-preview` model name updated; ARCHITECTURE
+JD_Tracker schema gained the missing `ATS Keywords` column, diagram
+"Fine eval (Top 20)" → 3-dim labels (UNION 60%), stale "two-stage" comment
+fixed, `scripts/` tree completed; REQUIREMENTS fixed REQ-006/007 (5 search
+categories at 25/20/25/20/10), REQ-056 (`BATCH_RESCORE_SIZE` never existed —
+rescore is `RESCORE_CONCURRENCY=3`), REQ-122 (MD5, not SHA), REQ-101 line
+count, and the "8 Custom Agents" → 11 count; CHANGELOG corrected four wrong
+P0-9~12 commit hashes and backfilled missing entries (P0-1~8, P1 batch 1,
+2026-04-21 public release prep). Docs + agent-definition frontmatter only;
+no runtime code changes.
+
+### Docs: reframe the AI SDLC team as a four-group org under the Architect / Product Owner
+
+The previous "11-agent Claude subagent review team" framing was inaccurate on
+three counts: it labeled PM/TPM as reviewers (they author requirements and
+milestones), routed the org chart through Claude Code as a middle layer
+(the four groups report to the user directly), and called all subagents
+"strictly read-only" while SDLC artifacts are authored by them. README,
+PROJECT_OVERVIEW, CLAUDE.md, and ARCHITECTURE now describe **four groups under
+the user (Architect / Product Owner)** — Planning (PM + TPM: requirements &
+milestones), Implementation (Claude Code Opus: sole code write access, runtime
+dispatch harness), Quality (6 agents: test plans & reviews), Evaluation
+(3 agents: eval & cost reports) — plus an explicit delivery path (architecture
+→ requirements → milestones → implementation → testing → eval → launch) and a
+write-permission model note (groups author deliverables; only Claude Code
+writes code). Docs-only change; no code or agent-definition changes.
+
 ## 2026-05-20
 
 ### Manual-entry override: backfill Career URL for hand-inserted Company_List rows
@@ -121,7 +160,7 @@ filters.
 
 ### launchd-based daily pipeline runner
 
-Added `scripts/run_daily_pipeline.sh` + sample `com.pathfinder.daily.plist`
+Added `scripts/run_pipeline_scheduled.sh` + sample `com.pathfinder.daily.plist`
 that schedules the full 4-agent pipeline (company → job → match →
 optimizer) via macOS `launchd`. Logs land in `logs/` (gitignored).
 `.gitignore` updated to also exclude `worktrees/` (Claude Code agent
@@ -162,10 +201,32 @@ The resume-fit scoring pipeline is restructured from a single LLM-derived "fit s
 
 ### P0 Code Review Follow-ups
 
-- **P0-9** (`6e9267f`): Stage 2 fine candidate selection switched from "top 20%" to UNION of (score >= `MATCH_FINE_SCORE_THRESHOLD`, top `MATCH_FINE_TOP_PERCENT%`). Protects against both flat-high distributions (where top-N% would discard genuine fits) and flat-low ones (where the absolute threshold would select nothing).
-- **P0-10** (`43bb666`): Optimizer rescore call shape unified with match_agent's fine eval. Dropped batch re-score (5 pairs/call) in favor of per-JD calls with `RESCORE_CONCURRENCY=3`. Eliminates ~3-5pt batch-context anchoring inflation in Score Delta. Removed unused `BATCH_FINE_SYSTEM_PROMPT` / `BatchMatchItem` / `BatchMatchResult`.
-- **P0-11** (`b88ab9a`): Gemini transient errors (5xx / UNAVAILABLE / timeout) now retry on the same key with bounded exponential backoff (2s / 4s / 8s + jitter) before raising. Quota / 429 still rotates keys (key-specific). Aligns with Gemini API guidance for retryable server-side errors.
-- **P0-12** (`712cd0e`): `Tailored_Match_Results` gains a persisted `Regression` boolean column. Previously this signal was only printed at run time and lost between runs; users had to re-derive from Score Delta < 0.
+- **P0-9** (`ef64907`): Stage 2 fine candidate selection switched from "top 20%" to UNION of (score >= `MATCH_FINE_SCORE_THRESHOLD`, top `MATCH_FINE_TOP_PERCENT%`). Protects against both flat-high distributions (where top-N% would discard genuine fits) and flat-low ones (where the absolute threshold would select nothing).
+- **P0-10** (`6ffbe1b`): Optimizer rescore call shape unified with match_agent's fine eval. Dropped batch re-score (5 pairs/call) in favor of per-JD calls with `RESCORE_CONCURRENCY=3`. Eliminates ~3-5pt batch-context anchoring inflation in Score Delta. Removed unused `BATCH_FINE_SYSTEM_PROMPT` / `BatchMatchItem` / `BatchMatchResult`.
+- **P0-11** (`fe600dd`): Gemini transient errors (5xx / UNAVAILABLE / timeout) now retry on the same key with bounded exponential backoff (2s / 4s / 8s + jitter) before raising. Quota / 429 still rotates keys (key-specific). Aligns with Gemini API guidance for retryable server-side errors.
+- **P0-12** (`a3679ac`): `Tailored_Match_Results` gains a persisted `Regression` boolean column. Previously this signal was only printed at run time and lost between runs; users had to re-derive from Score Delta < 0.
+
+### P0 Code Review Round 1 (P0-1 ~ P0-8) + P1 batch 1
+
+*(Entries backfilled 2026-06-10 from git history — these shipped 2026-04-28 alongside PRJ-002 but were not recorded at the time.)*
+
+- **P0-1** (`764fb49`): Enable Gemini Context Caching for the resume + system prompt, cutting repeated-token cost on multi-JD scoring runs.
+- **P0-2** (`700a55d`): Extract `_FINE_SYSTEM_PROMPT` and `MatchResult` from `match_agent` into `shared/` — single source of truth for the optimizer's rescore path.
+- **P0-3** (`5094644`): Wrap scraped JD/resume content in `<scraped_content>` delimiters as a prompt-injection boundary for LLM calls.
+- **P0-4** (`b471393`): Classify Gemini exceptions (transient vs. structural); remove fake-score fallbacks so failures surface instead of writing fabricated scores.
+- **P0-5** (`72a2993`): `upsert_companies` preserves TPM counts on existing rows instead of resetting them.
+- **P0-6** (`1521e35`): `get_scored_matches` filters by `stage='fine'` by default, so downstream consumers no longer see coarse-only rows.
+- **P0-7** (`591682f`): Add `RunSummary` dataclass and structured per-run logs (`shared/run_summary.py`).
+- **P0-8** (`b4e7ef5`): Remove redundant `_quick_keyword_score` pre-filter from match_agent.
+- **P1 batch 1** (`5e69291` code, `0bd67ac` skills): `JD_CACHE_DIR` moved to `shared/config.py`; `usage_metadata` capture in `gemini_pool.py`; schema clamp; `/test-one` mapping expanded to 15 entries; `/check-env` scanner generalized.
+
+## 2026-04-21
+
+### Public release preparation
+
+*(Entry backfilled 2026-06-10 from git history.)*
+
+Repo prepared for public visibility (`debc5dd`): MIT `LICENSE` added; `PROJECT_OVERVIEW.md` created (curated technical overview for recruiters/hiring managers, 112 lines); README rewritten for a public audience; `.gitignore` additions.
 
 ## 2026-03-17
 
@@ -359,9 +420,7 @@ The resume-fit scoring pipeline is restructured from a single LLM-derived "fit s
 - **BUG-10**: `_GeminiKeyPool` empty key list IndexError (documented)
 - **BUG-11**: CLAUDE.md Python version documentation correction (documented)
 
-## 2026-03-12 (this session)
-
-### Bug Fixes
+### Bug Fixes (later session, same day)
 - **BUG-24 (P3)**: Misleading module docstring in `tests/test_company_agent.py`
   - Original docstring stated "real HTTP check", "live ATS API probe", but BUG-09 had already mocked all HTTP calls
   - Updated module docstring to accurately describe that all HTTP calls are mocked, and added integration test instructions (`INTEGRATION_TEST=1`) and `@unittest.skipUnless` usage guidance

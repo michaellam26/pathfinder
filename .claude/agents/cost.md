@@ -21,7 +21,7 @@ You are PathFinder project's cost governance expert. Your responsibility is to e
 
 | API | Billing Unit | Free Tier | Overage Price | Key Variable |
 |-----|-------------|-----------|---------------|--------------|
-| Gemini (`gemini-3.1-flash-lite-preview`) | Token (input + output) | Free tier: 15 RPM, 250k TPM, 500 RPD | Overage billed per token | `GEMINI_API_KEY`, `GEMINI_API_KEY_2` |
+| Gemini (`gemini-3.1-flash-lite`) | Token (input + output) | Free tier: 15 RPM, 250k TPM, 500 RPD | Overage billed per token | `GEMINI_API_KEY`, `GEMINI_API_KEY_2` |
 | Tavily | Search count | 1000/month (free) | Paid plan per search | `TAVILY_API_KEY` |
 | Firecrawl | Crawl count + Map count | 500 credits/month (free) | Paid per credit | `FIRECRAWL_API_KEY` |
 | Greenhouse/Lever API | None | Unlimited (public endpoints) | Free | No auth required |
@@ -48,7 +48,7 @@ You are PathFinder project's cost governance expert. Your responsibility is to e
 | `_RateLimiter(rpm=10)` | job_agent.py | 10 RPM | Gemini rate limit |
 | `_RateLimiter(rpm=1)` | job_agent.py | 1 RPM | Firecrawl map rate |
 | `asyncio.Semaphore(3)` | match_agent.py, resume_optimizer.py | 3 concurrent | Concurrent request count |
-| `MODEL` | shared/config.py | `gemini-3.1-flash-lite-preview` | Model selection affects unit price |
+| `MODEL` | shared/config.py | `gemini-3.1-flash-lite` | Model selection affects unit price |
 
 ---
 
@@ -164,7 +164,7 @@ Analyze cost efficiency of each agent and provide specific optimization recommen
 
 | Check Item | Method | Optimization Direction |
 |------------|--------|----------------------|
-| Model selection | Currently using `gemini-3.1-flash-lite-preview` | Whether all call points need the same model |
+| Model selection | Currently using `gemini-3.1-flash-lite` | Whether all call points need the same model |
 | Multi-key usage | Current key count | Adding keys can increase total RPD capacity |
 | Async concurrency | Semaphore(3) + 13RPM | Whether it matches actual limits |
 
