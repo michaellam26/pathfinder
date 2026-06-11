@@ -96,7 +96,7 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 
 | ID | Requirement Description | Status |
 |----|----------|------|
-| REQ-030 | Load candidate resume (.md or .txt) from the `profile/` directory (overridable via `PROFILE_DIR` environment variable) | `[x]` |
+| REQ-030 | Load candidate resume (`.md`, `.txt`, or `.pdf` — picker priority in that order; PDF support via `shared/resume_io.py` per REQ-120~127) from the `profile/` directory (overridable via `PROFILE_DIR` environment variable) | `[x]` |
 | REQ-031 | Compute MD5 hash of resume content for change detection | `[x]` |
 | REQ-032 | When the resume changes, mark existing scores for that candidate as stale and trigger re-scoring | `[x]` |
 
@@ -266,6 +266,48 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 
 ---
 
+## 9.6 Post-PRJ-003 Operational Hardening (2026-05)
+
+Five small features landed between PRJ-003 and the next named project. Tracked here for traceability — no dedicated SDLC project; small enough to ship directly.
+
+### Manual-entry override (Company_List)
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-130 | `company_agent.run_phase_1_5` detects manually-inserted `Company_List` rows (`Company Name` + `AI Domain` present, `Career URL` blank) and runs the full `find_career_url` discovery pipeline (Tavily ATS-targeted → general search → Greenhouse / Lever / Ashby / Workable slug probes → Workday-via-Tavily fallback → homepage crawl) to backfill the URL. Tavily is a hard requirement for this path; rows that resist discovery are reported and left blank for the next run to retry. `AI Domain` accepts any of the 6 whitelisted buckets *or* a custom string (job_agent treats unknown buckets as `ai_native`). | `[t]` |
+
+### Tailored-resume user-edit protection
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-131 | `Tailored_Match_Results` gains a `Last Written Hash` column (sha256 of the `.md` content the optimizer last wrote). On each subsequent run, `_save_tailored_resume` compares the on-disk `.md` sha256 against this recorded hash; on mismatch (user hand-edited the file), the write is skipped and the pair is dropped from that run's Excel update so the row stays aligned with the on-disk file. Legacy rows (empty `Last Written Hash`) are treated as "no prior write on file" and write normally without false-positive tamper detection. `--force-rewrite` CLI flag bypasses the check. Motivation: prevents the launchd daily runner (REQ-133) from silently clobbering polish applied by hand. | `[t]` |
+
+### JD_Tracker auto-sort by Location Tier
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-132 | After each `job_agent` run, `JD_Tracker` is sorted into three location tiers — **Greater Seattle** → **Remote (US)** → **Other** — with a new `Location Tier` column and per-tier row highlighting. Sort is stable within-tier (preserves recency order). Classifier recognises Seattle / Bellevue / Redmond / Kirkland / Greater Seattle metro variants and standard Remote phrasings. | `[t]` |
+
+### Operational scheduling
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-133 | `scripts/run_daily_pipeline.sh` runs the full 4-agent pipeline (company → job → match → optimizer) in sequence; sample `com.pathfinder.daily.plist` schedules it via macOS `launchd`. Logs land in `logs/` (gitignored). `.gitignore` also excludes `worktrees/` (Claude Code agent isolation artifacts). | `[x]` |
+
+### Model name → GA
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-134 | `shared/config.py:MODEL` set to GA name `gemini-3.1-flash-lite` (dropped `-preview` suffix). Google deprecates the `-preview` alias on 2026-05-25. Pure rename — same model, same weights, same prompts, scores remain comparable across the rename. See DEC-001. | `[x]` |
+
+> **Code location (REQ-130)**: `agents/company_agent.py` — `run_phase_1_5()` manual-entry detection branch, `find_career_url()` reused unchanged.
+> **Code location (REQ-131)**: `agents/resume_optimizer.py` — `_save_tailored_resume()`, `_compute_file_sha256()`, `--force-rewrite` arg. `shared/excel_store.py` — `Last Written Hash` column in `TAILORED_HEADERS` + migration logic in `get_or_create_excel`, `last_written_hash` field in `batch_upsert_tailored_records`, `get_tailored_match_pairs()` return shape.
+> **Code location (REQ-132)**: `agents/job_agent.py` — `_classify_location_tier()`, `sort_jd_tracker_by_tier()`, post-run hook. `shared/excel_store.py` — `Location Tier` column in `JD_HEADERS` + migration.
+> **Code location (REQ-133)**: `scripts/run_daily_pipeline.sh`, `scripts/com.pathfinder.daily.plist`, `.gitignore`.
+> **Code location (REQ-134)**: `shared/config.py:MODEL`.
+
+---
+
 ## 10. Technical Decision Record
 
 ### DEC-001: LLM Model Selection — Retain Gemini flash-lite (2026-03-16)
@@ -308,3 +350,4 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 | v1.8 | 2026-03-16 | REQ-062, REQ-063 verified and passed; status updated to `[x]`. REQ-062: Added `ATS_PLATFORMS` declarative routing table (6 entries: greenhouse/lever/ashby/workday/google/tesla), `_match_ats()` route matching function, `_resolve_list_fn()` and `_discover_via_api()` helper functions, `_JD_FN_REGISTRY` JD routing registry; `API_ATS`/`WORKDAY_ATS`/`CRAWLER_ATS` auto-derived from routing table; 9 `_match_ats` tests + 5 routing table integrity tests all passed. REQ-063: `shared/config.py` added `AUTO_ARCHIVE_THRESHOLD=3`; `shared/excel_store.py` added `No TPM Count`/`Auto Archived` columns, migration logic, `get_archived_companies`/`update_archive_status`/`unarchive_company`/`get_company_archive_info`/`count_valid_tpm_jobs_by_company` five functions; `agents/job_agent.py` main() skips archived companies before iteration, updates archive status by threshold after iteration, `data_quality=failed` records excluded from count; 28 related tests (11 job_agent + 16 excel_store + 5 count_valid) all passed. |
 | v1.9 | 2026-04-28 | Added "9. PRJ-002: 3-Dimension Scoring Requirements" section: REQ-100~112 covering ATS dimension (deterministic keyword coverage, REQ-100~102, REQ-110), Excel schema extensions (REQ-103, REQ-104, REQ-109, REQ-111), prompt rename pivot (REQ-105), match_agent integration (REQ-106), resume_optimizer integration (REQ-107~108), test coverage (REQ-112). Implemented across 5 sequential PRs (`feat/3d-scoring` branch). Tests: 619 → 718 (+99). Also updated REQ-033 (marked obsolete: keyword pre-filter removed in P0-8), REQ-035 (top 20% → UNION threshold/top-N% per P0-9), REQ-052 (renamed FINE_SYSTEM_PROMPT to HM_SYSTEM_PROMPT, dropped batch_re_score reference per P0-10). |
 | v2.0 | 2026-05-05 | Added "9.5 PRJ-003: PDF Resume I/O" section: REQ-120~127 covering PDF→MD input via `pdfplumber` (deterministic, no LLM) with layout-aware section/bullet detection (REQ-120~123), MD→PDF output via WeasyPrint with ATS-safe CSS (REQ-124~126), and `load_resume` centralization in `shared/resume_io.py` (REQ-127). Tests: 736 → 749 (+13). Companion artifact: `docs/sdlc/PRJ-003-pdf-io-opus-eval/eval.md` — Claude Opus 4.7 vs Gemini 3.1 Flash Lite tailor-step memo (verdict: not as full swap; opt-in fallback only). |
+| v2.1 | 2026-05-20 | Added "9.6 Post-PRJ-003 Operational Hardening" section: REQ-130 (manual-entry Career URL backfill), REQ-131 (tailored-resume user-edit protection via Last Written Hash), REQ-132 (JD_Tracker auto-sort by Location Tier), REQ-133 (launchd daily pipeline runner), REQ-134 (Gemini model name → GA). REQ-030 updated to include `.pdf` cross-reference. Tests: 749 → 859 (+110, spanning Workable/Workday discovery work + the 5 features above). |

@@ -8,17 +8,17 @@ PathFinder is an autonomous AI-powered job discovery and matching system designe
 
 - **What it is:** A 4-agent LLM pipeline — **Discover → Extract → Match → Tailor** — that automates AI-TPM job search end-to-end. The match + tailor stages run a **3-dimension scoring funnel** (ATS keyword coverage / Recruiter scan / HM deep eval) that mirrors the real North American hiring filter cascade.
 - **How it was built:** I made all architecture, scope, and review decisions; used **Claude Code (Opus)** as implementation partner and designed an **11-agent Claude subagent review team** (PM, TPM, 9 QA/Eval/Cost reviewers) for parallel review across a full SDLC.
-- **Scale signals:** ~4K lines of Python · 725+ unit tests · Pydantic-typed inter-agent contracts · Gemini API pooling + token-bucket rate limiting · full BRD / Tech Design / Test / Launch artifacts under `docs/sdlc/`.
+- **Scale signals:** ~4K lines of Python · 859+ unit tests · Pydantic-typed inter-agent contracts · Gemini API pooling + token-bucket rate limiting · full BRD / Tech Design / Test / Launch artifacts under `docs/sdlc/`.
 - **Stack:** Python 3.11 · Gemini · Claude Code · Tavily · Firecrawl · Crawl4AI · Pydantic · openpyxl · pytest.
 
 ## How It Works
 
 The system runs four independent agents in sequence:
 
-1. **Company Agent** — Discovers AI companies via web search (Tavily), finds their career/ATS pages, and validates URLs
-2. **Job Agent** — Scrapes career pages for TPM openings using ATS APIs (Greenhouse, Lever, Ashby) or web crawlers (Firecrawl, Crawl4AI), extracts structured JD data including 8-15 ATS-relevant keywords per role
-3. **Match Agent** — **3-dimension scoring funnel** modeled on the real NA hiring cascade: **ATS Coverage** (deterministic keyword match, no LLM) + **Recruiter Score** (Gemini batch coarse) + **HM Score** (Gemini fine, 4-dim weighted), with UNION-of-threshold-and-top-N% gating into the deep-eval stage
-4. **Resume Optimizer** — Tailors resume per JD using Gemini, then **re-scores all 3 dimensions independently** so per-application improvement is visible per filter (regression flag uses HM Delta only — ATS keyword gains aren't false-positive regressions)
+1. **Company Agent** — Discovers AI companies via web search (Tavily), finds their career/ATS pages, validates URLs, and unwraps LinkedIn / VC-portfolio wrapper URLs back to the underlying ATS board. Also backfills the Career URL on any row the user drops into `Company_List` by hand.
+2. **Job Agent** — Scrapes career pages for TPM openings using ATS APIs (Greenhouse, Lever, Ashby, **Workable**) or web crawlers (Firecrawl, Crawl4AI); for unguessable-subdomain Workday boards, falls back to a Tavily-guarded lookup. Extracts structured JD data including 8-15 ATS-relevant keywords per role. Auto-sorts `JD_Tracker` into Greater Seattle / Remote / Other tiers after each run.
+3. **Match Agent** — **3-dimension scoring funnel** modeled on the real NA hiring cascade: **ATS Coverage** (deterministic keyword match, no LLM) + **Recruiter Score** (Gemini batch coarse) + **HM Score** (Gemini fine, 4-dim weighted), with UNION-of-threshold-and-top-N% gating into the deep-eval stage. Accepts `.md`, `.txt`, or `.pdf` resumes (PDF auto-converted via `pdfplumber`).
+4. **Resume Optimizer** — Tailors resume per JD using Gemini, then **re-scores all 3 dimensions independently** so per-application improvement is visible per filter (regression flag uses HM Delta only — ATS keyword gains aren't false-positive regressions). Renders each tailored `.md` as a sibling ATS-safe `.pdf` (WeasyPrint). User-edit protection: if you hand-polish a tailored `.md`, the next run detects the sha256 mismatch and skips the overwrite.
 
 All results are persisted to a local Excel dashboard (`pathfinder_dashboard.xlsx`).
 
@@ -41,8 +41,14 @@ shared/              # Shared utilities
   run_summary.py     # Structured per-run log dataclass
   ats_matcher.py     # Deterministic ATS keyword coverage (PRJ-002)
   ats_synonyms.py    # Hand-curated ATS keyword synonym table (PRJ-002)
-tests/               # Unit tests (725+ cases)
-profile/             # Candidate resume (.md/.txt)
+  resume_io.py       # Unified resume loader (.md/.txt/.pdf) + MD→PDF render (PRJ-003)
+templates/           # PDF rendering assets
+  resume.css         # ATS-safe CSS for tailored-resume PDF output
+scripts/             # Operational scripts
+  run_daily_pipeline.sh  # Daily full-pipeline runner (launchd)
+tests/               # Unit tests (859+ cases)
+profile/             # Candidate resume (.md / .txt / .pdf — picker priority in that order)
+  .cache/            # PDF→MD conversion cache (auto-created)
 docs/                # SDLC project documents
 ```
 
@@ -83,7 +89,7 @@ python agents/match_agent.py      # Step 3: Score matches
 python agents/resume_optimizer.py # Step 4: Tailor resumes
 ```
 
-Place your resume (`.md` or `.txt`) in the `profile/` directory before running the match agent.
+Place your resume (`.md`, `.txt`, or `.pdf`) in the `profile/` directory before running the match agent. Picker priority is `.md > .txt > .pdf` — drop a PDF straight in and the agents auto-convert via `pdfplumber` (deterministic, cached at `profile/.cache/`).
 
 ## AI SDLC Development Team
 

@@ -1319,9 +1319,9 @@ class TestGetTailoredMatchPairs(unittest.TestCase):
         self.assertEqual(pairs, {})
 
 
-class TestPRJ004LastWrittenHash(unittest.TestCase):
-    """PRJ-004 M1 — Tailored_Match_Results stores sha256 of last-written .md
-    so the optimizer can detect user hand-edits between runs."""
+class TestLastWrittenHash(unittest.TestCase):
+    """Tailored_Match_Results stores sha256 of last-written .md so the
+    optimizer can detect user hand-edits between runs."""
 
     def setUp(self):
         self.path = _tmp_xlsx()

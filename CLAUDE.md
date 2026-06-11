@@ -36,7 +36,7 @@ shared/              # Shared utilities reused across agents
   run_summary.py     # Structured run-log dataclass
   ats_matcher.py     # Deterministic ATS keyword coverage (PRJ-002)
   ats_synonyms.py    # Hand-curated ATS keyword synonym table (PRJ-002)
-tests/               # Unit tests (725+ cases)
+tests/               # Unit tests (859+ cases)
 docs/
   sdlc/              # SDLC project documents (index + per-project dirs)
 .claude/

@@ -167,8 +167,8 @@ class TestSaveTailoredResume(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class TestPRJ004UserEditProtection(unittest.TestCase):
-    """PRJ-004 M1 — _save_tailored_resume protects user hand-edits via sha256.
+class TestUserEditProtection(unittest.TestCase):
+    """_save_tailored_resume protects user hand-edits via sha256.
 
     Without protection, a daily scheduled re-run silently overwrites any
     tailored resume the user has manually polished — that's the data-loss

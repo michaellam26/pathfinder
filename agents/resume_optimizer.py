@@ -68,8 +68,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 
 _KEY_POOL: "_GeminiKeyPool | None" = None
 
-# PRJ-004 M1: when True, _save_tailored_resume bypasses the on-disk
-# tamper check and unconditionally overwrites. Set by --force-rewrite CLI.
+# When True, _save_tailored_resume bypasses the on-disk tamper check and
+# unconditionally overwrites. Set by --force-rewrite CLI.
 _FORCE_REWRITE: bool = False
 
 
@@ -120,11 +120,11 @@ def _save_tailored_resume(resume_id: str, url: str, content: str,
     Also writes a sibling .pdf using shared.resume_io.markdown_to_pdf with the
     style captured from the input PDF (if any) — ATS-safe by construction.
 
-    PRJ-004 M1 — user-edit protection: if the on-disk .md exists and its
-    sha256 does not match `expected_hash` (the hash we recorded the last
-    time we wrote this file, persisted in Tailored_Match_Results.Last
-    Written Hash), assume the user hand-edited it and skip both the .md
-    write and the .pdf render. Caller treats None as "skipped" and should
+    User-edit protection: if the on-disk .md exists and its sha256 does
+    not match `expected_hash` (the hash we recorded the last time we
+    wrote this file, persisted in Tailored_Match_Results.Last Written
+    Hash), assume the user hand-edited it and skip both the .md write
+    and the .pdf render. Caller treats None as "skipped" and should
     drop the pair from downstream Excel updates so the existing row stays
     aligned with the on-disk (user-edited) file.
 
@@ -397,8 +397,8 @@ async def _main_inner(summary: RunSummary):
 
     tailor_results: dict[str, dict] = {}   # url -> {"tailored_md", "opt_summary", "last_written_hash"}
     tailor_fallback: list[dict] = []
-    # PRJ-004 M1: pairs whose on-disk .md was hand-edited since our last
-    # write. We skip writing and exclude them from rescore + Excel update.
+    # Pairs whose on-disk .md was hand-edited since our last write.
+    # We skip writing and exclude them from rescore + Excel update.
     tampered_urls: set[str] = set()
 
     for b in range(n_tailor_batches):
@@ -615,8 +615,8 @@ async def _main_inner(summary: RunSummary):
             "optimization_summary": tailor_results[url]["opt_summary"],
             "resume_hash": resume_hash,
             "regression": regression,
-            # PRJ-004 M1: persist sha256 of the .md we just wrote so the
-            # next run can detect user hand-edits.
+            # Persist sha256 of the .md we just wrote so the next run can
+            # detect user hand-edits.
             "last_written_hash": tailor_results[url]["last_written_hash"],
             # PR 4 per-dim:
             "original_ats": original_ats,

@@ -1,10 +1,10 @@
 # PRJ-003: PDF Resume I/O + Claude Opus Tailor Evaluation
 
-**Phase**: Implementation Complete
-**Status**: 🟢 Ready for review
+**Phase**: Launched (merged to main 2026-05-05 — see CHANGELOG `## 2026-05-05` PRJ-003 entry)
+**Status**: 🟢 Closed (R3 carried as follow-up — see Risk Register)
 **Priority**: P2
 **Created**: 2026-05-05
-**Last Updated**: 2026-05-05
+**Last Updated**: 2026-06-10
 
 ## Scope
 

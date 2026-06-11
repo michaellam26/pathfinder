@@ -1,6 +1,6 @@
 # Bug Tracker
 
-> Last updated: 2026-03-16
+> Last updated: 2026-06-10 (no new bugs since 2026-03-16 — only timestamp refresh after post-PRJ-003 feature audit)
 
 ## Summary
 

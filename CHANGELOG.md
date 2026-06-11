@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## 2026-05-20
+
+### Manual-entry override: backfill Career URL for hand-inserted Company_List rows
+
+`company_agent.run_phase_1_5` now detects `Company_List` rows that were inserted
+manually (`Company Name` + `AI Domain` present, `Career URL` blank) and runs the
+full `find_career_url` discovery pipeline on them — Tavily ATS-targeted search →
+Tavily general search → Greenhouse / Lever / Ashby / Workable slug probes →
+Workday-via-Tavily fallback → homepage crawl — then writes the result back.
+Tavily is a hard requirement for this path; rows that resist discovery are
+reported and left blank for the next run to retry. `AI Domain` accepts any of
+the 6 whitelisted buckets *or* a custom string (job_agent treats unknown
+buckets as `ai_native`). Lets the user drop in a target company list without
+also hunting down their ATS URLs by hand.
+
+### Gemini model name → GA (`gemini-3.1-flash-lite`)
+
+`shared/config.py:MODEL` updated from `gemini-3.1-flash-lite-preview` to
+`gemini-3.1-flash-lite` (the GA name). Google deprecates the `-preview` alias
+on 2026-05-25; this is a pure rename — same model, same weights, same prompts,
+same costs, scores comparable across the rename. No call-site changes.
+
 ## 2026-05-05
 
 ### Discovery coverage: Workday-via-Tavily fallback (with strict subdomain guard)
@@ -67,6 +89,44 @@ Three additions, all opt-in / passive:
 **Tests**: 736 → 749 (+13 in `tests/test_resume_io.py`), all passing.
 
 **Reference docs**: `docs/sdlc/PRJ-003-pdf-io-opus-eval/` (status + eval memo).
+
+### Tailored-resume user-edit protection
+
+`resume_optimizer._save_tailored_resume` now refuses to overwrite a tailored
+resume that the user hand-edited between runs. Mechanism: each successful
+write records a `sha256` of the `.md` content in a new
+`Tailored_Match_Results.Last Written Hash` column; before any subsequent
+write, the on-disk hash is compared against that record — mismatch ⇒ skip
+both the `.md` write and the sibling `.pdf` render, and exclude the pair from
+that run's Excel update so the row stays aligned with the on-disk
+(user-edited) file. Legacy rows (empty `Last Written Hash`) are treated as
+"no prior write on file" and write normally on first run (no false-positive
+tamper detection). New `--force-rewrite` CLI flag bypasses the check.
+Motivation: daily scheduled re-runs (see launchd entry below) would
+otherwise silently clobber polish the user applied by hand.
+
+**Tests**: +13 in `tests/test_resume_optimizer.py` (`TestUserEditProtection`)
+and `tests/test_excel_store.py` (`TestLastWrittenHash`).
+
+### JD_Tracker auto-sort by location tier
+
+After each `job_agent` run, `JD_Tracker` is now sorted into three location
+tiers — **Greater Seattle** → **Remote (US)** → **Other** — with a new
+`Location Tier` column and row highlighting per tier. Tier classifier
+recognises Seattle / Bellevue / Redmond / Kirkland / Greater Seattle
+metro variants; Remote includes "Remote (US)", "United States — Remote",
+etc. The sort is stable within-tier (preserves prior recency order). Lets
+the user scan the highest-priority openings first without spreadsheet
+filters.
+
+### launchd-based daily pipeline runner
+
+Added `scripts/run_daily_pipeline.sh` + sample `com.pathfinder.daily.plist`
+that schedules the full 4-agent pipeline (company → job → match →
+optimizer) via macOS `launchd`. Logs land in `logs/` (gitignored).
+`.gitignore` updated to also exclude `worktrees/` (Claude Code agent
+isolation artifacts). Replaces ad-hoc terminal runs for users who want a
+fire-and-forget daily refresh.
 
 ## 2026-04-28
 

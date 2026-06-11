@@ -57,7 +57,9 @@ PathFinder is a multi-agent AI system for TPM job seekers, consisting of four in
      → ③ Tavily general search → ④ Greenhouse/Lever slug probing → ⑤ Homepage crawling
 5. Companies without a found URL are skipped (not written)
 6. Upsert company data to Company_List
-7. Phase 1.5: Probe and upgrade non-ATS URLs → write back
+7. Phase 1.5: Probe and upgrade non-ATS URLs → write back. Also detects
+     manually-inserted rows (Company Name + AI Domain present, Career URL
+     blank) and runs the full find_career_url pipeline to backfill the URL.
 ```
 
 **Key constants**:
@@ -114,7 +116,7 @@ On completion: Update TPM Jobs / AI TPM Jobs counts in Company_List for each com
 
 **Internal flow**:
 ```
-1. Load resume from profile/ (.md/.txt), compute resume MD5
+1. Load resume from profile/ (.md / .txt / .pdf — picker priority in that order; PDF auto-converted via `shared/resume_io.py`), compute resume MD5
 2. Read all JDs from JD_Tracker where is_ai_tpm=True
 3. Detect stale pairs (resume hash changed) → mark for re-scoring
 
@@ -155,7 +157,7 @@ Stage 2 — HM evaluation (UNION of threshold + top-N%):
 
 **Internal flow**:
 ```
-1. Load resume from profile/, compute MD5
+1. Load resume from profile/ (.md / .txt / .pdf via `shared/resume_io.py`), compute MD5
 2. Read fine-stage matches from Match_Results (stage="fine"), including
    per-dim originals (ATS Coverage %, Recruiter Score, HM Score) via the
    PR 4 extension to get_scored_matches
@@ -165,7 +167,12 @@ Stage 2 — HM evaluation (UNION of threshold + top-N%):
 Phase 1 — Batch tailor:
   Batch size 2 — Gemini generates tailored resume (reorders / emphasizes /
   mirrors JD keywords; never fabricates new experience). Save to
-  tailored_resumes/{resume_id}/{url_md5}.md. Per-item fallback if batch failed.
+  tailored_resumes/{resume_id}/{url_md5}.md AND a sibling .pdf rendered via
+  WeasyPrint (ATS-safe CSS, PRJ-003). Per-item fallback if batch failed.
+  User-edit protection: if the on-disk .md sha256 disagrees with the last
+  recorded `Tailored_Match_Results.Last Written Hash`, the write is skipped
+  and the pair is dropped from the rescore + Excel update so the row stays
+  aligned with the user's hand-edited file (--force-rewrite bypasses).
 
 Phase 2 — 3-dimension rescore (per JD, concurrency=3):
   ├── ATS:       compute_coverage(ats_keywords, tailored_md) — deterministic, no LLM
@@ -206,9 +213,9 @@ Phase 3 — Assemble + write:
 |-----------|-------------|--------|
 | `Company_List` | Company Name | Company Name, AI Domain, Business Focus, Career URL, Updated At, TPM Jobs, AI TPM Jobs, No TPM Count, Auto Archived |
 | `Company_Without_TPM` | Company Name | Company Name, AI Domain, Business Focus, Career URL, Updated At, TPM Jobs, AI TPM Jobs |
-| `JD_Tracker` | JD URL | JD URL, Job Title, Company, Location, Salary, Requirements, Additional Qualifications, Responsibilities, Is AI TPM, Updated At, MD Hash, Data Quality |
+| `JD_Tracker` | JD URL | JD URL, Job Title, Company, Location, Salary, Requirements, Additional Qualifications, Responsibilities, Is AI TPM, Updated At, MD Hash, Data Quality, **Location Tier** (Greater Seattle / Remote / Other — used for post-run auto-sort) |
 | `Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Score, Strengths, Gaps, Reason, Updated At, Resume Hash, Stage, **ATS Coverage %, Recruiter Score, HM Score, ATS Missing** (PRJ-002) |
-| `Tailored_Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Job Title, Company, Original Score, Tailored Score, Score Delta, Tailored Resume Path, Optimization Summary, Updated At, Resume Hash, Regression, **Original ATS, Tailored ATS, ATS Delta, Original Recruiter, Tailored Recruiter, Recruiter Delta, Original HM, Tailored HM, HM Delta** (PRJ-002) |
+| `Tailored_Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Job Title, Company, Original Score, Tailored Score, Score Delta, Tailored Resume Path, Optimization Summary, Updated At, Resume Hash, Regression, **Original ATS, Tailored ATS, ATS Delta, Original Recruiter, Tailored Recruiter, Recruiter Delta, Original HM, Tailored HM, HM Delta** (PRJ-002), **Last Written Hash** (sha256 of last-written .md — used by optimizer to detect user hand-edits) |
 
 ### Key Design
 
@@ -331,8 +338,20 @@ pathfinder/
 │   ├── excel_store.py         # Unified Excel persistence layer
 │   ├── gemini_pool.py         # Gemini API key rotation base class (client caching, round-robin, thread-safe)
 │   ├── rate_limiter.py        # Token-bucket async rate limiter
-│   └── config.py              # Shared constants (MODEL)
-├── tests/                     # Unit tests (725+ cases)
+│   ├── config.py              # Shared constants (MODEL, AUTO_ARCHIVE_THRESHOLD)
+│   ├── prompts.py             # System prompts (RECRUITER, HM, TAILOR)
+│   ├── schemas.py             # Pydantic response schemas for Gemini
+│   ├── exceptions.py          # GeminiTransientError / GeminiStructuralError
+│   ├── run_summary.py         # Structured per-run log dataclass
+│   ├── ats_matcher.py         # Deterministic ATS keyword coverage (PRJ-002)
+│   ├── ats_synonyms.py        # Hand-curated ATS keyword synonym table (PRJ-002)
+│   └── resume_io.py           # Unified resume loader (.md/.txt/.pdf) + MD→PDF render (PRJ-003)
+├── templates/                 # PDF rendering assets (PRJ-003)
+│   └── resume.css             # ATS-safe CSS for tailored-resume PDF output
+├── scripts/                   # Operational scripts
+│   ├── run_daily_pipeline.sh  # Daily full-pipeline runner (launchd)
+│   └── com.pathfinder.daily.plist  # Sample launchd job definition
+├── tests/                     # Unit tests (859+ cases)
 ├── docs/
 │   └── sdlc/                  # SDLC project documents
 │       ├── index.md           # Project index table
@@ -364,13 +383,15 @@ pathfinder/
 │       ├── test-all/
 │       ├── test-one/
 │       └── check-env/
-├── profile/                   # Candidate resume directory (.md/.txt)
+├── profile/                   # Candidate resume directory (.md / .txt / .pdf — picker priority in that order)
+│   └── .cache/                # PDF→MD conversion cache (auto-created, deterministic, hash-keyed)
 ├── jd_cache/                  # JD Markdown local cache (auto-created)
-├── tailored_resumes/          # Tailored resume output (subdirectories by resume_id)
+├── tailored_resumes/          # Tailored resume output (.md + .pdf per JD, subdirs by resume_id)
+├── logs/                      # Pipeline logs (auto-created by launchd runner, gitignored)
 ├── pathfinder_dashboard.xlsx  # Main data file (auto-created)
 ├── .env                       # API Keys (not committed)
 ├── CLAUDE.md                  # Development guide
-├── REQUIREMENTS.md            # Requirements tracking (63 REQ + DEC entries)
+├── REQUIREMENTS.md            # Requirements tracking (130+ REQ + DEC entries)
 ├── ARCHITECTURE.md            # System architecture (this document)
 ├── BUGS.md                    # Bug records
 ├── CHANGELOG.md               # Change log
@@ -390,4 +411,5 @@ pathfinder/
 | v1.3 | 2026-03-16 | Added coordination layer: TPM Agent (opus) + 3 SDLC Skills (sdlc-init, sdlc-status, sdlc-review) + `docs/sdlc/` project document directory. PM Agent gained BRD writing and testing sign-off modes. Established 5-phase SDLC workflow (BRD → Design → Implement → Testing → Launch). | Simulate real team SDLC: User only provides high-level goals, PM, TPM, Engineer Lead, and QA Team collaborate to complete the full process from requirements to launch; document-driven inter-agent communication |
 | v1.4 | 2026-03-16 | Comprehensive code audit fixing 55 bugs (BUG-01~55); Job Agent enhancements: Ashby upgraded to API_ATS (REQ-058), soft 404 hardening + JD positive validation (REQ-059), JD field completeness grading (REQ-060), Workday URL format expansion (REQ-061); ATS declarative routing table refactoring (REQ-062); auto-archiving companies with no TPM positions (REQ-063); `shared/gemini_pool.py` refactored to unified base class (`_GeminiKeyPoolBase`) with client caching, round-robin rotation, thread safety; `shared/excel_store.py` added `_JD_COL` dynamic column mapping and 5 archive management functions; JD_Tracker schema added Requirements/Additional Qualifications/Data Quality columns; Company_List added No TPM Count/Auto Archived columns. Tests grew from ~120 to 485. | Comprehensive code quality and robustness improvement; ATS extensibility; data quality observability |
 | v1.5 | 2026-03-17 | Added Observability Agent (run reporting, quality drift detection, anomaly alerting) and Cost Agent (token usage estimation, quota monitoring, cost optimization recommendations). Custom Agents grew from 9 to 11. | Runtime quality monitoring and cost governance capabilities specific to AI projects, filling gaps in traditional SDLC for AI dimensions |
-| v1.6 (current) | 2026-04-28 | **PRJ-002: 3-Dimension Scoring**. Restructured the resume-fit scoring pipeline from a single LLM-derived "fit score" into three parallel dimensions: ATS Coverage (deterministic, `shared/ats_matcher.py`), Recruiter Score (Gemini, was COARSE), HM Score (Gemini, was FINE). New `JobDetails.ats_keywords` field; `Match_Results` +4 cols; `Tailored_Match_Results` +9 cols (auto-migrated). Optimizer rescores all 3 dims; regression flag now means HM Delta < 0 only (was: legacy single-score delta). Tests 619 → 718 (+99 across 5 sequential PRs). Plus P0 follow-ups: P0-9 Stage 2 UNION selection, P0-10 single-JD rescore parity, P0-11 Gemini transient backoff retry, P0-12 persisted Regression column. | Existing single-score Score Delta conflated keyword gains with semantic strength; users had no signal on which one moved. Mapping each dimension to one real-world hiring filter (ATS keyword search → recruiter scan → HM deep eval) makes the system's output match the actual North American funnel. |
+| v1.6 | 2026-04-28 | **PRJ-002: 3-Dimension Scoring**. Restructured the resume-fit scoring pipeline from a single LLM-derived "fit score" into three parallel dimensions: ATS Coverage (deterministic, `shared/ats_matcher.py`), Recruiter Score (Gemini, was COARSE), HM Score (Gemini, was FINE). New `JobDetails.ats_keywords` field; `Match_Results` +4 cols; `Tailored_Match_Results` +9 cols (auto-migrated). Optimizer rescores all 3 dims; regression flag now means HM Delta < 0 only (was: legacy single-score delta). Tests 619 → 718 (+99 across 5 sequential PRs). Plus P0 follow-ups: P0-9 Stage 2 UNION selection, P0-10 single-JD rescore parity, P0-11 Gemini transient backoff retry, P0-12 persisted Regression column. | Existing single-score Score Delta conflated keyword gains with semantic strength; users had no signal on which one moved. Mapping each dimension to one real-world hiring filter (ATS keyword search → recruiter scan → HM deep eval) makes the system's output match the actual North American funnel. |
+| v1.7 (current) | 2026-05-20 | **PRJ-003 + operational hardening**. (a) PDF resume I/O: `shared/resume_io.py` centralizes `load_resume` across match + optimizer; supports `.md/.txt/.pdf` input via `pdfplumber` (deterministic, layout-aware, cached at `profile/.cache/`); every tailored `.md` also rendered as a sibling `.pdf` via WeasyPrint with ATS-safe CSS (`templates/resume.css`). (b) Discovery coverage: Workable as first-class ATS, LinkedIn/VC-portfolio URL unwrapper, Workday-via-Tavily fallback with strict subdomain-equality guard (26 cos recovered). (c) Manual-entry override: `run_phase_1_5` backfills Career URL on hand-inserted `Company_List` rows. (d) Tailored-resume user-edit protection via sha256 stored in `Tailored_Match_Results.Last Written Hash`. (e) `JD_Tracker` auto-sort by Location Tier (Greater Seattle / Remote / Other) with new `Location Tier` column. (f) launchd-based daily pipeline runner under `scripts/`. (g) Gemini model name → GA (`gemini-3.1-flash-lite`, drop `-preview`). Tests: 749 → 859 (+110). | PRJ-003 closes the resume-format gap (real submissions are PDFs, not Markdown). Manual-entry + URL unwrapper unblocks the user dropping in a target list without per-company ATS hunting. User-edit protection prevents the daily launchd runner from silently clobbering hand-polished resumes. Location-tier sort matches the user's actual review workflow. |
