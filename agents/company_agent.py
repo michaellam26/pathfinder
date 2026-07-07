@@ -56,35 +56,43 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 # BUG-31: use _GeminiKeyPoolBase directly with genai_mod parameter
 _GeminiKeyPool = _GeminiKeyPoolBase  # alias for backward compat (tests)
 
-MAX_TOTAL  = 200   # hard cap on total companies in the sheet
+# PRJ-004 REQ-004-01: 6-track taxonomy at 500-company scale with per-bucket
+# quotas. Quotas constrain NEW discovery only — migrated survivors over quota
+# are grandfathered (D-12); a full bucket simply gets 0 new-discovery slots.
+MAX_TOTAL  = 500   # sum of TRACK_QUOTAS
 BATCH_SIZE = 50    # new companies to discover each run
+
+TRACK_VALUES = ("AI-native", "Mid-large Tech", "Robotics", "Fintech", "Space", "Defense")
+TRACK_QUOTAS = {"AI-native": 150, "Mid-large Tech": 150, "Robotics": 50,
+                "Fintech": 50, "Space": 50, "Defense": 50}
+VERTICAL_TRACKS = frozenset({"AI-native", "Robotics", "Fintech", "Space", "Defense"})
+
+# REQ-004-03: defense legacy primes are hard-excluded deterministically —
+# the exclusion must not depend on LLM compliance. Palantir is the explicit
+# allowlist exception to the early-company rule.
+DEFENSE_EXCLUDED_PRIMES = frozenset({
+    "boeing", "lockheed martin", "lockheed", "raytheon", "rtx",
+    "northrop grumman", "northrop", "general dynamics", "bae", "bae systems",
+    "l3harris", "l3 harris",
+})
+DEFENSE_ALLOWLIST = frozenset({"palantir", "palantir technologies"})
 
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
-AI_DOMAIN_VALUES = (
-    "Big Tech (AI Investment)",
-    "Consumer ML Tech",
-    "AI Startups",
-    "AI Infrastructure & Compute",
-    "Large Model Labs",
-    "Defense/Robotics AI",
-)
-
-
-class AICompanyInfo(BaseModel):
+class CompanyInfo(BaseModel):
     """Company info extracted by Gemini — NO career URL (found separately)."""
-    company_name:   str = Field(description="The official name of the AI company.")
-    ai_domain:      Literal[
-        "Big Tech (AI Investment)",
-        "Consumer ML Tech",
-        "AI Startups",
-        "AI Infrastructure & Compute",
-        "Large Model Labs",
-        "Defense/Robotics AI",
+    company_name:   str = Field(description="The official name of the company.")
+    track:          Literal[
+        "AI-native",
+        "Mid-large Tech",
+        "Robotics",
+        "Fintech",
+        "Space",
+        "Defense",
     ] = Field(
         description=(
-            "The category that best describes this company's role in the AI ecosystem. "
+            "The track bucket this company belongs to. "
             "Must be exactly one of the 6 listed values."
         )
     )
@@ -92,13 +100,29 @@ class AICompanyInfo(BaseModel):
         description=(
             "3-4 sentence description covering: (1) what the company builds or sells, "
             "(2) who their primary customers are, (3) their key differentiator or "
-            "competitive edge in the AI ecosystem, and (4) notable products, funding, "
-            "or market traction."
+            "competitive edge, and (4) notable products, funding, or market traction."
         )
     )
 
+# Deprecated alias (pre-PRJ-004 name) — kept so external references fail soft.
+AICompanyInfo = CompanyInfo
+
 class CompanyInfoList(BaseModel):
-    companies: list[AICompanyInfo] = Field(description="A list of discovered AI companies.")
+    companies: list[CompanyInfo] = Field(description="A list of discovered companies.")
+
+
+class TrackClassification(BaseModel):
+    """One row of the REQ-004-06 --migrate-tracks re-bucketing pass."""
+    company_name: str = Field(description="Company name exactly as given in the input list.")
+    track:        Literal[
+        "AI-native", "Mid-large Tech", "Robotics", "Fintech", "Space", "Defense",
+    ] = Field(description="The best-fit track bucket for this company.")
+    rationale:    str = Field(description="One sentence explaining the classification.")
+    confident:    bool = Field(description="False if the classification is a guess.")
+
+
+class TrackClassificationList(BaseModel):
+    classifications: list[TrackClassification]
 
 # ── ATS slug-validation config (Greenhouse + Lever only — public APIs) ────────
 ATS_VALIDATORS = [
@@ -180,40 +204,46 @@ KNOWN_CAREER_URLS = {
     "Hugging Face":    "https://apply.workable.com/huggingface/",
 }
 
-# ── Tavily search queries (weighted by target distribution) ────────────────────
+# ── Tavily search queries (PRJ-004: 6 tracks, biased to Seattle/CA/TX hiring) ──
 TAVILY_QUERIES = [
-    # ── Big Tech (AI Investment) — 25% ────────────────────────────────────────
+    # ── AI-native (labs, startups, infra) ─────────────────────────────────────
     (
-        "big tech AI division jobs 2026 Google Microsoft Amazon Meta Apple IBM Oracle Salesforce "
-        "AI investment hiring TPM product manager careers"
+        "frontier AI labs and AI startups hiring 2026 OpenAI Anthropic xAI Perplexity "
+        "Scale AI Glean Sierra careers technical program manager San Francisco Seattle"
     ),
     (
-        "traditional tech companies AI transformation 2026 Intel Qualcomm AMD Cisco Adobe "
-        "Salesforce ServiceNow Workday AI careers job openings"
+        "AI infrastructure compute GPU cloud 2026 CoreWeave Lambda Together AI Groq "
+        "Cerebras Crusoe Fireworks Modal careers hiring TPM California Texas"
     ),
-    # ── Consumer ML Tech — 20% (NEW) ──────────────────────────────────────────
+    # ── Mid-large tech (incl. early-bet divisions) ─────────────────────────────
     (
-        "consumer media tech ML AI 2026 Netflix Spotify Pinterest Disney Roblox eBay Snap "
-        "DoorDash Uber Lyft Airbnb LinkedIn Reddit machine learning hiring technical program manager"
-    ),
-    # ── AI Startups — 25% ─────────────────────────────────────────────────────
-    (
-        "top AI startups hiring 2026 North America Scale AI Cohere Adept Inflection Runway "
-        "Midjourney Character.ai Perplexity Hugging Face careers job openings"
+        "big tech new-bet divisions hiring TPM 2026 Amazon Kuiper Leo Azure Government "
+        "Google Cloud Meta Reality Labs Apple special projects careers Seattle Bay Area"
     ),
     (
-        "well-funded AI startups 2026 USA hiring TPM product manager Glean Harvey Writer "
-        "Jasper Tome Imbue Pika Labs Sierra careers"
+        "mid-size tech companies technical program manager hiring 2026 Databricks Snowflake "
+        "Uber Netflix Salesforce ServiceNow careers Seattle California Austin"
     ),
-    # ── AI Infra / Compute / GPU — 20% ────────────────────────────────────────
+    # ── Robotics ───────────────────────────────────────────────────────────────
     (
-        "AI infrastructure compute GPU cloud 2026 CoreWeave Lambda Labs Together AI Groq "
-        "Cerebras SambaNova Crusoe Fireworks Modal careers hiring"
+        "robotics companies hiring 2026 Figure AI Apptronik Physical Intelligence Zipline "
+        "Nuro Waymo Skild humanoid autonomy careers technical program manager California Texas"
     ),
-    # ── Large Model Labs — 10% ────────────────────────────────────────────────
+    # ── Fintech ────────────────────────────────────────────────────────────────
     (
-        "frontier AI research labs 2026 OpenAI Anthropic xAI Google DeepMind Mistral "
-        "Cohere Aleph Alpha careers hiring site:jobs.lever.co OR site:greenhouse.io"
+        "fintech companies hiring technical program manager 2026 Stripe Plaid Ramp Brex "
+        "Chime Affirm Block Coinbase careers San Francisco Seattle Austin"
+    ),
+    # ── Space ──────────────────────────────────────────────────────────────────
+    (
+        "space startups hiring 2026 SpaceX Relativity Stoke Space Rocket Lab Firefly "
+        "Astranis Varda True Anomaly careers program manager El Segundo Hawthorne Long Beach Seattle"
+    ),
+    # ── Defense ────────────────────────────────────────────────────────────────
+    (
+        "venture-backed defense tech companies hiring 2026 Anduril Shield AI Saronic "
+        "Castelion Epirus Vannevar Palantir careers technical program manager "
+        "El Segundo Costa Mesa Washington state Texas"
     ),
 ]
 
@@ -549,21 +579,89 @@ def _is_duplicate_company(
 
 
 # ── Company discovery ─────────────────────────────────────────────────────────
-def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> list:
+def compute_need_by_track(existing_rows: list) -> dict:
+    """PRJ-004 REQ-004-01: open discovery slots per bucket.
+
+    need[bucket] = max(0, quota - current_count) — a bucket at/over quota
+    (grandfathered survivors, D-12) gets 0 and is never trimmed. Rows whose
+    Track value is not one of the 6 buckets (unmigrated) count toward no
+    bucket; they are surfaced with a warning and resolved by --migrate-tracks.
     """
-    Discover up to `need` new AI companies not in `existing_names`.
-    Returns a list of dicts with keys: company_name, ai_domain, business_focus, career_url.
+    counts = {t: 0 for t in TRACK_VALUES}
+    unmigrated = 0
+    for row in existing_rows:
+        track = str(row[1] if len(row) > 1 else "").strip()
+        if track in counts:
+            counts[track] += 1
+        elif row and row[0]:
+            unmigrated += 1
+    if unmigrated:
+        logging.warning(f"[Track] {unmigrated} Company_List row(s) have an "
+                        "unmigrated Track value — run "
+                        "`python agents/company_agent.py --migrate-tracks`.")
+    return {t: max(0, TRACK_QUOTAS[t] - counts[t]) for t in TRACK_VALUES}
+
+
+def allocate_batch(need_by_track: dict, batch_size: int) -> dict:
+    """Allocate one run's discovery budget across open buckets, proportional
+    to open slots (largest-remainder rounding), capped at batch_size total."""
+    total_open = sum(need_by_track.values())
+    if total_open <= batch_size:
+        return dict(need_by_track)
+    shares = {t: n * batch_size / total_open for t, n in need_by_track.items()}
+    alloc  = {t: int(s) for t, s in shares.items()}
+    leftover = batch_size - sum(alloc.values())
+    for t in sorted(shares, key=lambda t: shares[t] - alloc[t], reverse=True):
+        if leftover <= 0:
+            break
+        if alloc[t] < need_by_track[t]:
+            alloc[t] += 1
+            leftover -= 1
+    return alloc
+
+
+def _apply_bucket_rules(companies: list, need_by_track: dict) -> list:
+    """PRJ-004 REQ-004-03 + quota trim, deterministic (never trust the LLM for
+    hard exclusions): drop Defense-bucket legacy primes (unless allowlisted),
+    and cap accepted companies per bucket at that bucket's open slots."""
+    remaining = dict(need_by_track)
+    out = []
+    for c in companies:
+        name  = _normalize_company_name(c.get("company_name", ""))
+        track = c.get("track", "")
+        if track == "Defense" and name in DEFENSE_EXCLUDED_PRIMES \
+                and name not in DEFENSE_ALLOWLIST:
+            logging.info(f"[BucketRules] Dropped defense legacy prime: {name}")
+            continue
+        if remaining.get(track, 0) <= 0:
+            logging.info(f"[BucketRules] Bucket {track!r} full — dropped {name}")
+            continue
+        remaining[track] -= 1
+        out.append(c)
+    return out
+
+
+def discover_ai_companies(tavily_key: str, existing_names: set,
+                          need_by_track: dict) -> list:
+    """
+    Discover new companies not in `existing_names`, up to each track's open
+    slots in `need_by_track` ({track: slots}). Returns a list of dicts with
+    keys: company_name, track, business_focus, career_url.
 
     Flow:
       1. Tavily batch search → raw article/news results
       2. Gemini extracts structured company info (NO URL generation)
-      3. Per-company multi-strategy career URL lookup
+      3. Deterministic bucket rules (defense prime exclusion, quota trim)
+      4. Per-company multi-strategy career URL lookup
     """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking discover_ai_companies()")
     from tavily import TavilyClient
 
-    logging.info(f"Searching for {need} new US AI companies (existing: {len(existing_names)})...")
+    need = sum(need_by_track.values())
+    logging.info(f"Searching for {need} new companies across "
+                 f"{sum(1 for v in need_by_track.values() if v)} open buckets "
+                 f"(existing: {len(existing_names)})...")
     client   = TavilyClient(api_key=tavily_key)
     raw, seen_urls = [], set()
 
@@ -590,39 +688,63 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
     # Step 2: Gemini extracts company info only — no URL generation
     existing_list = sorted(existing_names)[:150]
     logging.info("Feeding context to Gemini for company extraction (no URL generation)...")
+    _bucket_guidance = {
+        "AI-native": (
+            "AI-native companies of any size — frontier labs, AI product startups, "
+            "AI infrastructure/compute (OpenAI, Anthropic, xAI, Perplexity, Scale AI, "
+            "Glean, Sierra, CoreWeave, Groq, Together AI, Cerebras, etc.). Founded "
+            "~2000 or later. NO tiny pre-seed companies — real headcount and a "
+            "public job board."),
+        "Mid-large Tech": (
+            "established mid-large tech companies with strong TPM organizations, "
+            "especially those with early-bet divisions (Google, Microsoft, Amazon, "
+            "Meta, Apple, NVIDIA, Databricks, Snowflake, Uber, Netflix, Salesforce, "
+            "ServiceNow, etc.). No founding-year restriction — this is the only "
+            "bucket where legacy incumbents belong."),
+        "Robotics": (
+            "robotics companies founded ~2000 or later (Figure AI, Apptronik, "
+            "Physical Intelligence, Skild, Zipline, Nuro, Waymo, etc.). EXCLUDE "
+            "legacy incumbents (e.g. ABB, Boston Dynamics' parent conglomerates) — "
+            "those belong in Mid-large Tech if anywhere."),
+        "Fintech": (
+            "fintech companies founded ~2000 or later (Stripe, Plaid, Ramp, Brex, "
+            "Chime, Affirm, Block, Coinbase, etc.). EXCLUDE legacy incumbents "
+            "(Visa, PayPal, Intuit, Mastercard) — those belong in Mid-large Tech "
+            "if anywhere."),
+        "Space": (
+            "space companies founded ~2000 or later (SpaceX, Relativity Space, "
+            "Stoke Space, Rocket Lab, Firefly, Astranis, Varda, True Anomaly, "
+            "etc.) — prefer these over incumbent space divisions (ULA, Boeing "
+            "space)."),
+        "Defense": (
+            "venture-backed defense tech founded roughly 2010 or later (Anduril, "
+            "Shield AI, Saronic, Castelion, Epirus, Vannevar Labs, etc.). "
+            "Palantir IS in scope (explicit exception). NEVER include legacy "
+            "primes: Boeing, Lockheed Martin, Raytheon/RTX, Northrop Grumman, "
+            "General Dynamics, BAE, L3Harris."),
+    }
+    distribution = "\n".join(
+        f'  - "{track}": {n} companies — {_bucket_guidance[track]}'
+        for track, n in need_by_track.items() if n > 0
+    )
     config = types.GenerateContentConfig(
         system_instruction=(
-            "You are an expert AI industry analyst. From the web search context, "
-            f"extract exactly {need} distinct companies headquartered in the United States "
-            "that are NOT in the EXISTING_COMPANIES list. All five categories must be "
-            "companies that have substantial AI/ML engineering organizations and post "
-            "AI-relevant TPM roles.\n"
-            "Follow this category distribution strictly (use the EXACT label string for ai_domain):\n"
-            f"  - \"Big Tech (AI Investment)\": {round(need*0.23)} companies — large established "
-            "tech companies whose AI work is core strategy (NVIDIA, AMD, Intel, Qualcomm, Meta, "
-            "Microsoft, Google, Amazon, Apple, IBM, Oracle, Salesforce, Adobe, Databricks, "
-            "Snowflake, Palantir, Stripe, Cisco, ServiceNow, Workday, SAP, etc.)\n"
-            f"  - \"Consumer ML Tech\": {round(need*0.20)} companies — large consumer/media tech "
-            "with substantial ML organizations and AI-TPM hiring (Netflix, Spotify, Pinterest, "
-            "Disney, Roblox, eBay, Snap, DoorDash, Uber, Lyft, Airbnb, LinkedIn, Twitter/X, "
-            "Reddit, Yelp, Etsy, Wayfair, Instacart, etc.)\n"
-            f"  - \"AI Startups\": {round(need*0.22)} companies — well-funded AI-native startups "
-            "with real headcount and public job boards (Scale AI, Cohere, Glean, Harvey, Writer, "
-            "Sierra, Perplexity, Runway, etc.) — NO tiny pre-seed companies\n"
-            f"  - \"AI Infrastructure & Compute\": {round(need*0.20)} companies — GPU cloud, AI "
-            "compute, model serving, AI chip companies (CoreWeave, Lambda, Together AI, Groq, "
-            "Cerebras, SambaNova, Crusoe, Fireworks, Modal, etc.)\n"
-            f"  - \"Large Model Labs\": {round(need*0.10)} companies — frontier AI research labs "
-            "(OpenAI, Anthropic, xAI, DeepMind, Mistral, Cohere, etc.)\n"
-            f"  - \"Defense/Robotics AI\": {round(need*0.05)} companies — defense, aerospace, "
-            "humanoid robotics, and AI-physical-systems companies (Anduril, Shield AI, Saronic, "
-            "Figure AI, Apptronik, SpaceX, Neuralink, Blue Origin, etc.)\n"
-            "STRICTLY exclude non-US companies (Canadian, European, Asian).\n"
-            "The ai_domain field MUST be one of these 6 exact strings — do not invent variants "
-            "like \"Top AI Startups\" or \"AI\" or \"NLP\".\n"
-            "For business_focus: write 3-4 sentences covering what the company builds, "
-            "who their customers are, their key competitive differentiator, and notable "
-            "products/funding/traction.\n"
+            "You are an expert technology-industry analyst. From the web search "
+            f"context, extract exactly {need} distinct companies that are NOT in "
+            "the EXISTING_COMPANIES list. Every company must have a real TPM "
+            "(Technical Program Manager) hiring function.\n"
+            "GEOGRAPHY: a company qualifies if it HIRES TPMs in Greater Seattle, "
+            "California (Bay Area or Southern California — El Segundo, Hawthorne, "
+            "Long Beach, Irvine, San Diego), or Texas. Qualification is by hiring "
+            "footprint in these regions, NOT by HQ location.\n"
+            "Follow this bucket distribution strictly (use the EXACT label string "
+            "for the track field):\n"
+            f"{distribution}\n"
+            "The track field MUST be one of the 6 exact strings — do not invent "
+            "variants.\n"
+            "For business_focus: write 3-4 sentences covering what the company "
+            "builds, who their customers are, their key competitive differentiator, "
+            "and notable products/funding/traction.\n"
             "DO NOT include any career_url or URL fields — URLs are handled separately."
         ),
         temperature=0.1,
@@ -632,8 +754,8 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
     prompt = (
         f"Search context:\n{json.dumps(results)}\n\n"
         f"EXISTING_COMPANIES (DO NOT include these):\n{json.dumps(existing_list)}\n\n"
-        f"Extract exactly {need} NEW US-headquartered companies with: company_name, "
-        f"ai_domain (one of: {' / '.join(AI_DOMAIN_VALUES)}), "
+        f"Extract exactly {need} NEW companies with: company_name, "
+        f"track (one of: {' / '.join(TRACK_VALUES)}), "
         "business_focus (3-4 sentences)."
     )
     try:
@@ -660,6 +782,12 @@ def discover_ai_companies(tavily_key: str, existing_names: set, need: int) -> li
         existing_normalized.add(_normalize_company_name(name))
         filtered.append(c)
     logging.info(f"After dedup filter: {len(filtered)} new companies.")
+
+    # Step 2.5: deterministic bucket rules (defense prime exclusion + quota
+    # trim) BEFORE career-URL discovery, so excluded companies never spend
+    # Tavily/validation calls.
+    filtered = _apply_bucket_rules(filtered, need_by_track)
+    logging.info(f"After bucket rules: {len(filtered)} companies.")
 
     # Step 3: Per-company career URL discovery
     validated = []
@@ -856,21 +984,27 @@ def main():
         print(f"📋 Companies in Company_Without_TPM: {len(names_without_tpm)}")
         print(f"📋 Total known companies (dedup exclusion list): {len(existing_names)}")
 
-        # ── Step 2: Determine how many to fetch ───────────────────────────────────
-        if current_count >= MAX_TOTAL:
-            print(f"✅ Already at max capacity ({MAX_TOTAL} companies). Skipping discovery.")
-            summary.note(f"At capacity ({MAX_TOTAL}); discovery skipped.")
+        # ── Step 2: Per-bucket slot accounting (PRJ-004 REQ-004-01 / D-12) ────────
+        # Count existing rows per Track value; a bucket at/over quota (e.g.
+        # grandfathered migration survivors) gets 0 new-discovery slots and is
+        # never trimmed. The per-run total stays capped at BATCH_SIZE,
+        # allocated across open buckets proportionally to their open slots.
+        need_by_track = compute_need_by_track(existing_rows)
+        total_open = sum(need_by_track.values())
+        if total_open <= 0:
+            print(f"✅ All buckets at quota ({MAX_TOTAL} companies). Skipping discovery.")
+            summary.note(f"All buckets at quota; discovery skipped.")
         else:
-            slots_left = MAX_TOTAL - current_count
-            need       = min(BATCH_SIZE, slots_left)
-            print(f"🔍 Will discover up to {need} new companies "
-                  f"(cap: {MAX_TOTAL}, current: {current_count})...")
+            need_by_track = allocate_batch(need_by_track, BATCH_SIZE)
+            need = sum(need_by_track.values())
+            open_desc = ", ".join(f"{t}: {n}" for t, n in need_by_track.items() if n)
+            print(f"🔍 Will discover up to {need} new companies this run "
+                  f"({open_desc}; total open slots: {total_open})...")
             summary.attempted = need
 
-            companies = discover_ai_companies(tavily_key, existing_names, need)
+            companies = discover_ai_companies(tavily_key, existing_names, need_by_track)
 
             if companies:
-                companies = companies[:need]
                 data = [c.model_dump() if hasattr(c, "model_dump") else dict(c)
                         for c in companies]
                 upsert_companies(xlsx_path, data)
