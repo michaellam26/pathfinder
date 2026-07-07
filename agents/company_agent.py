@@ -44,7 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.excel_store import (
     EXCEL_PATH, get_or_create_excel, count_company_rows,
     get_company_rows, get_company_rows_with_row_num, upsert_companies,
-    update_company_career_url, get_company_names_without_tpm,
+    update_company_career_url, update_company_track,
+    get_company_names_without_tpm,
 )
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.config import MODEL
@@ -1036,5 +1037,134 @@ def main():
         print(summary.to_json())
 
 
+def migrate_tracks(xlsx_path: str | None = None) -> dict:
+    """PRJ-004 REQ-004-06: one-time re-bucketing of existing Company_List rows
+    into the 6-track taxonomy via a Gemini classification pass.
+
+    Precondition (user-owned): the user has manually pruned Company_List.
+    Idempotent — rows whose Track is already one of the 6 values are skipped,
+    so a partial failure can simply be re-run. Nothing is ever deleted:
+    unconfident classifications get 'UNMIGRATED — manual review' and defense
+    legacy primes are deterministically forced to Mid-large Tech (a prime can
+    survive only there). Prints a full audit table for the user spot-check.
+
+    Returns {"migrated": n, "skipped": n, "flagged": n} for tests/reporting.
+    """
+    global _KEY_POOL
+    gemini_keys = [k for k in [os.getenv("GEMINI_API_KEY"),
+                               os.getenv("GEMINI_API_KEY_2")] if k]
+    if not gemini_keys:
+        print("❌ Missing GEMINI_API_KEY in .env")
+        return {"migrated": 0, "skipped": 0, "flagged": 0}
+    if _KEY_POOL is None:
+        _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
+
+    xlsx_path = xlsx_path or get_or_create_excel()  # header renames self-heal here
+    rows = get_company_rows_with_row_num(xlsx_path)
+    pending = []   # (excel_row, name, old_value, business_focus)
+    skipped = 0
+    for excel_row, row in rows:
+        name  = str(row[0]).strip() if row and row[0] else ""
+        track = str(row[1]).strip() if len(row) > 1 else ""
+        focus = str(row[2]).strip() if len(row) > 2 else ""
+        if not name:
+            continue
+        if track in TRACK_VALUES:
+            skipped += 1
+            continue
+        pending.append((excel_row, name, track, focus))
+
+    print(f"🔀 Track migration: {len(pending)} row(s) to classify, "
+          f"{skipped} already migrated (skipped).")
+    if not pending:
+        return {"migrated": 0, "skipped": skipped, "flagged": 0}
+
+    system_instruction = (
+        "You classify companies into exactly one of 6 track buckets for a "
+        "TPM job-search pipeline. Buckets:\n"
+        '  - "AI-native": AI labs / AI product startups / AI infra-compute, founded ~2000+\n'
+        '  - "Mid-large Tech": established mid-large tech companies (the only bucket '
+        "where legacy incumbents belong, e.g. Boeing, Visa, PayPal, Intuit)\n"
+        '  - "Robotics": robotics companies founded ~2000+\n'
+        '  - "Fintech": fintech companies founded ~2000+\n'
+        '  - "Space": space companies founded ~2000+\n'
+        '  - "Defense": venture-backed defense tech founded roughly 2010+. Palantir '
+        "belongs here (explicit exception). Legacy primes (Boeing, Lockheed Martin, "
+        "Raytheon/RTX, Northrop Grumman, General Dynamics, BAE, L3Harris) NEVER "
+        "belong here — classify them as Mid-large Tech.\n"
+        "Return one TrackClassification per input company, company_name copied "
+        "verbatim. Set confident=false when the business description is too thin "
+        "to decide — do not guess."
+    )
+
+    migrated, flagged = 0, 0
+    audit: list[tuple] = []
+    tally: dict = {}
+    BATCH = 25
+    for b in range(0, len(pending), BATCH):
+        chunk = pending[b : b + BATCH]
+        payload = json.dumps([{"company_name": n, "business_focus": f[:600]}
+                              for _, n, _, f in chunk])
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.0,
+            response_mime_type="application/json",
+            response_schema=TrackClassificationList,
+        )
+        try:
+            resp = _KEY_POOL.generate_content(
+                model=MODEL,
+                contents=f"Classify these companies:\n{payload}",
+                config=config,
+            )
+            results = {c.get("company_name", "").strip(): c
+                       for c in json.loads(resp.text).get("classifications", [])}
+        except Exception as e:
+            logging.error(f"[Migrate] batch {b // BATCH + 1} failed: {e} — "
+                          "rows left unmigrated; re-run to retry.")
+            results = {}
+        for excel_row, name, old_value, _focus in chunk:
+            r = results.get(name)
+            if r is None:
+                new_track, rationale = "UNMIGRATED — manual review", "no classification returned"
+            elif _normalize_company_name(name) in DEFENSE_EXCLUDED_PRIMES:
+                # Deterministic: a prime can survive only in Mid-large Tech.
+                new_track, rationale = "Mid-large Tech", "defense legacy prime (forced)"
+            elif not r.get("confident", False):
+                new_track, rationale = "UNMIGRATED — manual review", r.get("rationale", "unconfident")
+            else:
+                new_track, rationale = r["track"], r.get("rationale", "")
+            update_company_track(xlsx_path, excel_row, new_track)
+            audit.append((name, old_value, new_track, rationale))
+            if new_track in TRACK_VALUES:
+                migrated += 1
+                tally[new_track] = tally.get(new_track, 0) + 1
+            else:
+                flagged += 1
+        time.sleep(0.5)
+
+    print("\n── Migration audit (spot-check me) ─────────────────────────────")
+    for name, old, new, why in audit:
+        print(f"  {name}: {old or '(blank)'} → {new}   [{why}]")
+    print("\n── Per-bucket tally ─────────────────────────────────────────────")
+    for track in TRACK_VALUES:
+        print(f"  {track}: +{tally.get(track, 0)}")
+    if flagged:
+        print(f"  ⚠️  UNMIGRATED — manual review: {flagged} row(s)")
+    print(f"\n✅ Migrated {migrated}, flagged {flagged}, already-done {skipped}. "
+          "Re-run after fixing flagged rows — the pass is idempotent.")
+    return {"migrated": migrated, "skipped": skipped, "flagged": flagged}
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="PathFinder company agent")
+    parser.add_argument("--migrate-tracks", action="store_true",
+                        help="One-time PRJ-004 re-bucketing of Company_List "
+                             "into the 6-track taxonomy (REQ-004-06). "
+                             "Run AFTER manually pruning Company_List.")
+    args = parser.parse_args()
+    if args.migrate_tracks:
+        migrate_tracks()
+    else:
+        main()

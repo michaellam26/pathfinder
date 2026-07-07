@@ -1135,6 +1135,125 @@ class TestApplyBucketRules(unittest.TestCase):
         self.assertNotIn("SpaceCo", names)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T4 — --migrate-tracks re-bucketing pass (REQ-004-06)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestMigrateTracks(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        from shared.excel_store import get_or_create_excel, upsert_companies
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        self._orig_pool = company_agent_mod._KEY_POOL
+
+    def tearDown(self):
+        company_agent_mod._KEY_POOL = self._orig_pool
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _seed(self, rows):
+        """rows: [(name, track_value)]"""
+        from shared.excel_store import upsert_companies
+        upsert_companies(self.path, [
+            {"company_name": n, "track": t, "business_focus": f"{n} does things.",
+             "career_url": f"https://{n.lower()}.com/careers"}
+            for n, t in rows
+        ])
+
+    @staticmethod
+    def _pool_returning(classifications):
+        import json
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = json.dumps({"classifications": classifications})
+        pool.generate_content.return_value = resp
+        return pool
+
+    def _tracks(self):
+        from shared.excel_store import get_company_rows
+        return {r[0]: r[1] for r in get_company_rows(self.path)}
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_already_migrated_rows_skipped_idempotent(self):
+        self._seed([("DoneCo", "Space"), ("OldCo", "AI Startups")])
+        company_agent_mod._KEY_POOL = self._pool_returning([
+            {"company_name": "OldCo", "track": "AI-native",
+             "rationale": "AI product startup", "confident": True},
+        ])
+        out = company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(out, {"migrated": 1, "skipped": 1, "flagged": 0})
+        # Gemini saw only the unmigrated row
+        sent = company_agent_mod._KEY_POOL.generate_content.call_args.kwargs["contents"]
+        self.assertIn("OldCo", sent)
+        self.assertNotIn("DoneCo", sent)
+        self.assertEqual(self._tracks()["OldCo"], "AI-native")
+        self.assertEqual(self._tracks()["DoneCo"], "Space")
+        # Second run: nothing left to do
+        out2 = company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(out2["migrated"], 0)
+        self.assertEqual(out2["skipped"], 2)
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_unconfident_flagged_never_guessed(self):
+        self._seed([("MysteryCo", "Legacy Bucket")])
+        company_agent_mod._KEY_POOL = self._pool_returning([
+            {"company_name": "MysteryCo", "track": "Fintech",
+             "rationale": "thin description", "confident": False},
+        ])
+        out = company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(out["flagged"], 1)
+        self.assertEqual(self._tracks()["MysteryCo"], "UNMIGRATED — manual review")
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_defense_prime_forced_to_midlarge(self):
+        """Deterministic post-check: even if the LLM says Defense, a legacy
+        prime can only survive in Mid-large Tech."""
+        self._seed([("Lockheed Martin", "Defense/Robotics AI")])
+        company_agent_mod._KEY_POOL = self._pool_returning([
+            {"company_name": "Lockheed Martin", "track": "Defense",
+             "rationale": "defense company", "confident": True},
+        ])
+        company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(self._tracks()["Lockheed Martin"], "Mid-large Tech")
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_no_rows_deleted_and_batch_failure_leaves_unmigrated(self):
+        self._seed([("ACo", "old"), ("BCo", "old")])
+        pool = MagicMock()
+        pool.generate_content.side_effect = Exception("boom")
+        company_agent_mod._KEY_POOL = pool
+        out = company_agent_mod.migrate_tracks(self.path)
+        tracks = self._tracks()
+        # Both rows still present (never deleted), flagged for manual review.
+        self.assertEqual(set(tracks.keys()), {"ACo", "BCo"})
+        self.assertEqual(out["flagged"], 2)
+
+
+class TestUpdateCompanyTrack(unittest.TestCase):
+
+    def test_writes_track_in_place(self):
+        import tempfile
+        from shared.excel_store import (get_or_create_excel, upsert_companies,
+                                        get_company_rows, update_company_track)
+        fd, path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(path)
+        try:
+            get_or_create_excel(path)
+            upsert_companies(path, [{"company_name": "TrackCo", "track": "old",
+                                     "business_focus": "x", "career_url": "u"}])
+            update_company_track(path, 2, "Robotics")
+            rows = get_company_rows(path)
+            self.assertEqual(rows[0][1], "Robotics")
+            self.assertEqual(rows[0][0], "TrackCo")  # nothing else touched
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     unittest.main(verbosity=2)

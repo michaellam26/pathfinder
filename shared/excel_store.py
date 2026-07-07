@@ -355,6 +355,18 @@ def update_company_career_url(xlsx_path: str, excel_row: int, new_url: str):
         wb.close()
 
 
+def update_company_track(xlsx_path: str, excel_row: int, track: str):
+    """PRJ-004 REQ-004-06: write the Track column (col 2) for one row in place.
+    excel_row is the actual 1-based Excel row number (2 = first data row)."""
+    wb = load_workbook(xlsx_path)
+    try:
+        ws = wb["Company_List"]
+        ws.cell(excel_row, 2, track)
+        wb.save(xlsx_path)
+    finally:
+        wb.close()
+
+
 # ── Archive helpers (REQ-063) ────────────────────────────────────────────────
 def get_archived_companies(xlsx_path: str = EXCEL_PATH) -> set:
     """Return set of company names where Auto Archived == 'yes'."""
