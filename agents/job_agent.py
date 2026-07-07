@@ -266,6 +266,19 @@ ATS_PLATFORMS = {
         "list_fn":            "_fetch_workday_jobs",
         "jd_fn":              "_scrape_workday_jd",
     },
+    # PRJ-004 REQ-004-17 (G6b): Amazon.jobs public JSON search endpoint —
+    # replaces the chronically-failing generic browser-crawl path. search.json
+    # returns full JD text, so candidates carry _prefetched_md and never touch
+    # Firecrawl or the crawler. Same undocumented-API risk class as Workday/
+    # Ashby (R-09); adapter failure falls back to the crawler path as before.
+    "amazon": {
+        "domains":            ["amazon.jobs"],
+        "board_url_template": None,
+        "slug_pattern":       r"(amazon\.jobs)",
+        "strategy":           "json_api",
+        "list_fn":            "_fetch_amazon_jobs",
+        "jd_fn":              None,
+    },
     "google": {
         "domains":            [],  # Google has no ATS board URLs for discovery
         "jd_domains":         ["careers.google.com", "google.com/about/careers"],
@@ -490,6 +503,8 @@ def _parse_iso_date(value) -> str:
             return s[:10]
         if s.isdigit():  # epoch ms as string
             return datetime.fromtimestamp(int(s) / 1000).strftime("%Y-%m-%d")
+        # Amazon.jobs style: "July 1, 2026"
+        return datetime.strptime(s, "%B %d, %Y").strftime("%Y-%m-%d")
     except (ValueError, OSError, OverflowError):
         pass
     return ""
@@ -910,6 +925,63 @@ def _merge_filter(batches: list) -> list:
             and (any(k in l["url"].lower() for k in URL_KW)
                  or any(k in l.get("title","").lower() for k in TITLE_KW))]
 
+def _fetch_amazon_jobs(career_url: str) -> list:
+    """PRJ-004 REQ-004-17 (G6b): fetch TPM jobs from Amazon.jobs' public JSON
+    search endpoint, paginated (no artificial cap, REQ-004-13). search.json
+    returns titles, locations, posting dates AND full JD text, so each
+    candidate carries `_prefetched_md` — zero browser/Firecrawl calls and no
+    generic-crawler fallback for Amazon JDs."""
+    results, offset = [], 0
+    _PAGE, _MAX_PAGES = 100, 50  # runaway guard: 5,000 postings
+    for _page in range(_MAX_PAGES):
+        api_url = ("https://www.amazon.jobs/en/search.json"
+                   "?base_query=technical+program+manager&country=USA"
+                   f"&result_limit={_PAGE}&offset={offset}")
+        logging.info(f"[Amazon API] GET offset={offset}")
+        r = _http_request_with_retry("GET", api_url, timeout=12,
+                                     headers={"User-Agent": "PathFinder/1.0"})
+        if r is None:
+            break
+        if r.status_code != 200:
+            logging.warning(f"[Amazon API] {r.status_code} for {api_url}")
+            break
+        try:
+            data  = r.json()
+            jobs  = data.get("jobs", [])
+            total = data.get("hits")
+        except (ValueError, KeyError, TypeError) as e:
+            logging.error(f"[Amazon API] parse error: {type(e).__name__}: {e}")
+            break
+        for job in jobs:
+            title = (job.get("title") or "").strip()
+            path  = (job.get("job_path") or "").strip()
+            url   = f"https://www.amazon.jobs{path}" if path else ""
+            loc   = job.get("normalized_location") or job.get("location") or ""
+            if isinstance(loc, list):
+                loc = "; ".join(str(x) for x in loc)
+            if not (url and title):
+                continue
+            md_parts = [f"# {title}", "**Company:** Amazon",
+                        f"**Location:** {loc}"]
+            for label, key in (("Description", "description"),
+                               ("Basic Qualifications", "basic_qualifications"),
+                               ("Preferred Qualifications", "preferred_qualifications")):
+                v = job.get(key)
+                if v:
+                    md_parts.append(f"## {label}\n{v}")
+            results.append({"url": url, "title": title, "location": str(loc),
+                            "posted_date": _parse_iso_date(job.get("posted_date")),
+                            "_prefetched_md": "\n\n".join(md_parts),
+                            "_platform": "Amazon"})
+        offset += _PAGE
+        if len(jobs) < _PAGE:
+            break
+        if isinstance(total, int) and offset >= total:
+            break
+    logging.info(f"[Amazon API] {len(results)} postings total")
+    return results
+
+
 # ── Job discovery helpers (routing table lookup) ─────────────────────────────
 def _resolve_list_fn(fn_name: str):
     """Resolve a list_fn name string to the actual callable."""
@@ -918,6 +990,7 @@ def _resolve_list_fn(fn_name: str):
         "_fetch_ashby_jobs":    _fetch_ashby_jobs,
         "_fetch_workable_jobs": _fetch_workable_jobs,
         "_fetch_workday_jobs":  _fetch_workday_jobs,
+        "_fetch_amazon_jobs":   _fetch_amazon_jobs,
     }[fn_name]
 
 
@@ -1776,10 +1849,20 @@ _JD_FN_REGISTRY = {
 }
 
 # ── Shared scraper routing & JD processing pipeline ──────────────────────────
-async def _route_scraper(url: str, fc_key: str, crawler, workday_meta: dict | None = None) -> tuple[str, str]:
-    """Route URL to the appropriate scraper.  Returns (markdown, label)."""
+async def _route_scraper(url: str, fc_key: str, crawler, list_meta: dict | None = None) -> tuple[str, str]:
+    """Route URL to the appropriate scraper.  Returns (markdown, label).
+
+    list_meta (PRJ-004): per-URL metadata from the list-API phase — carries
+    prefetched JD markdown (Amazon) and the Workday marker; generalizes the
+    pre-PRJ-004 workday_meta parameter."""
+    meta = (list_meta or {}).get(url) or {}
+    # Priority 0 (REQ-004-17/G6b): JD text already came with the list API —
+    # zero additional calls, never falls to the generic crawler.
+    if meta.get("_prefetched_md"):
+        return meta["_prefetched_md"], meta.get("_platform", "prefetched")
+
     # Priority 1: Workday discovery metadata (no browser fallback)
-    if workday_meta is not None and url in workday_meta:
+    if meta.get("_workday"):
         return _scrape_workday_jd(url), "Workday"
 
     # Priority 2: Greenhouse-embedded (e.g. CoreWeave ?gh_jid=...), then browser
@@ -2005,8 +2088,7 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
     # PRJ-004 REQ-004-10: generalize the Workday-only prefetch lookup into
     # list-level metadata for ALL platforms — carries posted_date (and, for
     # adapters like Amazon, prefetched JD markdown).
-    list_meta    = {l["url"]: l for l in raw if l.get("url")}
-    workday_meta = {u: l for u, l in list_meta.items() if l.get("_workday")}
+    list_meta = {l["url"]: l for l in raw if l.get("url")}
 
     fresh_set = {u for u, m in known_url_meta.items() if m["age_days"] < FRESH_DAYS}
     stale_set = {u for u, m in known_url_meta.items() if m["age_days"] >= FRESH_DAYS}
@@ -2052,7 +2134,7 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
                 return
             seen_urls.add(url)
             print(f"      🕷️  {url}")
-            markdown, label = await _route_scraper(url, fc_key, crawler, workday_meta)
+            markdown, label = await _route_scraper(url, fc_key, crawler, list_meta)
         if not markdown:
             tag = "Scrape" if label == "generic" else label
             logging.warning(f"[{tag}] Empty {'markdown' if label == 'generic' else 'JD'} for {url}")

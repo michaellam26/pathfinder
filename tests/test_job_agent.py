@@ -2430,5 +2430,115 @@ class TestBackfillPostedDate(unittest.TestCase):
         self.assertEqual(jm._backfill_posted_date("Co", "TPM"), "")
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T14 — Amazon.jobs adapter (REQ-004-17, G6b) + T15 Tesla regression
+# ═════════════════════════════════════════════════════════════════════════════
+class TestAmazonAdapter(unittest.TestCase):
+
+    @staticmethod
+    def _page(n, start=0, total=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "jobs": [
+                {"title": f"Sr. Technical Program Manager {start + i}",
+                 "job_path": f"/en/jobs/{start + i}/sr-tpm",
+                 "normalized_location": "Seattle, Washington",
+                 "posted_date": "July 1, 2026",
+                 "description": "Own programs across Kuiper.",
+                 "basic_qualifications": "5+ years of program management",
+                 "preferred_qualifications": "Hardware program experience"}
+                for i in range(n)
+            ],
+            **({"hits": total} if total is not None else {}),
+        }
+        return resp
+
+    def test_registered_in_platforms_and_registry(self):
+        from agents.job_agent import ATS_PLATFORMS, _resolve_list_fn, ALL_ATS
+        self.assertIn("amazon", ATS_PLATFORMS)
+        self.assertIn("amazon.jobs", ATS_PLATFORMS["amazon"]["domains"])
+        self.assertEqual(ATS_PLATFORMS["amazon"]["strategy"], "json_api")
+        self.assertTrue(callable(_resolve_list_fn("_fetch_amazon_jobs")))
+        # ATS-trusted path: amazon.jobs is in ALL_ATS so process_company
+        # takes Path A, not the crawler.
+        self.assertIn("amazon.jobs", ALL_ATS)
+
+    def test_fetch_maps_fields_and_prefetches_jd(self):
+        from agents.job_agent import _fetch_amazon_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(2)]):
+            results = _fetch_amazon_jobs("https://www.amazon.jobs/")
+        self.assertEqual(len(results), 2)
+        r = results[0]
+        self.assertTrue(r["url"].startswith("https://www.amazon.jobs/en/jobs/"))
+        self.assertEqual(r["location"], "Seattle, Washington")
+        self.assertEqual(r["posted_date"], "2026-07-01")  # "July 1, 2026" parsed
+        self.assertIn("Basic Qualifications", r["_prefetched_md"])
+        self.assertIn("Kuiper", r["_prefetched_md"])
+        self.assertEqual(r["_platform"], "Amazon")
+
+    def test_paginates(self):
+        from agents.job_agent import _fetch_amazon_jobs
+        pages = [self._page(100, 0, total=130), self._page(30, 100, total=130)]
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=pages) as mock_http:
+            results = _fetch_amazon_jobs("https://www.amazon.jobs/")
+        self.assertEqual(len(results), 130)
+        self.assertEqual(mock_http.call_count, 2)
+
+
+class TestRouteScraperPrefetch(unittest.IsolatedAsyncioTestCase):
+    """G6b: prefetched JD markdown short-circuits routing — zero crawler calls."""
+
+    async def test_prefetched_md_wins_priority_zero(self):
+        from agents.job_agent import _route_scraper
+        list_meta = {"https://www.amazon.jobs/en/jobs/1/tpm": {
+            "_prefetched_md": "# Sr TPM\nJD body", "_platform": "Amazon"}}
+        with patch("agents.job_agent.scrape_jd") as mock_crawl:
+            md, label = await _route_scraper(
+                "https://www.amazon.jobs/en/jobs/1/tpm", "fc", MagicMock(),
+                list_meta)
+        self.assertEqual(md, "# Sr TPM\nJD body")
+        self.assertEqual(label, "Amazon")
+        mock_crawl.assert_not_called()
+
+    async def test_workday_meta_still_routes(self):
+        from agents.job_agent import _route_scraper
+        list_meta = {"https://co.myworkdayjobs.com/x/job/1": {"_workday": True}}
+        with patch("agents.job_agent._scrape_workday_jd",
+                   return_value="# WD JD") as mock_wd:
+            md, label = await _route_scraper(
+                "https://co.myworkdayjobs.com/x/job/1", "fc", MagicMock(),
+                list_meta)
+        self.assertEqual((md, label), ("# WD JD", "Workday"))
+        mock_wd.assert_called_once()
+
+
+class TestTeslaRegression(unittest.TestCase):
+    """PRJ-004 T15 (REQ-004-20): the Tesla custom scraper stays wired and its
+    output shape survives the new schema — verification, not a rebuild."""
+
+    def test_tesla_still_registered(self):
+        from agents.job_agent import ATS_PLATFORMS, _JD_FN_REGISTRY
+        self.assertEqual(ATS_PLATFORMS["tesla"]["jd_fn"], "_scrape_tesla_jd")
+        self.assertIn("tesla.com/careers", ATS_PLATFORMS["tesla"]["jd_domains"])
+        self.assertIn("_scrape_tesla_jd", _JD_FN_REGISTRY)
+
+    def test_extracted_tesla_jd_defaults_pass_schema(self):
+        """A Tesla JD extracted without PRJ-004 fields still validates —
+        defaults route it to keep+flag paths, never a crash."""
+        from agents.job_agent import JobDetails
+        obj = JobDetails(
+            job_title="Technical Program Manager, Energy",
+            company="Tesla", location="Palo Alto, CA", salary_range="",
+            requirements=["5+ years"], additional_qualifications=[],
+            key_responsibilities=["Deliver"],
+        )
+        self.assertEqual(obj.work_auth, "none_stated")   # kept by gate 3
+        self.assertEqual(obj.posted_date, "")            # keep + Date Flag
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
