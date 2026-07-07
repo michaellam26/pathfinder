@@ -882,5 +882,109 @@ class TestSelectFineCandidates(unittest.TestCase):
         self.assertEqual(stats_hi["threshold_count"], 1)
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T11 — per-track prompt routing + per-track context caches (REQ-004-22)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestPerTrackRouting(unittest.TestCase):
+
+    def setUp(self):
+        import agents.match_agent as ma
+        self._orig_pool = ma._KEY_POOL
+        self._orig_caches = dict(ma._FINE_CACHE_NAMES)
+        ma._FINE_CACHE_NAMES.clear()
+
+    def tearDown(self):
+        import agents.match_agent as ma
+        ma._KEY_POOL = self._orig_pool
+        ma._FINE_CACHE_NAMES.clear()
+        ma._FINE_CACHE_NAMES.update(self._orig_caches)
+
+    def _capture_pool(self):
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = '{"compatibility_score": 50, "key_strengths": [], "critical_gaps": [], "recommendation_reason": "x"}'
+        pool.generate_content.return_value = resp
+        return pool
+
+    def test_evaluate_match_routes_hm_prompt_by_track(self):
+        """The uncached path must use the track's own HM prompt — the SAME
+        object shared/prompts exposes (byte-identity guarantee, REQ-052)."""
+        import agents.match_agent as ma
+        from shared.prompts import HM_PROMPTS
+        ma._KEY_POOL = self._capture_pool()
+        ma.types.GenerateContentConfig.reset_mock()
+        ma.evaluate_match("resume text", '{"job_title": "TPM"}', "Space")
+        cfg_kwargs = ma.types.GenerateContentConfig.call_args.kwargs
+        self.assertIs(cfg_kwargs["system_instruction"], HM_PROMPTS["Space"])
+
+    def test_evaluate_match_uses_track_cache_when_present(self):
+        import agents.match_agent as ma
+        ma._KEY_POOL = self._capture_pool()
+        ma._FINE_CACHE_NAMES["Space"] = "caches/space-123"
+        ma.types.GenerateContentConfig.reset_mock()
+        ma.evaluate_match("resume text", "{}", "Space")
+        cfg_kwargs = ma.types.GenerateContentConfig.call_args.kwargs
+        self.assertEqual(cfg_kwargs["cached_content"], "caches/space-123")
+        self.assertNotIn("system_instruction", cfg_kwargs)
+
+    def test_evaluate_match_other_track_misses_cache(self):
+        """A cache for one track must never serve another track's JDs."""
+        import agents.match_agent as ma
+        from shared.prompts import HM_PROMPTS
+        ma._KEY_POOL = self._capture_pool()
+        ma._FINE_CACHE_NAMES["Space"] = "caches/space-123"
+        ma.types.GenerateContentConfig.reset_mock()
+        ma.evaluate_match("resume text", "{}", "Fintech")
+        cfg_kwargs = ma.types.GenerateContentConfig.call_args.kwargs
+        self.assertIs(cfg_kwargs["system_instruction"], HM_PROMPTS["Fintech"])
+        self.assertNotIn("cached_content", cfg_kwargs)
+
+    def test_batch_coarse_score_routes_recruiter_prompt_by_track(self):
+        import agents.match_agent as ma
+        from shared.prompts import RECRUITER_PROMPTS
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = '{"items": [{"index": 0, "score": 42}]}'
+        pool.generate_content.return_value = resp
+        ma._KEY_POOL = pool
+        jd = {"url": "https://x.co/1", "jd_json": "{}", "job_domain": "Robotics"}
+        ma.types.GenerateContentConfig.reset_mock()
+        scores = ma.batch_coarse_score("resume", [jd], "Robotics")
+        cfg_kwargs = ma.types.GenerateContentConfig.call_args.kwargs
+        self.assertIs(cfg_kwargs["system_instruction"], RECRUITER_PROMPTS["Robotics"])
+        self.assertEqual(scores, [42])
+
+
+class TestTrackBatches(unittest.TestCase):
+    """Stage-1 batches must never mix tracks (one system prompt per call)."""
+
+    @staticmethod
+    def _jd(i, domain):
+        return {"url": f"https://x.co/{domain}/{i}", "jd_json": "{}",
+                "job_domain": domain}
+
+    def test_batches_never_mix_tracks(self):
+        from agents.match_agent import _track_batches
+        jds = ([self._jd(i, "AI") for i in range(12)]
+               + [self._jd(i, "Space") for i in range(5)]
+               + [self._jd(i, "Fintech") for i in range(1)])
+        batches = _track_batches(jds)
+        for track, batch in batches:
+            self.assertLessEqual(len(batch), 10)
+            self.assertEqual({jd["job_domain"] for jd in batch}, {track})
+        # 12 AI → 2 batches; 5 Space → 1; 1 Fintech → 1
+        self.assertEqual(len(batches), 4)
+        # Every JD appears exactly once
+        all_urls = [jd["url"] for _, b in batches for jd in b]
+        self.assertEqual(len(all_urls), len(set(all_urls)))
+        self.assertEqual(len(all_urls), 18)
+
+    def test_missing_domain_defaults_to_ai(self):
+        from agents.match_agent import _track_batches
+        batches = _track_batches([{"url": "u", "jd_json": "{}"}])
+        self.assertEqual(batches[0][0], "AI")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
