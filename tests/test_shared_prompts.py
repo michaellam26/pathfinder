@@ -35,17 +35,29 @@ import agents.resume_optimizer as optimizer_mod
 class TestPromptSingleSource(unittest.TestCase):
     """Both agents must refer to the SAME prompt object (is, not ==)."""
 
-    def test_fine_prompt_is_shared_singleton(self):
-        # Whatever match_agent's module-level reference to FINE_SYSTEM_PROMPT
-        # resolves to, it must be the shared.prompts.FINE_SYSTEM_PROMPT object.
-        self.assertIs(match_mod.FINE_SYSTEM_PROMPT, prompts.FINE_SYSTEM_PROMPT)
-        self.assertIs(optimizer_mod.FINE_SYSTEM_PROMPT, prompts.FINE_SYSTEM_PROMPT)
+    def test_hm_prompts_are_shared_singletons(self):
+        # PRJ-004: both agents resolve the HM prompt via the SAME accessor and
+        # dict objects from shared.prompts — per-track byte identity (REQ-052).
+        self.assertIs(match_mod.get_prompt_pair, prompts.get_prompt_pair)
+        self.assertIs(optimizer_mod.get_prompt_pair, prompts.get_prompt_pair)
+        self.assertIs(match_mod.HM_PROMPTS, prompts.HM_PROMPTS)
 
-    def test_match_and_optimizer_share_same_fine_prompt_object(self):
-        self.assertIs(match_mod.FINE_SYSTEM_PROMPT, optimizer_mod.FINE_SYSTEM_PROMPT)
+    def test_match_and_optimizer_share_same_hm_prompt_object_per_track(self):
+        # The prompt each agent would use for a track is the identical object.
+        for track in prompts.TRACKS:
+            m_pair = match_mod.get_prompt_pair(track)
+            o_pair = optimizer_mod.get_prompt_pair(track)
+            self.assertIs(m_pair[1], o_pair[1], f"HM prompt differs for {track}")
+            self.assertIs(m_pair[0], o_pair[0], f"Recruiter prompt differs for {track}")
 
-    def test_coarse_prompt_lives_in_shared(self):
-        self.assertIs(match_mod.COARSE_SYSTEM_PROMPT, prompts.COARSE_SYSTEM_PROMPT)
+    def test_all_five_tracks_have_distinct_prompt_pairs(self):
+        hm_ids = {id(prompts.HM_PROMPTS[t]) for t in prompts.TRACKS}
+        rec_ids = {id(prompts.RECRUITER_PROMPTS[t]) for t in prompts.TRACKS}
+        self.assertEqual(len(hm_ids), 5, "HM prompts must be 5 distinct objects")
+        self.assertEqual(len(rec_ids), 5)
+        for t in prompts.TRACKS:
+            self.assertIn("SECURITY:", prompts.HM_PROMPTS[t])
+            self.assertIn("SECURITY:", prompts.RECRUITER_PROMPTS[t])
 
     def test_tailor_prompt_lives_in_shared(self):
         self.assertIs(optimizer_mod.TAILOR_SYSTEM_PROMPT, prompts.TAILOR_SYSTEM_PROMPT)

@@ -35,7 +35,7 @@ from shared.config import MODEL, JD_CACHE_DIR
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
 from shared.run_summary import RunSummary
 from shared.prompts import (
-    FINE_SYSTEM_PROMPT,
+    get_prompt_pair, get_tailor_prompts,
     TAILOR_SYSTEM_PROMPT, BATCH_TAILOR_SYSTEM_PROMPT,
 )
 from shared.schemas import (
@@ -45,11 +45,12 @@ from shared.schemas import (
 # PRJ-002 PR 4: 3-dimension rescore.
 #   - ATS dim: deterministic, reuses shared/ats_matcher.compute_coverage
 #   - Recruiter dim: reuses match_agent.batch_coarse_score (1-element batch)
-#   - HM dim: existing re_score() with FINE_SYSTEM_PROMPT (kept identical
-#     to match_agent's Stage 2 so deltas are comparable per REQ-052).
+#   - HM dim: re_score() resolves the HM prompt via get_prompt_pair(track) —
+#     the identical constant match_agent's Stage 2 uses for that track, so
+#     deltas stay comparable per REQ-052 (PRJ-004 REQ-004-23: per track).
 from shared.ats_matcher import compute_coverage
 from shared.resume_io import load_resume, get_style_for_resume, markdown_to_pdf
-from agents.match_agent import batch_coarse_score, _extract_ats_keywords
+from agents.match_agent import batch_coarse_score, _extract_ats_keywords, _track_batches
 
 # BUG-41: single shared limiter for all Gemini calls
 _GEMINI_LIMITER = _RateLimiter(rpm=13)
@@ -163,16 +164,19 @@ def _save_tailored_resume(resume_id: str, url: str, content: str,
 
 
 # ── Gemini calls ─────────────────────────────────────────────────────────────
-def tailor_resume(resume_text: str, jd_content: str) -> str | None:
+def tailor_resume(resume_text: str, jd_content: str,
+                  job_domain: str = "AI") -> str | None:
     """Call Gemini to tailor resume for a specific JD. Returns JSON string.
 
+    PRJ-004 REQ-004-23: the tailor prompt carries the track's emphasis clause
+    (e.g. never push GenAI experience for a Space role).
     P0-4: returns None on structural error so the caller can drop the
     record. Transient errors propagate as GeminiTransientError.
     """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking tailor_resume()")
     cfg = types.GenerateContentConfig(
-        system_instruction=TAILOR_SYSTEM_PROMPT,
+        system_instruction=get_tailor_prompts(job_domain)[0],
         temperature=0.3,
         response_mime_type="application/json",
         response_schema=TailoredResume,
@@ -197,15 +201,19 @@ def tailor_resume(resume_text: str, jd_content: str) -> str | None:
         return None
 
 
-def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
-    """Batch-tailor resume for multiple JDs in one Gemini call. Returns list[dict] aligned to input."""
+def batch_tailor_resume(resume_text: str, jd_contents: list[str],
+                        job_domain: str = "AI") -> list[dict]:
+    """Batch-tailor resume for multiple JDs in one Gemini call. Returns
+    list[dict] aligned to input. PRJ-004 REQ-004-23: a batch shares one system
+    prompt, so all jd_contents must belong to the same track — the caller
+    partitions by job_domain before chunking."""
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking batch_tailor_resume()")
     numbered = "\n\n".join(
         f"[JD {i}]\n{jd}" for i, jd in enumerate(jd_contents)
     )
     cfg = types.GenerateContentConfig(
-        system_instruction=BATCH_TAILOR_SYSTEM_PROMPT,
+        system_instruction=get_tailor_prompts(job_domain)[1],
         temperature=0.3,
         response_mime_type="application/json",
         response_schema=BatchTailoredResult,
@@ -241,8 +249,11 @@ def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
         return [{} for _ in range(len(jd_contents))]
 
 
-def re_score(tailored_resume: str, jd_content: str) -> str | None:
-    """Re-score the tailored resume using the same fine-evaluation prompt.
+def re_score(tailored_resume: str, jd_content: str,
+             job_domain: str = "AI") -> str | None:
+    """Re-score the tailored resume using the track's HM prompt — the SAME
+    constant match_agent's Stage 2 uses for that track (REQ-052/REQ-004-23:
+    before/after deltas are only comparable within one track's prompt pair).
 
     P0-4: returns None on structural error so the caller can drop the
     record. Transient errors propagate as GeminiTransientError.
@@ -250,7 +261,7 @@ def re_score(tailored_resume: str, jd_content: str) -> str | None:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking re_score()")
     cfg = types.GenerateContentConfig(
-        system_instruction=FINE_SYSTEM_PROMPT,
+        system_instruction=get_prompt_pair(job_domain)[1],
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=MatchResult,
@@ -347,6 +358,9 @@ async def _main_inner(summary: RunSummary):
                 "job_title": d.get("job_title", ""),
                 "company": d.get("company", ""),
                 "jd_json": jd["jd_json"],
+                # PRJ-004 REQ-004-23: the track travels with the JD row so
+                # tailoring and re-scoring route to the same prompt pair.
+                "job_domain": jd.get("job_domain", "AI"),
             }
         except Exception:
             pass
@@ -388,12 +402,16 @@ async def _main_inner(summary: RunSummary):
             "url": url,
             "meta": meta,
             "jd_content": jd_content,
+            "job_domain": meta.get("job_domain", "AI"),
         })
 
     # ── Phase 1: Batch Tailor ──────────────────────────────────────
-    n_tailor_batches = math.ceil(len(job_items) / BATCH_TAILOR_SIZE)
+    # PRJ-004 REQ-004-23: a batch shares one system prompt, so partition by
+    # track first (same pattern as match_agent Stage 1), then chunk.
+    tailor_batches = _track_batches(job_items, size=BATCH_TAILOR_SIZE)
+    n_tailor_batches = len(tailor_batches)
     print(f"[Phase 1] Batch tailoring {len(job_items)} jobs in {n_tailor_batches} batches "
-          f"(batch_size={BATCH_TAILOR_SIZE})...\n")
+          f"(batch_size={BATCH_TAILOR_SIZE}, grouped by track)...\n")
 
     tailor_results: dict[str, dict] = {}   # url -> {"tailored_md", "opt_summary", "last_written_hash"}
     tailor_fallback: list[dict] = []
@@ -401,18 +419,17 @@ async def _main_inner(summary: RunSummary):
     # We skip writing and exclude them from rescore + Excel update.
     tampered_urls: set[str] = set()
 
-    for b in range(n_tailor_batches):
-        batch = job_items[b * BATCH_TAILOR_SIZE : (b + 1) * BATCH_TAILOR_SIZE]
+    for b, (track, batch) in enumerate(tailor_batches):
         jd_contents = [item["jd_content"] for item in batch]
 
         labels = ", ".join(
             f"{item['meta'].get('company', '?')}" for item in batch
         )
-        print(f"  [Tailor {b+1}/{n_tailor_batches}] {labels}")
+        print(f"  [Tailor {b+1}/{n_tailor_batches}] ({track}) {labels}")
 
         await limiter.acquire()
         batch_results = await asyncio.to_thread(
-            batch_tailor_resume, resume_text, jd_contents
+            batch_tailor_resume, resume_text, jd_contents, track
         )
 
         for item, result in zip(batch, batch_results):
@@ -442,7 +459,8 @@ async def _main_inner(summary: RunSummary):
         for item in tailor_fallback:
             await limiter.acquire()
             tailor_json = await asyncio.to_thread(
-                tailor_resume, resume_text, item["jd_content"]
+                tailor_resume, resume_text, item["jd_content"],
+                item["job_domain"],
             )
             # P0-4: None = structural error; drop the record (do not write empty MD).
             if tailor_json is None:
@@ -480,8 +498,9 @@ async def _main_inner(summary: RunSummary):
 
     # ── Phase 2: 3-dim rescore — ATS (det.) + Recruiter (LLM) + HM (LLM) ───
     # Per JD: 1 deterministic ATS pass + 1 Recruiter Gemini call + 1 HM Gemini call.
-    # HM uses the same FINE_SYSTEM_PROMPT path as match_agent's Stage 2 so deltas
-    # remain comparable (REQ-052). Regression flag reflects HM delta only.
+    # HM uses the same per-track prompt path as match_agent's Stage 2 so deltas
+    # remain comparable within a track (REQ-052/REQ-004-23). Regression flag
+    # reflects HM delta only.
     rescore_items = [item for item in job_items if item["url"] in tailor_results]
     print(f"\n[Phase 2] Re-scoring {len(rescore_items)} tailored resumes "
           f"on 3 dimensions (ATS det. + Recruiter + HM)...\n")
@@ -502,20 +521,22 @@ async def _main_inner(summary: RunSummary):
             ats_kws = _extract_ats_keywords(jd_dict)
             ats_results[url] = compute_coverage(ats_kws, tailored_md)
 
-            # 2. Recruiter rescore — single-JD Gemini call via batch_coarse_score.
+            # 2. Recruiter rescore — single-JD Gemini call via batch_coarse_score,
+            # routed to the JD's track (REQ-004-23).
             await limiter.acquire()
             rec_scores = await asyncio.to_thread(
-                batch_coarse_score, tailored_md, [jd_dict]
+                batch_coarse_score, tailored_md, [jd_dict], item["job_domain"]
             )
             if rec_scores:
                 recruiter_results[url] = max(1, rec_scores[0])
             # If empty list (structural failure), recruiter_results omits this url
             # → downstream will write Tailored Recruiter as None.
 
-            # 3. HM rescore — same call shape as match_agent's fine eval.
+            # 3. HM rescore — same call shape and same per-track prompt as
+            # match_agent's fine eval.
             await limiter.acquire()
             score_json = await asyncio.to_thread(
-                re_score, tailored_md, item["jd_content"]
+                re_score, tailored_md, item["jd_content"], item["job_domain"]
             )
             # P0-4: None = structural error; drop the record (do not write fake score=0).
             if score_json is None:

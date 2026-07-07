@@ -111,7 +111,7 @@ class TestDeleteCache(unittest.TestCase):
 
 
 class TestEvaluateMatchUsesCachedContent(unittest.TestCase):
-    """When _FINE_CACHE_NAME is set, evaluate_match must use cached_content
+    """When the track has a _FINE_CACHE_NAMES entry, evaluate_match must use cached_content
     in the config and NOT include the resume in contents."""
 
     def setUp(self):
@@ -125,17 +125,17 @@ class TestEvaluateMatchUsesCachedContent(unittest.TestCase):
 
     def tearDown(self):
         self.match_mod._KEY_POOL = None
-        self.match_mod._FINE_CACHE_NAME = None
+        self.match_mod._FINE_CACHE_NAMES.clear()
 
     def test_no_cache_includes_resume_in_contents(self):
-        self.match_mod._FINE_CACHE_NAME = None
+        self.match_mod._FINE_CACHE_NAMES.clear()
         self.match_mod.evaluate_match("RESUME_BODY", '{"job_title":"X"}')
         kwargs = self.pool.generate_content.call_args.kwargs
         self.assertIn("RESUME_BODY", kwargs["contents"])
 
     def test_with_cache_omits_resume_from_contents(self):
-        self.match_mod._FINE_CACHE_NAME = "cachedContents/abc"
-        self.match_mod.evaluate_match("RESUME_BODY", '{"job_title":"X"}')
+        self.match_mod._FINE_CACHE_NAMES["AI"] = "cachedContents/abc"
+        self.match_mod.evaluate_match("RESUME_BODY", '{"job_title":"X"}', "AI")
         kwargs = self.pool.generate_content.call_args.kwargs
         self.assertNotIn("RESUME_BODY", kwargs["contents"],
                          "When using cached_content, resume must not be sent again")

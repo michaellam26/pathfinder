@@ -570,7 +570,7 @@ class TestResumeOptimizerMain(unittest.IsolatedAsyncioTestCase):
         optimizer_mod._KEY_POOL = mock_pool
 
         # Mock batch_tailor_resume to return tailored content
-        def fake_batch_tailor(resume_text, jd_contents):
+        def fake_batch_tailor(resume_text, jd_contents, job_domain="AI"):
             return [
                 {"tailored_resume_markdown": f"# Tailored for JD {i}\n{resume_text[:100]}",
                  "optimization_summary": f"Optimized for JD {i}"}
@@ -578,7 +578,7 @@ class TestResumeOptimizerMain(unittest.IsolatedAsyncioTestCase):
             ]
 
         # Mock re_score (single-call, FINE_SYSTEM_PROMPT) to return improved scores
-        def fake_re_score(tailored_resume, jd_content):
+        def fake_re_score(tailored_resume, jd_content, job_domain="AI"):
             return json.dumps({
                 "compatibility_score": 85,
                 "key_strengths": ["Improved alignment"],
