@@ -1,6 +1,41 @@
 # Task Tracker
 
-## Active (2026-04-28 evening): REVIEW_2026-04-28 follow-up
+## Active (2026-07-07): PRJ-004 Multi-Track Expansion — Phase 3 Implementation
+
+**Source of truth**: `docs/sdlc/PRJ-004-multi-track-expansion/design.md` §6 (T1–T17)
+**Branch**: `prj-004-multi-track-expansion`
+**Critical path**: T1 → T5 → T6 → T9 → T17
+
+### P0 (launch-blocking)
+- [ ] T1 excel_store schema: JD_HEADERS rework, `Track`/`Qualified Jobs` renames + migration blocks + assert-empty guard, writer extension, `compute_freshness_tier`/`classify_region`/`compute_sort_tier` (atomic with test-fixture updates — R-11)
+- [ ] T2 row selector all-valid-rows + job_domain passthrough; qualified-count rework
+- [ ] T3 company_agent: TRACK_VALUES/QUOTAS, MAX_TOTAL=500, CompanyInfo.track, per-bucket need math, new TAVILY_QUERIES, discovery prompt, `_apply_bucket_rules`
+- [ ] T4 `--migrate-tracks` CLI (code now; run blocked on user pruning)
+- [ ] T5 job_agent extraction core: JobDetails fields, track-aware extract_jd + anchors + vertical override, domain/YoE/work-auth write gates, `_nontech_title_prefilter`, `llm_filter_jobs` rewrite
+- [ ] T6 posting dates: ATS date fields, list_meta threading, ≤14-day keep gate, Tavily backfill
+- [ ] T7 geo tighten: classify_region wiring + [GeoFilter] drop logging
+- [ ] T8 Workday pagination; Firecrawl limit removal
+- [ ] T9 sort_jd_tracker_by_tier rewrite (recompute freshness, 1–6 tiers, tier-9 sink)
+- [ ] T10 prompts.py: RECRUITER_PROMPTS/HM_PROMPTS/TAILOR_EMPHASIS + accessors
+- [ ] T11 match_agent per-track routing + `_FINE_CACHE_NAMES` dict
+- [ ] T12 resume_optimizer per-track routing (tailor + re-score + recruiter rescore)
+
+### P1/P2 (non-blocking)
+- [ ] T13 launchd failure surfacing (LAST_RUN_FAILED/LAST_RUN_OK markers, RunSummary usage note)
+- [ ] T14 Amazon.jobs adapter + prefetched-JD routing
+- [ ] T15 Tesla regression verification
+- [ ] T16 Google Careers adapter (stretch)
+
+### Rollout (T17 — after all P0; user actions interleaved)
+- [ ] User: prune Company_List → run `--migrate-tracks` → user spot-check
+- [ ] User: wipe JD_Tracker (schema guard verifies)
+- [ ] Discovery top-up runs → uncapped trial run → cost confirmation (REQ-004-26 gate 2) → enable daily schedule
+
+**Working rules**: full suite after each task, never left red; tests in tests/; bugs found en route go to BUGS.md.
+
+---
+
+## Backlog (stale, 2026-04-28): REVIEW_2026-04-28 follow-up
 
 **Source doc**: `docs/REVIEW_2026-04-28.md`
 **Status**: P0 done (7/8, P0-8 WONTFIX); P1 5 fixed today + 2 fixed earlier; P2 3 fixed earlier
