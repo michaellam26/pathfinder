@@ -21,6 +21,7 @@ import re
 import logging
 import time
 import requests
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from google import genai
@@ -653,6 +654,28 @@ def _ai_title_prefilter(links: list, ai_domain: str) -> list:
     return filtered
 
 # ── Path W: Workday JSON API ──────────────────────────────────────────────────
+def _parse_workday_posted_on(text: str, today=None) -> str:
+    """PRJ-004 REQ-004-10: deterministic parse of Workday's relative postedOn
+    strings ("Posted Today", "Posted 2 Days Ago", "Posted 30+ Days Ago") into
+    an ISO date string. "30+" maps to 31 days back, which correctly fails the
+    15-day freshness gate. Unparseable/blank text → "" (unknown date — the
+    keep+flag path, never treated as aged)."""
+    if not text:
+        return ""
+    t = str(text).strip().lower()
+    today = today or datetime.now().date()
+    if "today" in t:
+        days = 0
+    elif "yesterday" in t:
+        days = 1
+    else:
+        m = re.search(r"(\d+)(\+?)\s*days?\s*ago", t)
+        if not m:
+            return ""
+        days = int(m.group(1)) + (1 if m.group(2) else 0)
+    return (today - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def _fetch_workday_jobs(career_url: str) -> list:
     """
     Workday exposes an undocumented but widely-used POST JSON API.
@@ -675,24 +698,35 @@ def _fetch_workday_jobs(career_url: str) -> list:
     host   = host_m.group(1)
 
     api_url = f"{host}/wday/cxs/{company_slug}/{site_slug}/jobs"
-    payload = {"limit": 20, "offset": 0, "searchText": "Technical Program Manager"}
-    logging.info(f"[Workday API] POST {api_url}")
-    r = _http_request_with_retry(
-        "POST", api_url, timeout=12, json=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "PathFinder/1.0"},
-    )
-    if r is None:
-        return []
-    if r.status_code != 200:
-        logging.warning(f"[Workday API] {r.status_code} for {api_url}")
-        return []
-    try:
-        base     = f"{host}/{site_slug}"
-        postings = r.json().get("jobPostings", [])
-        results  = []
+    base    = f"{host}/{site_slug}"
+    # PRJ-004 REQ-004-13: paginate instead of the old hardcoded limit:20 —
+    # no artificial cap on scraped job count. The page-count guard is a
+    # runaway/corruption backstop (5,000 postings), not a result cap.
+    _PAGE_SIZE, _MAX_PAGES = 50, 100
+    results, offset = [], 0
+    for page in range(_MAX_PAGES):
+        payload = {"limit": _PAGE_SIZE, "offset": offset,
+                   "searchText": "Technical Program Manager"}
+        logging.info(f"[Workday API] POST {api_url} offset={offset}")
+        r = _http_request_with_retry(
+            "POST", api_url, timeout=12, json=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "PathFinder/1.0"},
+        )
+        if r is None:
+            break
+        if r.status_code != 200:
+            logging.warning(f"[Workday API] {r.status_code} for {api_url}")
+            break
+        try:
+            data     = r.json()
+            postings = data.get("jobPostings", [])
+            total    = data.get("total")
+        except (ValueError, KeyError, TypeError) as e:
+            logging.error(f"[Workday API] parse error for {api_url}: {type(e).__name__}: {e}")
+            break
         for p in postings:
             path  = p.get("externalPath", "")
-            title = p.get("title", "").strip()
+            title = (p.get("title", "") or "").strip()
             loc   = p.get("locationsText", "") or ""
             # For "N Locations", fall back to the country/city in the URL path
             # e.g. /job/Israel-Yokneam/... → "Israel-Yokneam"
@@ -702,12 +736,18 @@ def _fetch_workday_jobs(career_url: str) -> list:
                     loc = url_loc_m.group(1).replace('-', ', ')
             if path and title:
                 results.append({"url": base + path, "title": title, "location": loc,
+                                 "posted_date": _parse_workday_posted_on(p.get("postedOn", "")),
                                  "_workday": True})
-        logging.info(f"[Workday API] {len(results)} postings for {company_slug}/{site_slug}")
-        return results
-    except (ValueError, KeyError, TypeError) as e:
-        logging.error(f"[Workday API] parse error for {api_url}: {type(e).__name__}: {e}")
-        return []
+        offset += _PAGE_SIZE
+        if len(postings) < _PAGE_SIZE:
+            break
+        if isinstance(total, int) and offset >= total:
+            break
+    else:
+        logging.error(f"[Workday API] hit {_MAX_PAGES}-page runaway guard for "
+                      f"{company_slug}/{site_slug} — response likely corrupt")
+    logging.info(f"[Workday API] {len(results)} postings for {company_slug}/{site_slug}")
+    return results
 
 # ── ATS link detection in rendered pages ─────────────────────────────────────
 def _detect_ats(links: list) -> dict:
@@ -771,7 +811,8 @@ def _firecrawl_map(career_url: str, fc_key: str) -> list:
     for attempt in range(3):
         try:
             logging.info(f"[Firecrawl] map attempt {attempt + 1}/3: {career_url}")
-            res = app.map(url=career_url, search="Technical Program Manager", limit=100)
+            # PRJ-004 REQ-004-13: no artificial cap on mapped URLs.
+            res = app.map(url=career_url, search="Technical Program Manager")
             urls = getattr(res, "links", None) or (res.get("links",[]) if isinstance(res,dict) else res if isinstance(res,list) else [])
             out  = []
             for u in urls:

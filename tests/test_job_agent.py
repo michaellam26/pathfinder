@@ -2127,5 +2127,109 @@ class TestRetryOneSkipsIncompleteExtraction(unittest.IsolatedAsyncioTestCase):
             job_agent_mod._GEMINI_LIMITER = original_limiter
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T8 — Workday pagination + Firecrawl uncap (REQ-004-13, G6a)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestWorkdayPagination(unittest.TestCase):
+    """REQ-004-13: _fetch_workday_jobs paginates past the old 20-posting cap."""
+
+    @staticmethod
+    def _page(n_postings, start=0, total=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "jobPostings": [
+                {"externalPath": f"/job/US-Somewhere/tpm-{start + i}",
+                 "title": f"TPM {start + i}", "locationsText": "Seattle, WA",
+                 "postedOn": "Posted 2 Days Ago"}
+                for i in range(n_postings)
+            ],
+            **({"total": total} if total is not None else {}),
+        }
+        return resp
+
+    def test_paginates_across_pages(self):
+        from agents.job_agent import _fetch_workday_jobs
+        # 3 pages: 50 + 50 + 20 = 120 postings — far beyond the old cap of 20.
+        pages = [self._page(50, 0, total=120), self._page(50, 50, total=120),
+                 self._page(20, 100, total=120)]
+        with patch("agents.job_agent._http_request_with_retry", side_effect=pages) as mock_http:
+            results = _fetch_workday_jobs("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite")
+        self.assertEqual(len(results), 120)
+        self.assertEqual(mock_http.call_count, 3)
+        # offsets advance by page size
+        offsets = [c.kwargs["json"]["offset"] for c in mock_http.call_args_list]
+        self.assertEqual(offsets, [0, 50, 100])
+        self.assertGreater(len(results), 20, "G6a: must exceed the old 20-job cap")
+
+    def test_short_page_terminates(self):
+        from agents.job_agent import _fetch_workday_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(7)]) as mock_http:
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        self.assertEqual(len(results), 7)
+        self.assertEqual(mock_http.call_count, 1)
+
+    def test_carries_posted_date(self):
+        from agents.job_agent import _fetch_workday_jobs
+        from datetime import datetime, timedelta
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(1)]):
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        expected = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
+        self.assertEqual(results[0]["posted_date"], expected)
+
+    def test_http_failure_returns_partial(self):
+        from agents.job_agent import _fetch_workday_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(50, 0), None]):
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        self.assertEqual(len(results), 50)
+
+
+class TestParseWorkdayPostedOn(unittest.TestCase):
+    """REQ-004-10: deterministic postedOn relative-string parser."""
+
+    from datetime import date as _date
+    TODAY = _date(2026, 7, 7)
+
+    def _p(self, text):
+        from agents.job_agent import _parse_workday_posted_on
+        return _parse_workday_posted_on(text, today=self.TODAY)
+
+    def test_today_and_yesterday(self):
+        self.assertEqual(self._p("Posted Today"), "2026-07-07")
+        self.assertEqual(self._p("Posted Yesterday"), "2026-07-06")
+
+    def test_days_ago(self):
+        self.assertEqual(self._p("Posted 2 Days Ago"), "2026-07-05")
+        self.assertEqual(self._p("Posted 14 Days Ago"), "2026-06-23")
+
+    def test_thirty_plus_saturates_past_gate(self):
+        # "30+" → 31 days back: correctly fails the 15-day freshness gate.
+        self.assertEqual(self._p("Posted 30+ Days Ago"), "2026-06-06")
+
+    def test_unparseable_is_unknown_not_aged(self):
+        self.assertEqual(self._p(""), "")
+        self.assertEqual(self._p(None), "")
+        self.assertEqual(self._p("Posted recently"), "")
+
+
+class TestFirecrawlMapUncapped(unittest.TestCase):
+    """REQ-004-13: the Firecrawl map call must not pass a result limit."""
+
+    def test_map_called_without_limit(self):
+        from agents.job_agent import _firecrawl_map
+        fake_app = MagicMock()
+        fake_app.map.return_value = {"links": []}
+        # FirecrawlApp is imported inside the function - patch at the source.
+        with patch("firecrawl.FirecrawlApp", return_value=fake_app):
+            _firecrawl_map("https://example.com/careers", "fc-key")
+        self.assertTrue(fake_app.map.called)
+        self.assertNotIn("limit", fake_app.map.call_args.kwargs,
+                         "Firecrawl map must not cap results (REQ-004-13)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
