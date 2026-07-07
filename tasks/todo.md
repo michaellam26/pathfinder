@@ -26,7 +26,7 @@
 - [x] T15 Tesla regression verification (registry + schema tests)
 - [ ] T16 Google Careers adapter (P2 stretch — deliberately deferred post-launch per design)
 
-### Rollout (T17 — after all P0; user actions interleaved)
+### Rollout (T17 — Phase 5 launch checklist; see docs/sdlc/PRJ-004-multi-track-expansion/launch-readiness.md §2)
 - [ ] User: prune Company_List → run `--migrate-tracks` → user spot-check
 - [ ] User: wipe JD_Tracker (schema guard verifies)
 - [ ] Discovery top-up runs → uncapped trial run → cost confirmation (REQ-004-26 gate 2) → enable daily schedule

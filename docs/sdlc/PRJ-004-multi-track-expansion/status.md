@@ -1,6 +1,6 @@
 # PRJ-004: Multi-Track Expansion
 
-**Phase**: Phase 4 — Testing & Bug Fix
+**Phase**: Phase 5 — Launch Readiness
 **Status**: 🟡 In Progress
 **Priority**: P1
 **Created**: 2026-07-07
@@ -49,10 +49,10 @@
 - [x] PM sign-off (conditions carried into the Phase 5 launch checklist)
 
 ### Phase 5: Launch Readiness
-- [ ] TPM launch readiness report
-- [ ] User final sign-off
-- [ ] Engineer Lead confirmation
-- [ ] PM confirmation
+- [x] TPM launch readiness report (2026-07-07, 🟢 Go — launch-readiness.md; merge-now recommendation)
+- [ ] User final sign-off ← **the only remaining gate**
+- [x] Engineer Lead confirmation (2026-07-07 — suite 945 green at HEAD; launch steps 2/4/5/6/8 executable on user's go)
+- [x] PM confirmation (via ACCEPT WITH CONDITIONS; conditions carried into launch checklist)
 
 ## Risk Register
 
