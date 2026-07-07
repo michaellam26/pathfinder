@@ -29,6 +29,10 @@ run_step() {
     } >> "$LOG_FILE"
     if ! python "$script_path" >> "$LOG_FILE" 2>&1; then
         echo "=== [$step_name] FAILED: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+        # PRJ-004 REQ-004-25: persistent failure marker — a missed macOS
+        # notification must not be the only trace of a failed daily run.
+        printf '%s\nstep=%s\nlog=%s\n' "$(date '+%F %T')" "$step_name" "$LOG_FILE" \
+            > "$PROJECT_DIR/logs/LAST_RUN_FAILED"
         notify "FAILED at $step_name" "Check $LOG_FILE"
         exit 1
     fi
@@ -47,4 +51,9 @@ run_step "4/4 Resume Optimizer"  "agents/resume_optimizer.py"
 
 echo "" >> "$LOG_FILE"
 echo "Pipeline complete: $(date)" >> "$LOG_FILE"
+# PRJ-004 REQ-004-25: success clears the failure marker and stamps LAST_RUN_OK.
+# A stale LAST_RUN_OK (>36h) is itself the "runs stopped firing" signal that a
+# failure marker alone cannot provide (launchd-never-ran failure mode).
+rm -f "$PROJECT_DIR/logs/LAST_RUN_FAILED"
+date '+%F %T' > "$PROJECT_DIR/logs/LAST_RUN_OK"
 notify "Pipeline complete" "$(basename "$LOG_FILE")"

@@ -2106,6 +2106,13 @@ async def main():
         summary.note(f"Run aborted: {type(e).__name__}: {e}")
         raise
     finally:
+        # PRJ-004 REQ-004-25/26: token-usage snapshot in every run log —
+        # the measurement carrier for the trial-run cost gate.
+        try:
+            from shared.gemini_pool import get_usage_summary
+            summary.note(f"gemini usage: {get_usage_summary()}")
+        except Exception:
+            pass
         summary.mark_finished()
         log_path = summary.write()
         print(f"📊 Run summary: {log_path}")
