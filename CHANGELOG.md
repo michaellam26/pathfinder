@@ -1,5 +1,49 @@
 # CHANGELOG
 
+## 2026-07-07
+
+### PRJ-004: Multi-Track Expansion (breaking schema change)
+
+Expanded the pipeline from AI-only/200-company scope to six tracks at 500
+companies (AI-native 150 / Mid-large Tech 150 / Robotics 50 / Fintech 50 /
+Space 50 / Defense 50), with freshness, YoE-seniority, and work-authorization
+filtering. Full SDLC cycle: `docs/sdlc/PRJ-004-multi-track-expansion/`.
+
+**Breaking (Excel schema)**:
+- `JD_Tracker`: `Is AI TPM` → `Job Domain` (AI/Robotics/Fintech/Space/Defense);
+  `Location Tier` → `Sort Tier` (combined 1–6 freshness×region index, 9 = sink);
+  new `Posted Date`, `Freshness Tier`, `Min YoE`, `YoE Flag`, `Work-Auth
+  Status`, `Date Flag` columns. Legacy header sets are replaced wholesale
+  behind an assert-empty guard (RuntimeError if legacy data rows exist —
+  wipe is a user-owned pre-launch step).
+- `Company_List`/`Company_Without_TPM`: `AI Domain` → `Track`, `AI TPM Jobs`
+  → `Qualified Jobs` (in-place header rename; values re-bucketed via the new
+  one-time `python agents/company_agent.py --migrate-tracks` CLI).
+
+**Features**:
+- company_agent: 6-bucket taxonomy with per-bucket quotas + grandfathering,
+  early-company rule (~2000+), defense legacy-prime hard exclusion with
+  Palantir allowlist, hires-in-region geography, `--migrate-tracks`.
+- job_agent: 5-track domain classifier with big-tech sub-org mapping anchors
+  (cloud→AI, payments→Fintech, Kuiper/Leo→Space, Azure Government→Defense);
+  YoE window gate (skip stated min ≤3 or ≥12; unstated → keep + flag);
+  global work-authorization screen (citizenship/clearance → skip, audited);
+  posting-date extraction across all ATS adapters + ≤14-day write-time
+  freshness gate (never retroactive) + optional Tavily LinkedIn-scoped date
+  backfill; geo tightened to Seattle/CA/TX/US-Remote; Workday pagination
+  (removes the 20-job cap); Firecrawl map uncapped; new Amazon.jobs adapter
+  with prefetched JD text (zero crawler fallback).
+- match layer: 5 per-track Recruiter/HM prompt pairs + tailor emphasis
+  clauses; routing by Job Domain in match_agent and resume_optimizer with
+  per-track byte-identity preserved (REQ-052); per-track Gemini context
+  caches; batches never mix tracks.
+- ops: launchd wrapper writes `logs/LAST_RUN_FAILED`/`LAST_RUN_OK` markers;
+  all agents log Gemini token usage into RunSummary (trial-run cost carrier).
+
+**Tests**: 859 → 945 (+86, incl. Phase 4 QA follow-ups), 0 regressions.
+**Backlog**: BUG-62, BUG-63. Google Careers adapter (P2 stretch) deferred.
+
+
 ## 2026-06-10
 
 ### Docs: accuracy pass across README / PROJECT_OVERVIEW / ARCHITECTURE / REQUIREMENTS / CHANGELOG

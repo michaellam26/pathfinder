@@ -43,10 +43,10 @@
 
 ### Phase 4: Testing & Bug Fix
 - [x] QA Team review (2026-07-07 — 3 parallel reviews: code review APPROVE WITH COMMENTS, schema validation PASS, test analysis SUFFICIENT WITH GAPS; reviews/phase4-*.md)
-- [ ] PM functional acceptance
+- [x] PM functional acceptance (2026-07-07, ACCEPT WITH CONDITIONS — reviews/phase4-pm-acceptance.md; all conditions are launch-checklist items)
 - [x] Bug fixes completed (commit 2cda556 — injection guards + gate hardening + all P0/P1 test gaps closed; BUG-62/63 logged for backlog; suite 945 passed)
 - [x] QA sign-off (all actionable findings resolved and verified by tests; zero BLOCKER/MAJOR across all three reviews)
-- [ ] PM sign-off
+- [x] PM sign-off (conditions carried into the Phase 5 launch checklist)
 
 ### Phase 5: Launch Readiness
 - [ ] TPM launch readiness report

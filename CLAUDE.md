@@ -38,7 +38,7 @@ shared/              # Shared utilities reused across agents
   run_summary.py     # Structured run-log dataclass
   ats_matcher.py     # Deterministic ATS keyword coverage (PRJ-002)
   ats_synonyms.py    # Hand-curated ATS keyword synonym table (PRJ-002)
-tests/               # Unit tests (859+ cases)
+tests/               # Unit tests (945+ cases)
 docs/
   sdlc/              # SDLC project documents (index + per-project dirs)
 .claude/
@@ -65,14 +65,13 @@ This is a **multi-agent AI project**. The expected pattern:
 The agents accept manually-inserted rows in `pathfinder_dashboard.xlsx` and
 will enrich them on the next pipeline run:
 
-- **Company_List** — insert a row with just `Company Name` + `AI Domain` (blank
+- **Company_List** — insert a row with just `Company Name` + `Track` (blank
   Career URL). `company_agent.run_phase_1_5` detects the blank URL and calls
   `find_career_url` to discover an ATS/Workday URL, writing it back. Tavily
   must be available; rows that resist discovery are reported and left blank
-  for retry. `AI Domain` may use any of the 6 whitelisted buckets (Big Tech
-  AI Investment / Consumer ML Tech / AI Startups / AI Infrastructure & Compute
-  / Large Model Labs / Defense/Robotics AI), or a custom string (job_agent
-  treats unknown buckets as `ai_native`).
+  for retry. `Track` should be one of the 6 buckets (AI-native / Mid-large
+  Tech / Robotics / Fintech / Space / Defense); unknown/custom values take
+  the strict Mid-large-Tech per-JD classifier path with a logged warning.
 - **JD_Tracker** — insert a row with just `JD URL` + `Company`. The job_agent
   picks it up via `get_incomplete_jd_rows` and runs full extraction.
 
