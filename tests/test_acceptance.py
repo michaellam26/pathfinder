@@ -89,7 +89,8 @@ def _make_temp_xlsx():
     return path
 
 
-def _make_jd_json(title="AI TPM", company="TestCo", location="San Francisco, CA"):
+def _make_jd_json(title="AI TPM", company="TestCo", location="San Francisco, CA",
+                  job_domain="AI"):
     return json.dumps({
         "job_title": title,
         "company": company,
@@ -98,7 +99,7 @@ def _make_jd_json(title="AI TPM", company="TestCo", location="San Francisco, CA"
         "requirements": ["LLM experience", "PyTorch", "MLOps"],
         "additional_qualifications": ["GenAI deployment"],
         "key_responsibilities": ["Lead AI programs", "Cross-functional coordination"],
-        "is_ai_tpm": True,
+        "job_domain": job_domain,
         "data_quality": "complete",
     })
 
@@ -703,8 +704,11 @@ class TestEndToEndDataFlow(unittest.TestCase):
         for jd in jds:
             self.assertIn("url", jd)
             self.assertIn("jd_json", jd)
+            self.assertIn("job_domain", jd)
             parsed = json.loads(jd["jd_json"])
-            self.assertTrue(parsed.get("is_ai_tpm"), "Should only return AI TPM JDs")
+            self.assertIn(parsed.get("job_domain"),
+                          ("AI", "Robotics", "Fintech", "Space", "Defense"),
+                          "Every returned row must carry a valid Job Domain")
             self.assertTrue(parsed.get("job_title"), "Job title must be non-empty")
             self.assertTrue(parsed.get("company"), "Company must be non-empty")
 

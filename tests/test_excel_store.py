@@ -22,7 +22,7 @@ import json
 import tempfile
 import unittest
 import unittest.mock
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -86,7 +86,7 @@ class TestGetOrCreateExcel(unittest.TestCase):
         wb = openpyxl.load_workbook(self.path)
         ws = wb["Company_List"]
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        for h in ["Company Name", "AI Domain", "Career URL"]:
+        for h in ["Company Name", "Track", "Career URL"]:
             self.assertIn(h, headers)
 
     def test_match_results_headers(self):
@@ -192,17 +192,17 @@ class TestUpsertCompanies(unittest.TestCase):
 
     def test_update_existing_company(self):
         upsert_companies(self.path, [
-            {"company_name": "Corp", "ai_domain": "AI Startups",
+            {"company_name": "Corp", "track": "AI-native",
              "business_focus": "Old", "career_url": "https://old.com/jobs"},
         ])
         upsert_companies(self.path, [
-            {"company_name": "Corp", "ai_domain": "Big Tech (AI Investment)",
+            {"company_name": "Corp", "track": "Mid-large Tech",
              "business_focus": "New focus", "career_url": "https://new.com/careers"},
         ])
         # Should still be 1 row (updated, not duplicated)
         self.assertEqual(count_company_rows(self.path), 1)
         rows = get_company_rows(self.path)
-        self.assertEqual(rows[0][1], "Big Tech (AI Investment)")
+        self.assertEqual(rows[0][1], "Mid-large Tech")
 
     def test_missing_career_url_defaults_na(self):
         upsert_companies(self.path, [
@@ -288,7 +288,7 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
         self._seed_company_with_counts("MutCo", tpm=9, ai_tpm=3,
                                        no_tpm=0, auto_archived="No")
         upsert_companies(self.path, [{
-            "company_name": "MutCo", "ai_domain": "Robotics",
+            "company_name": "MutCo", "track": "Robotics",
             "business_focus": "Updated focus",
             "career_url": "https://mutco.io/jobs"
         }])
@@ -418,8 +418,9 @@ class TestJDHelpers(unittest.TestCase):
         if os.path.exists(self.path):
             os.remove(self.path)
 
-    def _insert_jd(self, url, company="TestCorp", is_ai_tpm=True,
-                   location="Remote", tech="pytorch", resp="Lead AI"):
+    def _insert_jd(self, url, company="TestCorp", job_domain="AI",
+                   location="Remote", tech="pytorch", resp="Lead AI",
+                   data_quality=""):
         jd_json = json.dumps({
             "job_title": "TPM",
             "company": company,
@@ -428,7 +429,8 @@ class TestJDHelpers(unittest.TestCase):
             "requirements": [tech],
             "additional_qualifications": ["Nice to have"],
             "key_responsibilities": [resp],
-            "is_ai_tpm": is_ai_tpm,
+            "job_domain": job_domain,
+            "data_quality": data_quality,
         })
         upsert_jd_record(self.path, url, jd_json, "abc123")
 
@@ -463,13 +465,33 @@ class TestJDHelpers(unittest.TestCase):
         age = meta["https://greenhouse.io/testco/job/2"]["age_days"]
         self.assertLess(age, 1.0)  # just inserted, should be < 1 day
 
-    def test_get_jd_rows_for_match_only_ai_tpm(self):
-        self._insert_jd("https://lever.co/x/ai", is_ai_tpm=True)
-        self._insert_jd("https://lever.co/x/notai", is_ai_tpm=False)
+    def test_get_jd_rows_for_match_all_valid_rows(self):
+        """REQ-004-21: every written row is already domain-qualified — the
+        selector returns all valid rows across tracks, carrying job_domain."""
+        self._insert_jd("https://lever.co/x/ai", job_domain="AI")
+        self._insert_jd("https://lever.co/x/space", job_domain="Space")
         rows = get_jd_rows_for_match(self.path)
-        urls = [r["url"] for r in rows]
-        self.assertIn("https://lever.co/x/ai", urls)
-        self.assertNotIn("https://lever.co/x/notai", urls)
+        by_url = {r["url"]: r for r in rows}
+        self.assertIn("https://lever.co/x/ai", by_url)
+        self.assertIn("https://lever.co/x/space", by_url)
+        self.assertEqual(by_url["https://lever.co/x/space"]["job_domain"], "Space")
+        jd = json.loads(by_url["https://lever.co/x/space"]["jd_json"])
+        self.assertEqual(jd["job_domain"], "Space")
+
+    def test_get_jd_rows_for_match_excludes_failed_quality(self):
+        self._insert_jd("https://lever.co/x/ok", job_domain="AI")
+        self._insert_jd("https://lever.co/x/bad", job_domain="AI",
+                        data_quality="failed")
+        urls = [r["url"] for r in get_jd_rows_for_match(self.path)]
+        self.assertIn("https://lever.co/x/ok", urls)
+        self.assertNotIn("https://lever.co/x/bad", urls)
+
+    def test_get_jd_rows_for_match_invalid_domain_falls_back_to_ai(self):
+        """Blank/invalid Job Domain must never drop the row — AI fallback + warning."""
+        self._insert_jd("https://lever.co/x/blank", job_domain="")
+        rows = get_jd_rows_for_match(self.path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["job_domain"], "AI")
 
     def test_upsert_jd_record_update_existing(self):
         url = "https://jobs.lever.co/testco/xyz"
@@ -563,17 +585,18 @@ class TestCountTpmJobsByCompany(unittest.TestCase):
             os.remove(self.path)
 
     def test_counts_jobs_correctly(self):
-        for i, ai in enumerate([True, True, False]):
+        for i, domain in enumerate(["AI", "Fintech", ""]):
             jd_json = json.dumps({
                 "job_title": "TPM", "company": "BigCo", "location": "Remote",
                 "salary_range": "N/A", "core_ai_tech_stack": [],
-                "key_responsibilities": [], "is_ai_tpm": ai,
+                "key_responsibilities": [], "job_domain": domain,
             })
             upsert_jd_record(self.path, f"https://bco.com/job/{i}", jd_json, f"h{i}")
         counts = count_tpm_jobs_by_company(self.path)
         self.assertIn("BigCo", counts)
         self.assertEqual(counts["BigCo"]["tpm"], 3)
-        self.assertEqual(counts["BigCo"]["ai_tpm"], 2)
+        # Only rows with a valid 5-track Job Domain count as qualified
+        self.assertEqual(counts["BigCo"]["qualified"], 2)
 
     def test_empty_tracker_returns_empty_dict(self):
         counts = count_tpm_jobs_by_company(self.path)
@@ -596,16 +619,16 @@ class TestUpdateCompanyJobCounts(unittest.TestCase):
 
     def test_writes_tpm_counts(self):
         update_company_job_counts(self.path, {
-            "BigCo": {"tpm": 5, "ai_tpm": 3}
+            "BigCo": {"tpm": 5, "qualified": 3}
         })
         wb = openpyxl.load_workbook(self.path)
         ws = wb["Company_List"]
         headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
         tpm_col = headers.get("TPM Jobs")
-        ai_tpm_col = headers.get("AI TPM Jobs")
+        qual_col = headers.get("Qualified Jobs")
         self.assertIsNotNone(tpm_col)
         self.assertEqual(ws.cell(2, tpm_col).value, 5)
-        self.assertEqual(ws.cell(2, ai_tpm_col).value, 3)
+        self.assertEqual(ws.cell(2, qual_col).value, 3)
 
 
 class TestBatchUpdateJdTimestamps(unittest.TestCase):
@@ -1638,40 +1661,64 @@ class TestPRJ002Phase4ATSKeywordsColumn(unittest.TestCase):
                          ["PyTorch", "Kubernetes"])
 
 
-class TestPRJ002Phase4JDTrackerMigration(unittest.TestCase):
-    """PRJ-002 Phase 4 — pre-fix workbooks (no ATS Keywords column) auto-migrate."""
+class TestPRJ004JDTrackerMigration(unittest.TestCase):
+    """PRJ-004 REQ-004-14 — legacy JD_Tracker (with 'Is AI TPM' header) is
+    replaced wholesale, but ONLY when it holds no data rows (the user wipes
+    JD rows pre-launch; intake C3). With data present the migration must
+    refuse loudly rather than silently apply over legacy rows."""
 
-    def test_migration_adds_ats_keywords_column(self):
-        path = _tmp_xlsx()
-        try:
-            wb = openpyxl.Workbook()
-            ws = wb.active
-            ws.title = "JD_Tracker"
-            # Pre-Phase-4 JD_HEADERS (12 cols, no "ATS Keywords").
-            old_headers = [
-                "JD URL", "Job Title", "Company", "Location", "Salary",
-                "Requirements", "Additional Qualifications", "Responsibilities",
-                "Is AI TPM", "Updated At", "MD Hash", "Data Quality",
-            ]
-            ws.append(old_headers)
+    _LEGACY_HEADERS = [
+        "JD URL", "Job Title", "Company", "Location", "Salary",
+        "Requirements", "Additional Qualifications", "Responsibilities",
+        "Is AI TPM", "Updated At", "MD Hash", "Data Quality",
+    ]
+
+    def _make_legacy_workbook(self, path, with_data: bool):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "JD_Tracker"
+        ws.append(self._LEGACY_HEADERS)
+        if with_data:
             ws.append(["https://a.com/1", "TPM", "Acme", "Remote", "",
                        "• Req 1", "None", "• Resp 1",
                        "True", "2026-01-01", "h", ""])
-            for required in ("Company_List", "Company_Without_TPM",
-                             "Match_Results", "Tailored_Match_Results"):
-                wb.create_sheet(required)
-            wb.save(path)
-            wb.close()
+        for required in ("Company_List", "Company_Without_TPM",
+                         "Match_Results", "Tailored_Match_Results"):
+            wb.create_sheet(required)
+        wb.save(path)
+        wb.close()
 
+    def test_empty_legacy_sheet_gets_new_headers(self):
+        path = _tmp_xlsx()
+        try:
+            self._make_legacy_workbook(path, with_data=False)
             get_or_create_excel(path)
-
             wb = openpyxl.load_workbook(path)
             ws = wb["JD_Tracker"]
             headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-            self.assertIn("ATS Keywords", headers)
-            # Existing row's pre-existing data still intact in original positions.
+            wb.close()
+            self.assertEqual(headers[:len(JD_HEADERS)], JD_HEADERS)
+            self.assertNotIn("Is AI TPM", headers)
+            for h in ("Job Domain", "Posted Date", "Freshness Tier", "Min YoE",
+                      "YoE Flag", "Work-Auth Status", "Date Flag", "Sort Tier",
+                      "ATS Keywords", "Data Quality"):
+                self.assertIn(h, headers)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_legacy_sheet_with_data_raises(self):
+        path = _tmp_xlsx()
+        try:
+            self._make_legacy_workbook(path, with_data=True)
+            with self.assertRaises(RuntimeError):
+                get_or_create_excel(path)
+            # And nothing was deleted: the legacy row is still there.
+            wb = openpyxl.load_workbook(path)
+            ws = wb["JD_Tracker"]
             self.assertEqual(ws.cell(2, 1).value, "https://a.com/1")
-            self.assertEqual(ws.cell(2, 2).value, "TPM")
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            self.assertIn("Is AI TPM", headers)
             wb.close()
         finally:
             if os.path.exists(path):
@@ -2008,15 +2055,20 @@ class TestDataQualityColumn(unittest.TestCase):
         self.assertEqual(ws.cell(2, dq_col).value, "failed")
         wb.close()
 
-    def test_migration_adds_data_quality_column(self):
-        """Existing Excel without Data Quality column gets it via migration."""
-        # Remove the Data Quality column to simulate old file
+    def test_legacy_migration_includes_data_quality_column(self):
+        """PRJ-004: the wholesale legacy-header rewrite carries Data Quality —
+        an empty legacy sheet (pre-Data-Quality era, with 'Is AI TPM') ends up
+        with the full new header set."""
         wb = openpyxl.load_workbook(self.path)
         ws = wb["JD_Tracker"]
-        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        if "Data Quality" in headers:
-            dq_col = headers.index("Data Quality") + 1
-            ws.delete_cols(dq_col)
+        # Simulate an old-era header row (no Data Quality, legacy Is AI TPM).
+        for c in range(ws.max_column, 0, -1):
+            ws.delete_cols(c)
+        for i, h in enumerate(["JD URL", "Job Title", "Company", "Location",
+                               "Salary", "Requirements",
+                               "Additional Qualifications", "Responsibilities",
+                               "Is AI TPM", "Updated At", "MD Hash"], 1):
+            ws.cell(1, i).value = h
         wb.save(self.path)
         wb.close()
         # Run migration
@@ -2025,6 +2077,7 @@ class TestDataQualityColumn(unittest.TestCase):
         ws2 = wb2["JD_Tracker"]
         headers2 = [ws2.cell(1, c).value for c in range(1, ws2.max_column + 1)]
         self.assertIn("Data Quality", headers2)
+        self.assertNotIn("Is AI TPM", headers2)
         wb2.close()
 
     def test_data_quality_empty_when_not_provided(self):
@@ -2391,7 +2444,8 @@ class TestBug46DocstringColumnNumber(unittest.TestCase):
 
 
 class TestBug55WithoutTpmHeadersMigration(unittest.TestCase):
-    """BUG-55: WITHOUT_TPM_HEADERS must include TPM Jobs and AI TPM Jobs."""
+    """BUG-55 (updated for PRJ-004): WITHOUT_TPM_HEADERS must include TPM Jobs
+    and Qualified Jobs; legacy 'AI Domain'/'AI TPM Jobs' headers migrate in place."""
 
     def setUp(self):
         self.path = _tmp_xlsx()
@@ -2403,7 +2457,7 @@ class TestBug55WithoutTpmHeadersMigration(unittest.TestCase):
     def test_headers_include_tpm_columns(self):
         from shared.excel_store import WITHOUT_TPM_HEADERS
         self.assertIn("TPM Jobs", WITHOUT_TPM_HEADERS)
-        self.assertIn("AI TPM Jobs", WITHOUT_TPM_HEADERS)
+        self.assertIn("Qualified Jobs", WITHOUT_TPM_HEADERS)
 
     def test_new_excel_has_correct_without_tpm_headers(self):
         get_or_create_excel(self.path)
@@ -2412,10 +2466,10 @@ class TestBug55WithoutTpmHeadersMigration(unittest.TestCase):
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
         wb.close()
         self.assertIn("TPM Jobs", headers)
-        self.assertIn("AI TPM Jobs", headers)
+        self.assertIn("Qualified Jobs", headers)
 
     def test_migration_adds_columns_to_existing(self):
-        # Create old-style file with only 5 columns
+        # Create old-style file with only 5 columns (pre-PRJ-004 header names)
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Company_Without_TPM"
@@ -2429,7 +2483,10 @@ class TestBug55WithoutTpmHeadersMigration(unittest.TestCase):
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
         wb.close()
         self.assertIn("TPM Jobs", headers)
-        self.assertIn("AI TPM Jobs", headers)
+        self.assertIn("Qualified Jobs", headers)
+        # PRJ-004: legacy 'AI Domain' header renamed in place
+        self.assertIn("Track", headers)
+        self.assertNotIn("AI Domain", headers)
 
 
 class TestBug52JdTrackerDynamicColumns(unittest.TestCase):
@@ -2475,7 +2532,7 @@ class TestBug52JdTrackerDynamicColumns(unittest.TestCase):
                 os.remove(path)
 
     def test_count_tpm_jobs_reads_correct_columns(self):
-        """End-to-end: count_tpm_jobs_by_company reads Company and Is AI TPM correctly."""
+        """End-to-end: count_tpm_jobs_by_company reads Company and Job Domain correctly."""
         path = _tmp_xlsx()
         try:
             get_or_create_excel(path)
@@ -2484,18 +2541,18 @@ class TestBug52JdTrackerDynamicColumns(unittest.TestCase):
             row = [None] * len(JD_HEADERS)
             row[JD_HEADERS.index("JD URL")] = "https://example.com/job/1"
             row[JD_HEADERS.index("Company")] = "AcmeCorp"
-            row[JD_HEADERS.index("Is AI TPM")] = "True"
+            row[JD_HEADERS.index("Job Domain")] = "Robotics"
             ws.append(row)
             row2 = [None] * len(JD_HEADERS)
             row2[JD_HEADERS.index("JD URL")] = "https://example.com/job/2"
             row2[JD_HEADERS.index("Company")] = "AcmeCorp"
-            row2[JD_HEADERS.index("Is AI TPM")] = "False"
+            row2[JD_HEADERS.index("Job Domain")] = ""
             ws.append(row2)
             wb.save(path)
             wb.close()
             counts = count_tpm_jobs_by_company(path)
             self.assertEqual(counts["AcmeCorp"]["tpm"], 2)
-            self.assertEqual(counts["AcmeCorp"]["ai_tpm"], 1)
+            self.assertEqual(counts["AcmeCorp"]["qualified"], 1)
         finally:
             if os.path.exists(path):
                 os.remove(path)
@@ -2594,8 +2651,10 @@ class TestClassifyLocation(unittest.TestCase):
 
 
 class TestSortJdTrackerByTier(unittest.TestCase):
-    """Integration: sort_jd_tracker_by_tier writes Location Tier, sorts rows,
-    applies fill colors, and is idempotent."""
+    """PRJ-004 REQ-004-15: sort_jd_tracker_by_tier recomputes Freshness Tier
+    from Posted Date, writes the combined 1-6 Sort Tier (9 = unknown/aged/
+    other-region), sorts rows, applies fills, preserves row count, and is
+    idempotent."""
 
     def setUp(self):
         self.path = _tmp_xlsx()
@@ -2605,7 +2664,12 @@ class TestSortJdTrackerByTier(unittest.TestCase):
         if os.path.exists(self.path):
             os.remove(self.path)
 
-    def _add_jd(self, url: str, location: str, updated_at: str, company: str = "Acme"):
+    @staticmethod
+    def _days_ago(n: int) -> str:
+        return (datetime.now().date() - timedelta(days=n)).strftime("%Y-%m-%d")
+
+    def _add_jd(self, url: str, location: str, posted_days_ago: int | None,
+                updated_at: str = "2026-05-01 10:00:00", company: str = "Acme"):
         wb = openpyxl.load_workbook(self.path)
         ws = wb["JD_Tracker"]
         row = [None] * len(JD_HEADERS)
@@ -2613,93 +2677,196 @@ class TestSortJdTrackerByTier(unittest.TestCase):
         row[JD_HEADERS.index("Company")]    = company
         row[JD_HEADERS.index("Location")]   = location
         row[JD_HEADERS.index("Updated At")] = updated_at
+        if posted_days_ago is not None:
+            row[JD_HEADERS.index("Posted Date")] = self._days_ago(posted_days_ago)
         ws.append(row)
         wb.save(self.path)
         wb.close()
 
-    def test_sort_order_seattle_remote_other(self):
-        self._add_jd("u1", "San Francisco, CA",  "2026-05-01 10:00:00")
-        self._add_jd("u2", "Bellevue, WA",       "2026-05-02 10:00:00")
-        self._add_jd("u3", "Remote",             "2026-05-03 10:00:00")
-        self._add_jd("u4", "Seattle, WA",        "2026-05-04 10:00:00")
-        self._add_jd("u5", "Mountain View, CA",  "2026-05-05 10:00:00")
-        self._add_jd("u6", "Remote, USA",        "2026-05-06 10:00:00")
-
-        n = sort_jd_tracker_by_tier(self.path)
-        self.assertEqual(n, 6)
-
+    def _ordered(self):
         wb = openpyxl.load_workbook(self.path)
         ws = wb["JD_Tracker"]
         url_col  = JD_HEADERS.index("JD URL") + 1
-        tier_col = JD_HEADERS.index("Location Tier") + 1
-        ordered = [(ws.cell(r, url_col).value, ws.cell(r, tier_col).value)
-                   for r in range(2, ws.max_row + 1) if ws.cell(r, url_col).value]
+        tier_col = JD_HEADERS.index("Sort Tier") + 1
+        out = [(ws.cell(r, url_col).value, ws.cell(r, tier_col).value)
+               for r in range(2, ws.max_row + 1) if ws.cell(r, url_col).value]
         wb.close()
-        # Greater Seattle first (Updated At desc within tier): u4 (May 4) before u2 (May 2)
-        # then Remote: u6 (May 6) before u3 (May 3)
-        # then Other: u5 (May 5) before u1 (May 1)
-        self.assertEqual(ordered, [
-            ("u4", "Greater Seattle"),
-            ("u2", "Greater Seattle"),
-            ("u6", "Remote"),
-            ("u3", "Remote"),
-            ("u5", "Other"),
-            ("u1", "Other"),
+        return out
+
+    def test_sort_order_combined_tiers(self):
+        # One row per tier cell, inserted out of order on purpose.
+        self._add_jd("u_t4", "Austin, TX",         posted_days_ago=5)     # T2 x CA/TX   -> 4
+        self._add_jd("u_t1", "Seattle, WA",        posted_days_ago=1)     # T1 x Sea/Rem -> 1
+        self._add_jd("u_t6", "San Francisco, CA",  posted_days_ago=10)    # T3 x CA/TX   -> 6
+        self._add_jd("u_t3", "Remote",             posted_days_ago=5)     # T2 x Sea/Rem -> 3
+        self._add_jd("u_t9", "Bellevue, WA",       posted_days_ago=None)  # unknown date -> 9
+        self._add_jd("u_t2", "Irvine, CA",         posted_days_ago=1)     # T1 x CA/TX   -> 2
+        self._add_jd("u_t5", "Redmond, WA",        posted_days_ago=10)    # T3 x Sea/Rem -> 5
+
+        n = sort_jd_tracker_by_tier(self.path)
+        self.assertEqual(n, 7)
+        self.assertEqual(self._ordered(), [
+            ("u_t1", 1), ("u_t2", 2), ("u_t3", 3), ("u_t4", 4),
+            ("u_t5", 5), ("u_t6", 6), ("u_t9", 9),
         ])
 
-    def test_fill_colors_applied(self):
-        self._add_jd("u1", "Seattle, WA",       "2026-05-01 10:00:00")
-        self._add_jd("u2", "Remote",            "2026-05-02 10:00:00")
-        self._add_jd("u3", "San Francisco, CA", "2026-05-03 10:00:00")
+    def test_freshness_recomputed_from_posted_date(self):
+        """A stale scrape-time Freshness Tier is overwritten at sort time."""
+        self._add_jd("u1", "Seattle, WA", posted_days_ago=10)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        ws.cell(2, JD_HEADERS.index("Freshness Tier") + 1).value = 1  # stale
+        wb.save(self.path)
+        wb.close()
 
         sort_jd_tracker_by_tier(self.path)
 
         wb = openpyxl.load_workbook(self.path)
         ws = wb["JD_Tracker"]
-        # Row 2 = Seattle (green C6EFCE), Row 3 = Remote (yellow FFEB9C), Row 4 = Other (no fill)
+        self.assertEqual(ws.cell(2, JD_HEADERS.index("Freshness Tier") + 1).value, 3)
+        self.assertEqual(ws.cell(2, JD_HEADERS.index("Sort Tier") + 1).value, 5)
+        wb.close()
+
+    def test_aged_row_sinks_but_is_never_deleted(self):
+        """REQ-004-16/G7: a grandfathered row older than 14 days gets tier 9
+        and sinks — it is never removed by the sorter."""
+        self._add_jd("u_aged",  "Seattle, WA", posted_days_ago=30)
+        self._add_jd("u_fresh", "Seattle, WA", posted_days_ago=1)
+        n = sort_jd_tracker_by_tier(self.path)
+        self.assertEqual(n, 2)
+        self.assertEqual(self._ordered(), [("u_fresh", 1), ("u_aged", 9)])
+
+    def test_fill_colors_applied(self):
+        self._add_jd("u1", "Seattle, WA",       posted_days_ago=1)     # tier 1 green
+        self._add_jd("u2", "San Francisco, CA", posted_days_ago=5)     # tier 4 yellow
+        self._add_jd("u3", "Bellevue, WA",      posted_days_ago=None)  # tier 9 no fill
+
+        sort_jd_tracker_by_tier(self.path)
+
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
         self.assertIn("C6EFCE", str(ws.cell(2, 1).fill.start_color.rgb or ""))
         self.assertIn("FFEB9C", str(ws.cell(3, 1).fill.start_color.rgb or ""))
-        # Row 4 should have no solid fill — fill_type is None or 'none'
         row4_fill_type = ws.cell(4, 1).fill.fill_type
         self.assertIn(row4_fill_type, (None, "none"))
         wb.close()
 
     def test_idempotent(self):
-        self._add_jd("u1", "Seattle, WA",       "2026-05-01 10:00:00")
-        self._add_jd("u2", "Remote",            "2026-05-02 10:00:00")
-        self._add_jd("u3", "San Francisco, CA", "2026-05-03 10:00:00")
+        self._add_jd("u1", "Seattle, WA",       posted_days_ago=1)
+        self._add_jd("u2", "Remote",            posted_days_ago=5)
+        self._add_jd("u3", "San Francisco, CA", posted_days_ago=10)
 
         sort_jd_tracker_by_tier(self.path)
         sort_jd_tracker_by_tier(self.path)  # second call must not change order
 
-        wb = openpyxl.load_workbook(self.path)
-        ws = wb["JD_Tracker"]
-        url_col = JD_HEADERS.index("JD URL") + 1
-        urls = [ws.cell(r, url_col).value for r in range(2, ws.max_row + 1)
-                if ws.cell(r, url_col).value]
-        wb.close()
-        self.assertEqual(urls, ["u1", "u2", "u3"])
+        self.assertEqual([u for u, _ in self._ordered()], ["u1", "u2", "u3"])
 
     def test_empty_sheet(self):
         # No data rows: sort returns 0 and does not crash.
         n = sort_jd_tracker_by_tier(self.path)
         self.assertEqual(n, 0)
 
-    def test_blank_updated_at_sinks_within_tier(self):
-        self._add_jd("u_old",   "Seattle, WA", "2026-05-01 10:00:00")
-        self._add_jd("u_blank", "Bellevue, WA", "")
-        self._add_jd("u_new",   "Redmond, WA", "2026-05-10 10:00:00")
+    def test_posted_date_desc_within_tier(self):
+        self._add_jd("u_older", "Seattle, WA",  posted_days_ago=2,
+                     updated_at="2026-05-09 10:00:00")
+        self._add_jd("u_newer", "Bellevue, WA", posted_days_ago=1,
+                     updated_at="2026-05-01 10:00:00")
 
         sort_jd_tracker_by_tier(self.path)
+        # Both tier 1; newer Posted Date first even though Updated At is older.
+        self.assertEqual([u for u, _ in self._ordered()], ["u_newer", "u_older"])
 
-        wb = openpyxl.load_workbook(self.path)
-        ws = wb["JD_Tracker"]
-        url_col = JD_HEADERS.index("JD URL") + 1
-        urls = [ws.cell(r, url_col).value for r in range(2, ws.max_row + 1)
-                if ws.cell(r, url_col).value]
-        wb.close()
-        # All Greater Seattle. Newer first; blank sinks to bottom of tier.
-        self.assertEqual(urls, ["u_new", "u_old", "u_blank"])
+
+class TestComputeFreshnessTier(unittest.TestCase):
+    """Pure-function boundary tests (design section 7: 2/3, 7/8, 14/15 pinned)."""
+
+    TODAY = date(2026, 7, 7)
+
+    def _tier(self, days_ago: int):
+        from shared.excel_store import compute_freshness_tier
+        posted = (self.TODAY - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        return compute_freshness_tier(posted, today=self.TODAY)
+
+    def test_band_boundaries(self):
+        self.assertEqual(self._tier(0), 1)
+        self.assertEqual(self._tier(2), 1)
+        self.assertEqual(self._tier(3), 2)
+        self.assertEqual(self._tier(7), 2)
+        self.assertEqual(self._tier(8), 3)
+        self.assertEqual(self._tier(14), 3)   # day-14 keeps: last tierable day
+        self.assertIsNone(self._tier(15))     # pinned boundary: >=15 untierable
+
+    def test_blank_and_unparsable(self):
+        from shared.excel_store import compute_freshness_tier
+        self.assertIsNone(compute_freshness_tier("", today=self.TODAY))
+        self.assertIsNone(compute_freshness_tier("Posted 3 Days Ago", today=self.TODAY))
+
+    def test_future_date_treated_as_today(self):
+        self.assertEqual(self._tier(-1), 1)
+
+
+class TestClassifyRegion(unittest.TestCase):
+    """Pure-function matrix for classify_region (REQ-004-12)."""
+
+    def _r(self, loc):
+        from shared.excel_store import classify_region
+        return classify_region(loc)
+
+    def test_seattle(self):
+        self.assertEqual(self._r("Seattle, WA"), "Seattle")
+        self.assertEqual(self._r("Bellevue, WA"), "Seattle")
+
+    def test_remote(self):
+        self.assertEqual(self._r("Remote"), "Remote")
+        self.assertEqual(self._r("Remote, USA"), "Remote")
+        self.assertEqual(self._r("Remote, Canada"), "Other")
+
+    def test_california_incl_socal(self):
+        self.assertEqual(self._r("San Francisco, CA"), "CA")
+        self.assertEqual(self._r("El Segundo, CA"), "CA")
+        self.assertEqual(self._r("Hawthorne, California"), "CA")
+
+    def test_texas(self):
+        self.assertEqual(self._r("Austin, TX"), "TX")
+        self.assertEqual(self._r("Houston, Texas"), "TX")
+
+    def test_other_us_dropped_regions(self):
+        self.assertEqual(self._r("New York, NY"), "Other")
+        self.assertEqual(self._r("Boston, MA"), "Other")
+
+    def test_unknown(self):
+        self.assertEqual(self._r(""), "Unknown")
+        self.assertEqual(self._r(None), "Unknown")
+        self.assertEqual(self._r("N/A"), "Unknown")
+
+    def test_multi_segment_best_region_wins(self):
+        self.assertEqual(self._r("San Francisco, CA; Seattle, WA"), "Seattle")
+        self.assertEqual(self._r("Austin, TX; Remote"), "Remote")
+        self.assertEqual(self._r("New York, NY; Austin, TX"), "TX")
+
+
+class TestComputeSortTier(unittest.TestCase):
+    """Full 6-cell matrix + tier-9 cases for compute_sort_tier (REQ-004-15)."""
+
+    def _t(self, fresh, region):
+        from shared.excel_store import compute_sort_tier
+        return compute_sort_tier(fresh, region)
+
+    def test_matrix(self):
+        self.assertEqual(self._t(1, "Seattle"), 1)
+        self.assertEqual(self._t(1, "Remote"), 1)
+        self.assertEqual(self._t(1, "CA"), 2)
+        self.assertEqual(self._t(1, "TX"), 2)
+        self.assertEqual(self._t(2, "Seattle"), 3)
+        self.assertEqual(self._t(2, "CA"), 4)
+        self.assertEqual(self._t(3, "Remote"), 5)
+        self.assertEqual(self._t(3, "TX"), 6)
+
+    def test_tier_nine_cases(self):
+        self.assertEqual(self._t(None, "Seattle"), 9)   # unknown/aged date
+        self.assertEqual(self._t(1, "Other"), 9)        # non-target region
+        self.assertEqual(self._t(1, "Unknown"), 9)
+        self.assertEqual(self._t(None, "Other"), 9)
 
 
 if __name__ == "__main__":

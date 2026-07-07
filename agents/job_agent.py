@@ -2020,13 +2020,13 @@ async def _main_inner(summary: RunSummary):
     print("📊 Computing job counts per company...")
     counts = count_tpm_jobs_by_company(xlsx_path)
     update_company_job_counts(xlsx_path, counts)
-    total_tpm    = sum(v["tpm"]    for v in counts.values())
-    total_ai_tpm = sum(v["ai_tpm"] for v in counts.values())
-    print(f"   Total TPM jobs tracked:    {total_tpm}")
-    print(f"   Total AI TPM jobs tracked: {total_ai_tpm}")
-    for cname, v in sorted(counts.items(), key=lambda x: -x[1]["ai_tpm"]):
+    total_tpm       = sum(v["tpm"]       for v in counts.values())
+    total_qualified = sum(v["qualified"] for v in counts.values())
+    print(f"   Total TPM jobs tracked:       {total_tpm}")
+    print(f"   Total qualified jobs tracked: {total_qualified}")
+    for cname, v in sorted(counts.items(), key=lambda x: -x[1]["qualified"]):
         if v["tpm"] > 0:
-            print(f"   {cname}: {v['tpm']} TPM | {v['ai_tpm']} AI TPM")
+            print(f"   {cname}: {v['tpm']} TPM | {v['qualified']} qualified")
 
     # ── Phase: REQ-063 auto-archive companies with no TPM jobs ────────────────
     print(f"\n{'='*60}")
