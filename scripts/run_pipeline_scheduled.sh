@@ -9,7 +9,8 @@ set -e
 set -u
 set -o pipefail
 
-PROJECT_DIR="/Users/michaelnomad/pathfinder"
+# PATHFINDER_PROJECT_DIR override exists for the test harness only.
+PROJECT_DIR="${PATHFINDER_PROJECT_DIR:-/Users/michaelnomad/pathfinder}"
 cd "$PROJECT_DIR"
 
 mkdir -p logs

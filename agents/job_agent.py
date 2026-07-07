@@ -1937,6 +1937,30 @@ def _assess_jd_quality(jd_data: dict) -> str:
     return "partial"
 
 
+def _apply_prescrape_freshness_gate(to_process: list, list_meta: dict,
+                                    known_url_meta: dict) -> tuple:
+    """PRJ-004 REQ-004-10 (D-11/D-18): pre-scrape freshness gate.
+
+    Skips a URL iff ALL of: it is NOT already in the sheet, the list API
+    supplied a date that PARSES as ISO (YYYY-MM-DD), and that date is ≥15 days
+    old. Unparseable/blank dates are explicitly NOT treated as aged — they take
+    the unknown-date keep+flag path (never a silent drop), so a future adapter
+    forwarding raw date text cannot cause aged-drops. Rows already tracked are
+    never retroactively touched. Returns (kept_urls, aged_skipped_count)."""
+    kept, aged_skipped = [], 0
+    for u in to_process:
+        posted = str((list_meta.get(u) or {}).get("posted_date", "") or "").strip()
+        is_parseable_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", posted))
+        if u not in known_url_meta and is_parseable_date \
+                and compute_freshness_tier(posted) is None:
+            logging.info(f"[FreshnessGate] Skipped ≥15-day-old posting "
+                         f"({posted}): {u}")
+            aged_skipped += 1
+            continue
+        kept.append(u)
+    return kept, aged_skipped
+
+
 # PRJ-004 REQ-004-08: Senior/Staff-prefix titles auto-qualify when YoE is unstated.
 _SENIOR_TITLE_RE = re.compile(r"\b(senior|sr\.?|staff|principal|director)\b", re.I)
 
@@ -2010,11 +2034,12 @@ async def _process_scraped_jd(
     if domain not in JOB_DOMAIN_VALUES:
         print(f"      🚫 [DomainGate] No track match (domain={domain!r}): {url}")
         return
-    # ── Gate 2 (REQ-004-08): YoE window [4, 10]. Unstated → keep + flag.
+    # ── Gate 2 (REQ-004-08): YoE — skip iff stated min ≤3 or ≥12
+    # ("10+ years" keeps, "12+ years" skips). Unstated → keep + flag.
     min_yoe = parsed.get("min_yoe")
     if isinstance(min_yoe, int):
         if min_yoe <= 3 or min_yoe >= 12:
-            print(f"      🚫 [YoEGate] min {min_yoe} yrs outside [4,10]: {url}")
+            print(f"      🚫 [YoEGate] stated min {min_yoe} yrs (skip rule: ≤3 or ≥12): {url}")
             return
         parsed["yoe_flag"] = ""
     else:
@@ -2095,22 +2120,8 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
 
     to_process = [u for u in urls if u not in fresh_set]
 
-    # PRJ-004 REQ-004-10 (D-11/D-18): pre-scrape freshness gate — applies ONLY
-    # to URLs not already in the sheet, and only when the list API supplied a
-    # posting date. Skipping before scraping saves Firecrawl/Gemini spend on
-    # stale postings; rows already tracked are never retroactively touched.
-    aged_skipped = 0
-    kept = []
-    for u in to_process:
-        posted = (list_meta.get(u) or {}).get("posted_date", "")
-        if u not in known_url_meta and posted \
-                and compute_freshness_tier(posted) is None:
-            logging.info(f"[FreshnessGate] Skipped ≥15-day-old posting "
-                         f"({posted}): {u}")
-            aged_skipped += 1
-            continue
-        kept.append(u)
-    to_process = kept
+    to_process, aged_skipped = _apply_prescrape_freshness_gate(
+        to_process, list_meta, known_url_meta)
     if aged_skipped:
         print(f"    🕰️  Freshness gate: skipped {aged_skipped} posting(s) ≥15 days old.")
 

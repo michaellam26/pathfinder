@@ -119,7 +119,11 @@ posted_date: str = ""               # NOT LLM-extracted; injected by code (see 2
   - Amazon adapter: `posted_date` field (see 2.2.5).
 - **Metadata threading**: `process_company` (`job_agent.py:1745+`) generalizes the existing `workday_meta` pattern (`job_agent.py:1784`) into `list_meta = {l["url"]: l for l in raw}`; `_process_scraped_jd` receives it and injects `parsed["posted_date"]` before staging.
 - **Write-time gate (Q3 resolution)**: applied **only to URLs not already in `known_url_meta`** — pre-scrape when the list API supplied a date (skip before spending Firecrawl/Gemini), post-parse otherwise. **Boundary convention (pinned per TPM design-review Finding 1)**: keep iff age ≤ 14 days; age ≥ 15 days → skip + log. This makes the gate boundary and the tier ceiling identical (every kept dated posting is tierable — no day-15 dead zone), and reads BRD "older than 15 days" as "15 or more days old". Existing rows are never retroactively touched (G7/REQ-004-16).
-- **Unknown date**: keep + `Date Flag = "manual review — unknown posted date"`. Best-effort backfill: new `_backfill_posted_date(company, title, tavily_client) -> str` running one Tavily query scoped `site:linkedin.com/jobs "<title>" "<company>"` and regex-parsing a posted-date string from result snippets (REQ-004-19: search-signal only, never fetch LinkedIn pages). Runs only when `TAVILY_API_KEY` is set (new optional env read in job_agent `_main_inner`); failure leaves the flag for manual lookup. Never a drop condition.
+- **Unknown date**: keep + `Date Flag = "manual review — unknown posted date"`.
+  *Clarification (Phase 4 code review F3)*: the freshness gate applies only to
+  list-API-supplied dates pre-scrape; a date recovered later by backfill is
+  NEVER a drop condition even if aged — the row keeps and sinks to Sort Tier 9.
+  This resolves the "post-parse otherwise" ambiguity in favor of never-drop. Best-effort backfill: new `_backfill_posted_date(company, title, tavily_client) -> str` running one Tavily query scoped `site:linkedin.com/jobs "<title>" "<company>"` and regex-parsing a posted-date string from result snippets (REQ-004-19: search-signal only, never fetch LinkedIn pages). Runs only when `TAVILY_API_KEY` is set (new optional env read in job_agent `_main_inner`); failure leaves the flag for manual lookup. Never a drop condition.
 - **Tier computation**: shared pure function in `shared/excel_store.py` (next to `classify_location`):
   ```python
   def compute_freshness_tier(posted_date: str, today: date | None = None) -> int | None:

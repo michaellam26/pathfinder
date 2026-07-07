@@ -2540,5 +2540,129 @@ class TestTeslaRegression(unittest.TestCase):
         self.assertEqual(obj.posted_date, "")            # keep + Date Flag
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 4 QA follow-ups — pre-scrape gate, prompt anchors, llm_filter rules
+# ═════════════════════════════════════════════════════════════════════════════
+class TestPrescrapeFreshnessGate(unittest.TestCase):
+    """P0 gap from test analysis: the enforcement point of REQ-004-10/G4."""
+
+    @staticmethod
+    def _days_ago(n):
+        from datetime import datetime, timedelta
+        return (datetime.now().date() - timedelta(days=n)).strftime("%Y-%m-%d")
+
+    def _gate(self, to_process, list_meta, known=None):
+        from agents.job_agent import _apply_prescrape_freshness_gate
+        return _apply_prescrape_freshness_gate(to_process, list_meta, known or {})
+
+    def test_aged_new_posting_skipped_fresh_kept(self):
+        meta = {"u_old": {"posted_date": self._days_ago(20)},
+                "u_new": {"posted_date": self._days_ago(10)}}
+        kept, aged = self._gate(["u_old", "u_new"], meta)
+        self.assertEqual(kept, ["u_new"])
+        self.assertEqual(aged, 1)
+
+    def test_day_14_keeps_day_15_skips(self):
+        meta = {"u14": {"posted_date": self._days_ago(14)},
+                "u15": {"posted_date": self._days_ago(15)}}
+        kept, aged = self._gate(["u14", "u15"], meta)
+        self.assertEqual(kept, ["u14"])
+        self.assertEqual(aged, 1)
+
+    def test_already_tracked_url_never_gated(self):
+        """G7/REQ-004-16: rows already in the sheet are never retroactively
+        dropped, even if their list-API date is aged."""
+        meta = {"u_known": {"posted_date": self._days_ago(30)}}
+        kept, aged = self._gate(["u_known"], meta,
+                                known={"u_known": {"age_days": 5}})
+        self.assertEqual(kept, ["u_known"])
+        self.assertEqual(aged, 0)
+
+    def test_unparseable_date_is_unknown_not_aged(self):
+        """Hardening (code review F4): raw/unparseable date text must take the
+        keep+flag path, never be treated as aged."""
+        meta = {"u_raw": {"posted_date": "Posted 30+ Days Ago"},
+                "u_blank": {"posted_date": ""}, "u_nometa": {}}
+        kept, aged = self._gate(["u_raw", "u_blank", "u_nometa"], meta)
+        self.assertEqual(kept, ["u_raw", "u_blank", "u_nometa"])
+        self.assertEqual(aged, 0)
+
+
+class TestExtractJdPromptAnchors(unittest.TestCase):
+    """P1 gap: the D-10 mapping anchors must actually be in the mid-large
+    system prompt; vertical prompts must force the track's domain."""
+
+    def setUp(self):
+        import agents.job_agent as jm
+        self._orig = jm._KEY_POOL
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = "{}"
+        pool.generate_content.return_value = resp
+        jm._KEY_POOL = pool
+
+    def tearDown(self):
+        import agents.job_agent as jm
+        jm._KEY_POOL = self._orig
+
+    def _sys_instr(self, track):
+        import agents.job_agent as jm
+        jm.types.GenerateContentConfig.reset_mock()
+        jm.extract_jd("# JD body", company="TestCo", track=track)
+        return jm.types.GenerateContentConfig.call_args.kwargs["system_instruction"]
+
+    def test_midlarge_prompt_contains_all_five_anchors(self):
+        instr = self._sys_instr("Mid-large Tech")
+        for anchor in ("GPU fleet", "Google Pay", "Amazon Robotics",
+                       "Project Kuiper", "Azure Government"):
+            self.assertIn(anchor, instr, f"missing mapping anchor: {anchor}")
+        self.assertIn("SECURITY:", instr)
+        # YoE + work-auth clauses ride the same call (no extra round-trip)
+        self.assertIn("min_yoe", instr)
+        self.assertIn("clearance_required", instr)
+
+    def test_vertical_prompt_forces_domain(self):
+        instr = self._sys_instr("Space")
+        self.assertIn('set job_domain to "Space"', instr)
+        self.assertIn("SECURITY:", instr)
+
+
+class TestLlmFilterJobsRuleSelection(unittest.TestCase):
+    """P1 gap: vertical fast-path vs mid-large 5-track rule (REQ-004-09)."""
+
+    def setUp(self):
+        import agents.job_agent as jm
+        self._orig = jm._KEY_POOL
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = '{"urls": ["https://x.co/1"]}'
+        pool.generate_content.return_value = resp
+        jm._KEY_POOL = pool
+
+    def tearDown(self):
+        import agents.job_agent as jm
+        jm._KEY_POOL = self._orig
+
+    def _sys_instr(self, track):
+        import agents.job_agent as jm
+        jm.types.GenerateContentConfig.reset_mock()
+        jm.llm_filter_jobs("TestCo", [{"url": "https://x.co/1", "title": "TPM"}],
+                           track)
+        return jm.types.GenerateContentConfig.call_args.kwargs["system_instruction"]
+
+    def test_vertical_track_gets_permissive_rule(self):
+        instr = self._sys_instr("Defense")
+        self.assertIn("Defense-track company", instr)
+        self.assertIn("every genuine Technical Program Manager", instr)
+        self.assertNotIn("five tracks", instr)
+
+    def test_midlarge_gets_five_track_rule(self):
+        instr = self._sys_instr("Mid-large Tech")
+        self.assertIn("five tracks", instr)
+        self.assertIn("Project Kuiper", instr)
+        self.assertIn("SECURITY:", instr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

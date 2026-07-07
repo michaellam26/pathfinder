@@ -2869,5 +2869,44 @@ class TestComputeSortTier(unittest.TestCase):
         self.assertEqual(self._t(None, "Other"), 9)
 
 
+
+class TestFreshnessTierXorDateFlag(unittest.TestCase):
+    """Intake §9.4 seed, literal form (Phase 4 QA P2): every written row has a
+    Freshness Tier XOR a Date Flag — no row has neither."""
+
+    def test_written_rows_have_tier_xor_flag(self):
+        import tempfile, json
+        fd, path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(path)
+        try:
+            get_or_create_excel(path)
+            base = {"job_title": "TPM", "company": "Co", "location": "Seattle, WA",
+                    "salary_range": "", "requirements": ["x"],
+                    "additional_qualifications": [], "key_responsibilities": ["y"],
+                    "job_domain": "AI"}
+            recent = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            rows = [
+                ("https://a.co/dated",   {**base, "posted_date": recent}),
+                ("https://a.co/unknown", {**base,
+                                          "date_flag": "manual review — unknown posted date"}),
+            ]
+            batch_upsert_jd_records(path, [(u, json.dumps(d), "h") for u, d in rows])
+            wb = openpyxl.load_workbook(path)
+            ws = wb["JD_Tracker"]
+            c_fresh = JD_HEADERS.index("Freshness Tier") + 1
+            c_flag  = JD_HEADERS.index("Date Flag") + 1
+            for r in range(2, ws.max_row + 1):
+                has_tier = ws.cell(r, c_fresh).value in (1, 2, 3)
+                has_flag = bool(ws.cell(r, c_flag).value)
+                self.assertTrue(has_tier != has_flag,
+                                f"row {r}: tier={ws.cell(r, c_fresh).value!r} "
+                                f"flag={ws.cell(r, c_flag).value!r} — must be XOR")
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

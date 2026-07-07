@@ -49,6 +49,7 @@ from shared.excel_store import (
 )
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.config import MODEL
+from shared.prompts import SECURITY_CLAUSE
 from shared.run_summary import RunSummary
 
 load_dotenv()
@@ -747,13 +748,14 @@ def discover_ai_companies(tavily_key: str, existing_names: set,
             "builds, who their customers are, their key competitive differentiator, "
             "and notable products/funding/traction.\n"
             "DO NOT include any career_url or URL fields — URLs are handled separately."
+            + SECURITY_CLAUSE  # P0-3: Tavily snippets are untrusted third-party content
         ),
         temperature=0.1,
         response_mime_type="application/json",
         response_schema=CompanyInfoList,
     )
     prompt = (
-        f"Search context:\n{json.dumps(results)}\n\n"
+        f"Search context:\n<scraped_content>\n{json.dumps(results)}\n</scraped_content>\n\n"
         f"EXISTING_COMPANIES (DO NOT include these):\n{json.dumps(existing_list)}\n\n"
         f"Extract exactly {need} NEW companies with: company_name, "
         f"track (one of: {' / '.join(TRACK_VALUES)}), "
@@ -1102,6 +1104,7 @@ def migrate_tracks(xlsx_path: str | None = None) -> dict:
         "Return one TrackClassification per input company, company_name copied "
         "verbatim. Set confident=false when the business description is too thin "
         "to decide — do not guess."
+        + SECURITY_CLAUSE  # P0-3: business_focus text originated from scraped web content
     )
 
     migrated, flagged = 0, 0
@@ -1121,7 +1124,8 @@ def migrate_tracks(xlsx_path: str | None = None) -> dict:
         try:
             resp = _KEY_POOL.generate_content(
                 model=MODEL,
-                contents=f"Classify these companies:\n{payload}",
+                contents=("Classify these companies:\n"
+                          f"<scraped_content>\n{payload}\n</scraped_content>"),
                 config=config,
             )
             results = {c.get("company_name", "").strip(): c
