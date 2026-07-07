@@ -1,6 +1,6 @@
 # PRJ-004: Multi-Track Expansion
 
-**Phase**: Phase 3 — Implementation
+**Phase**: Phase 4 — Testing & Bug Fix
 **Status**: 🟡 In Progress
 **Priority**: P1
 **Created**: 2026-07-07
@@ -21,24 +21,24 @@
 
 ### Phase 3: Implementation
 - [x] Task decomposition and dependency ordering (TPM) — design.md §6 T1–T17; critical path T1→T5→T6→T9→T17
-- [ ] Code implementation (Engineer Lead)
-  - [ ] T1 excel_store schema + shared functions (+ atomic test-fixture update, R-11)
-  - [ ] T2 row selector + qualified-count rework
-  - [ ] T3 company_agent taxonomy/quotas/rules
-  - [ ] T4 --migrate-tracks migration CLI
-  - [ ] T5 job_agent extraction core (YoE/domain/work-auth gates)
-  - [ ] T6 posting dates + freshness gate + backfill
-  - [ ] T7 geo tighten
-  - [ ] T8 Workday pagination + Firecrawl uncap
-  - [ ] T9 combined 1–6 sort
-  - [ ] T10 per-track prompt dicts
-  - [ ] T11 match_agent routing + per-track caches
-  - [ ] T12 resume_optimizer routing
-  - [ ] T13 launchd failure surfacing (P1)
-  - [ ] T14 Amazon.jobs adapter (P1)
-  - [ ] T15 Tesla regression verification (P2)
+- [x] Code implementation (Engineer Lead) — T1–T15 complete across 9 commits (49e3b1b…f493ffd); T16 Google adapter deferred post-launch (P2 stretch, per design)
+  - [x] T1 excel_store schema + shared functions (+ atomic test-fixture update, R-11)
+  - [x] T2 row selector + qualified-count rework
+  - [x] T3 company_agent taxonomy/quotas/rules
+  - [x] T4 --migrate-tracks migration CLI
+  - [x] T5 job_agent extraction core (YoE/domain/work-auth gates)
+  - [x] T6 posting dates + freshness gate + backfill
+  - [x] T7 geo tighten
+  - [x] T8 Workday pagination + Firecrawl uncap
+  - [x] T9 combined 1–6 sort
+  - [x] T10 per-track prompt dicts
+  - [x] T11 match_agent routing + per-track caches
+  - [x] T12 resume_optimizer routing
+  - [x] T13 launchd failure surfacing (P1)
+  - [x] T14 Amazon.jobs adapter (P1)
+  - [x] T15 Tesla regression verification (P2)
   - [ ] T16 Google Careers adapter (P2, stretch)
-- [ ] Code self-testing passes (full suite green)
+- [x] Code self-testing passes — suite 930 passed / 1 skipped (was 859 at baseline; +71 new PRJ-004 tests, 0 regressions)
 - External prerequisites (user-owned, block T4/T17 rollout only): prune Company_List; wipe JD_Tracker; trial-run cost confirmation
 
 ### Phase 4: Testing & Bug Fix
