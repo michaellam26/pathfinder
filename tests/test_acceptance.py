@@ -89,7 +89,8 @@ def _make_temp_xlsx():
     return path
 
 
-def _make_jd_json(title="AI TPM", company="TestCo", location="San Francisco, CA"):
+def _make_jd_json(title="AI TPM", company="TestCo", location="San Francisco, CA",
+                  job_domain="AI"):
     return json.dumps({
         "job_title": title,
         "company": company,
@@ -98,7 +99,7 @@ def _make_jd_json(title="AI TPM", company="TestCo", location="San Francisco, CA"
         "requirements": ["LLM experience", "PyTorch", "MLOps"],
         "additional_qualifications": ["GenAI deployment"],
         "key_responsibilities": ["Lead AI programs", "Cross-functional coordination"],
-        "is_ai_tpm": True,
+        "job_domain": job_domain,
         "data_quality": "complete",
     })
 
@@ -184,38 +185,42 @@ class TestCompanyAgentMain(unittest.TestCase):
         """BRD §8 scenario 1: Company Agent writes Company_List with required fields."""
         mock_excel.return_value = self.temp_xlsx
         mock_discover.return_value = [
-            {"company_name": "Anthropic", "ai_domain": "Large Model Labs",
+            {"company_name": "Anthropic", "track": "AI-native",
              "business_focus": "AI safety research", "career_url": "https://anthropic.com/careers"},
-            {"company_name": "Scale AI", "ai_domain": "AI Startups",
+            {"company_name": "Scale AI", "track": "AI-native",
              "business_focus": "Data labeling", "career_url": "https://scale.com/careers"},
         ]
         company_mod.main()
 
         rows = get_company_rows(self.temp_xlsx)
         self.assertEqual(len(rows), 2)
-        # Verify required fields non-empty: Company Name (0), AI Domain (1), Career URL (3)
+        # Verify required fields non-empty: Company Name (0), Track (1), Career URL (3)
         for row in rows:
             self.assertTrue(row[0], "Company Name must be non-empty")
-            self.assertTrue(row[1], "AI Domain must be non-empty")
+            self.assertTrue(row[1], "Track must be non-empty")
             self.assertTrue(row[3], "Career URL must be non-empty")
 
     @patch.dict(os.environ, {"TAVILY_API_KEY": "fake_tavily", "GEMINI_API_KEY": "fake_gemini"})
     @patch("agents.company_agent.get_or_create_excel")
     @patch("agents.company_agent.discover_ai_companies")
     @patch("agents.company_agent.run_phase_1_5")
-    def test_main_respects_max_total_200(self, mock_p15, mock_discover, mock_excel):
-        """REQ-009: Company_List total capped at MAX_TOTAL (200)."""
+    def test_main_respects_bucket_quotas(self, mock_p15, mock_discover, mock_excel):
+        """REQ-004-01: discovery is skipped when every bucket is at quota."""
         mock_excel.return_value = self.temp_xlsx
-        # Pre-fill with 200 companies
-        bulk = [{"company_name": f"Co_{i}", "ai_domain": "AI Startups",
-                 "business_focus": "Test", "career_url": f"https://co{i}.com/careers"}
-                for i in range(200)]
+        bulk = []
+        i = 0
+        for track, quota in company_mod.TRACK_QUOTAS.items():
+            for _ in range(quota):
+                bulk.append({"company_name": f"Co_{i}", "track": track,
+                             "business_focus": "Test",
+                             "career_url": f"https://co{i}.com/careers"})
+                i += 1
         upsert_companies(self.temp_xlsx, bulk)
-        self.assertEqual(count_company_rows(self.temp_xlsx), 200)
+        self.assertEqual(count_company_rows(self.temp_xlsx), company_mod.MAX_TOTAL)
 
         company_mod.main()
 
-        # discover_ai_companies should NOT be called when at capacity
+        # discover_ai_companies should NOT be called when all buckets are full
         mock_discover.assert_not_called()
 
     @patch.dict(os.environ, {"TAVILY_API_KEY": "fake_tavily", "GEMINI_API_KEY": "fake_gemini"})
@@ -223,26 +228,38 @@ class TestCompanyAgentMain(unittest.TestCase):
     @patch("agents.company_agent.discover_ai_companies")
     @patch("agents.company_agent.run_phase_1_5")
     def test_main_limits_batch_to_remaining_slots(self, mock_p15, mock_discover, mock_excel):
-        """REQ-009: When near capacity, only request remaining slots."""
+        """REQ-004-01: only open bucket slots are requested; full buckets get 0."""
         mock_excel.return_value = self.temp_xlsx
-        # Pre-fill with 190 companies (10 slots remaining, less than BATCH_SIZE=50)
-        bulk = [{"company_name": f"Co_{i}", "ai_domain": "AI Startups",
+        # AI-native at 140/150 (10 open); every other bucket exactly at quota.
+        bulk = [{"company_name": f"Co_{i}", "track": "AI-native",
                  "business_focus": "Test", "career_url": f"https://co{i}.com/careers"}
-                for i in range(190)]
+                for i in range(140)]
+        i = 140
+        for track, quota in company_mod.TRACK_QUOTAS.items():
+            if track == "AI-native":
+                continue
+            for _ in range(quota):
+                bulk.append({"company_name": f"Co_{i}", "track": track,
+                             "business_focus": "Test",
+                             "career_url": f"https://co{i}.com/careers"})
+                i += 1
         upsert_companies(self.temp_xlsx, bulk)
 
         mock_discover.return_value = [
-            {"company_name": f"New_{j}", "ai_domain": "AI Startups",
+            {"company_name": f"New_{j}", "track": "AI-native",
              "business_focus": "Test", "career_url": f"https://new{j}.com/careers"}
             for j in range(15)  # return more than slots
         ]
 
         company_mod.main()
 
-        # discover_ai_companies should be called with need=10 (200-190)
+        # discover_ai_companies gets a need dict: 10 AI-native slots, 0 elsewhere
         mock_discover.assert_called_once()
-        args = mock_discover.call_args
-        self.assertEqual(args[0][2], 10)  # third positional arg is `need`
+        need_by_track = mock_discover.call_args[0][2]
+        self.assertEqual(need_by_track["AI-native"], 10)
+        for track in company_mod.TRACK_QUOTAS:
+            if track != "AI-native":
+                self.assertEqual(need_by_track.get(track, 0), 0)
 
     def test_main_exits_on_missing_keys(self):
         """main() should exit gracefully when API keys are missing."""
@@ -569,7 +586,7 @@ class TestResumeOptimizerMain(unittest.IsolatedAsyncioTestCase):
         optimizer_mod._KEY_POOL = mock_pool
 
         # Mock batch_tailor_resume to return tailored content
-        def fake_batch_tailor(resume_text, jd_contents):
+        def fake_batch_tailor(resume_text, jd_contents, job_domain="AI"):
             return [
                 {"tailored_resume_markdown": f"# Tailored for JD {i}\n{resume_text[:100]}",
                  "optimization_summary": f"Optimized for JD {i}"}
@@ -577,7 +594,7 @@ class TestResumeOptimizerMain(unittest.IsolatedAsyncioTestCase):
             ]
 
         # Mock re_score (single-call, FINE_SYSTEM_PROMPT) to return improved scores
-        def fake_re_score(tailored_resume, jd_content):
+        def fake_re_score(tailored_resume, jd_content, job_domain="AI"):
             return json.dumps({
                 "compatibility_score": 85,
                 "key_strengths": ["Improved alignment"],
@@ -703,8 +720,11 @@ class TestEndToEndDataFlow(unittest.TestCase):
         for jd in jds:
             self.assertIn("url", jd)
             self.assertIn("jd_json", jd)
+            self.assertIn("job_domain", jd)
             parsed = json.loads(jd["jd_json"])
-            self.assertTrue(parsed.get("is_ai_tpm"), "Should only return AI TPM JDs")
+            self.assertIn(parsed.get("job_domain"),
+                          ("AI", "Robotics", "Fintech", "Space", "Defense"),
+                          "Every returned row must carry a valid Job Domain")
             self.assertTrue(parsed.get("job_title"), "Job title must be non-empty")
             self.assertTrue(parsed.get("company"), "Company must be non-empty")
 

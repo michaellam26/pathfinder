@@ -77,11 +77,11 @@ from agents.job_agent import (
     _RateLimiter,
     _GeminiKeyPool,
     _classify,
-    _classify_by_domain,
+    _vertical_domain,
     _fetch_ashby_jobs,
     _fetch_workable_jobs,
     _format_workable_location,
-    _ai_title_prefilter,
+    _nontech_title_prefilter,
     _TITLE_BLOCK_KW,
     ATS_PLATFORMS,
     ATS_SEARCH_PARAM,
@@ -281,28 +281,29 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(_classify("GOOGLE"), "big_tech")
 
 
-class TestClassifyByDomain(unittest.TestCase):
+class TestVerticalDomain(unittest.TestCase):
+    """PRJ-004 REQ-004-09: Track → forced job_domain for vertical companies;
+    mid-large / unknown / unmigrated values → None (per-JD classifier path)."""
 
-    def test_big_tech_domain(self):
-        self.assertEqual(_classify_by_domain("Big Tech (AI Investment)"), "big_tech")
+    def test_vertical_tracks_force_their_domain(self):
+        self.assertEqual(_vertical_domain("AI-native"), "AI")
+        self.assertEqual(_vertical_domain("Robotics"), "Robotics")
+        self.assertEqual(_vertical_domain("Fintech"), "Fintech")
+        self.assertEqual(_vertical_domain("Space"), "Space")
+        self.assertEqual(_vertical_domain("Defense"), "Defense")
 
-    def test_consumer_ml_tech_domain(self):
-        self.assertEqual(_classify_by_domain("Consumer ML Tech"), "big_tech")
+    def test_mid_large_gets_per_jd_judgment(self):
+        self.assertIsNone(_vertical_domain("Mid-large Tech"))
 
-    def test_ai_startups_domain(self):
-        self.assertEqual(_classify_by_domain("AI Startups"), "ai_native")
+    def test_unmigrated_value_treated_as_mid_large_with_warning(self):
+        with self.assertLogs("root", level="WARNING") as cm:
+            self.assertIsNone(_vertical_domain("AI Startups"))
+        self.assertTrue(any("unmigrated" in m for m in cm.output))
 
-    def test_large_model_labs(self):
-        self.assertEqual(_classify_by_domain("Large Model Labs"), "ai_native")
-
-    def test_empty_domain(self):
-        self.assertEqual(_classify_by_domain(""), "unknown")
-
-    def test_na_domain(self):
-        self.assertEqual(_classify_by_domain("N/A"), "unknown")
-
-    def test_none_domain(self):
-        self.assertEqual(_classify_by_domain(None), "unknown")
+    def test_blank_and_na(self):
+        self.assertIsNone(_vertical_domain(""))
+        self.assertIsNone(_vertical_domain(None))
+        self.assertIsNone(_vertical_domain("N/A"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,30 +334,40 @@ class TestAtsPlatformsConfig(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class TestAiTitlePrefilter(unittest.TestCase):
-    """Block-keyword expansion (PRJ self-audit 2026-05-05): SOX/compliance/audit/
-    governance/GRC titles must be filtered out for Big Tech companies. Reason:
-    LLM JD-level filter was admitting these as is_ai_tpm=True; title-level block
-    catches them before extraction."""
+class TestNontechTitlePrefilter(unittest.TestCase):
+    """PRJ-004: the pre-Gemini title blocklist applies on the mid-large-tech
+    path only; vertical-track companies pass all through (every TPM role is
+    domain-qualified). 'operations' removed — Mission Operations TPM is a
+    legitimate space/defense role (REQ-004-07/09)."""
 
-    def test_compliance_keywords_blocked_for_big_tech(self):
+    def test_compliance_keywords_blocked_for_mid_large(self):
         links = [
             {"url": "u1", "title": "Technical Program Manager, ML Infrastructure"},
             {"url": "u2", "title": "Technical Program Manager - SOX Compliance"},
             {"url": "u3", "title": "TPM, GRC and Audit"},
             {"url": "u4", "title": "Senior TPM, Governance"},
         ]
-        kept = _ai_title_prefilter(links, "Big Tech")
+        kept = _nontech_title_prefilter(links, "Mid-large Tech")
         kept_urls = {l["url"] for l in kept}
         self.assertEqual(kept_urls, {"u1"})
 
-    def test_ai_native_companies_pass_all_through(self):
+    def test_vertical_companies_pass_all_through(self):
         links = [{"url": "u1", "title": "TPM, SOX Compliance"}]
-        self.assertEqual(_ai_title_prefilter(links, "AI Startups"), links)
+        self.assertEqual(_nontech_title_prefilter(links, "AI-native"), links)
+        self.assertEqual(_nontech_title_prefilter(links, "Space"), links)
+
+    def test_unmigrated_value_gets_strict_midlarge_filtering(self):
+        links = [{"url": "u1", "title": "TPM, SOX Compliance"}]
+        self.assertEqual(_nontech_title_prefilter(links, "AI Startups"), [])
+
+    def test_operations_no_longer_blocked(self):
+        links = [{"url": "u1", "title": "TPM, Mission Operations"}]
+        self.assertEqual(_nontech_title_prefilter(links, "Mid-large Tech"), links)
 
     def test_block_kw_includes_compliance_set(self):
         for kw in ["sox", "compliance", "audit", "governance", "grc"]:
             self.assertIn(kw, _TITLE_BLOCK_KW)
+        self.assertNotIn("operations", _TITLE_BLOCK_KW)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -484,12 +495,14 @@ class TestPydanticSchemas(unittest.TestCase):
             requirements=["5+ years TPM", "ML pipeline experience"],
             additional_qualifications=["PyTorch", "LLM", "MLOps"],
             key_responsibilities=["Lead AI roadmap", "Coordinate with research"],
-            is_ai_tpm=True,
+            job_domain="AI", min_yoe=5, work_auth="none_stated",
         )
         self.assertEqual(obj.company, "Anthropic")
-        self.assertTrue(obj.is_ai_tpm)
+        self.assertEqual(obj.job_domain, "AI")
+        self.assertEqual(obj.min_yoe, 5)
 
-    def test_job_details_is_ai_tpm_false(self):
+    def test_job_details_prj004_defaults(self):
+        """PRJ-004: new fields default so cached JDs round-trip."""
         obj = JobDetails(
             job_title="PM",
             company="Corp",
@@ -498,16 +511,18 @@ class TestPydanticSchemas(unittest.TestCase):
             requirements=[],
             additional_qualifications=[],
             key_responsibilities=[],
-            is_ai_tpm=False,
         )
-        self.assertFalse(obj.is_ai_tpm)
+        self.assertEqual(obj.job_domain, "None")
+        self.assertIsNone(obj.min_yoe)
+        self.assertEqual(obj.work_auth, "none_stated")
+        self.assertEqual(obj.posted_date, "")
 
     def test_bug47_data_quality_field_exists(self):
         """BUG-47: JobDetails must have data_quality field."""
         obj = JobDetails(
             job_title="TPM", company="Co", location="SF",
             salary_range="N/A", requirements=[], additional_qualifications=[],
-            key_responsibilities=[], is_ai_tpm=True,
+            key_responsibilities=[], job_domain="AI",
         )
         self.assertIsNone(obj.data_quality)
 
@@ -516,7 +531,7 @@ class TestPydanticSchemas(unittest.TestCase):
         obj = JobDetails(
             job_title="TPM", company="Co", location="SF",
             salary_range="N/A", requirements=[], additional_qualifications=[],
-            key_responsibilities=[], is_ai_tpm=True,
+            key_responsibilities=[], job_domain="AI",
             data_quality="complete",
         )
         self.assertEqual(obj.data_quality, "complete")
@@ -2125,6 +2140,528 @@ class TestRetryOneSkipsIncompleteExtraction(unittest.IsolatedAsyncioTestCase):
                 mock_batch_upsert.assert_not_called()
         finally:
             job_agent_mod._GEMINI_LIMITER = original_limiter
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T8 — Workday pagination + Firecrawl uncap (REQ-004-13, G6a)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestWorkdayPagination(unittest.TestCase):
+    """REQ-004-13: _fetch_workday_jobs paginates past the old 20-posting cap."""
+
+    @staticmethod
+    def _page(n_postings, start=0, total=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "jobPostings": [
+                {"externalPath": f"/job/US-Somewhere/tpm-{start + i}",
+                 "title": f"TPM {start + i}", "locationsText": "Seattle, WA",
+                 "postedOn": "Posted 2 Days Ago"}
+                for i in range(n_postings)
+            ],
+            **({"total": total} if total is not None else {}),
+        }
+        return resp
+
+    def test_paginates_across_pages(self):
+        from agents.job_agent import _fetch_workday_jobs
+        # 3 pages: 50 + 50 + 20 = 120 postings — far beyond the old cap of 20.
+        pages = [self._page(50, 0, total=120), self._page(50, 50, total=120),
+                 self._page(20, 100, total=120)]
+        with patch("agents.job_agent._http_request_with_retry", side_effect=pages) as mock_http:
+            results = _fetch_workday_jobs("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite")
+        self.assertEqual(len(results), 120)
+        self.assertEqual(mock_http.call_count, 3)
+        # offsets advance by page size
+        offsets = [c.kwargs["json"]["offset"] for c in mock_http.call_args_list]
+        self.assertEqual(offsets, [0, 50, 100])
+        self.assertGreater(len(results), 20, "G6a: must exceed the old 20-job cap")
+
+    def test_short_page_terminates(self):
+        from agents.job_agent import _fetch_workday_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(7)]) as mock_http:
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        self.assertEqual(len(results), 7)
+        self.assertEqual(mock_http.call_count, 1)
+
+    def test_carries_posted_date(self):
+        from agents.job_agent import _fetch_workday_jobs
+        from datetime import datetime, timedelta
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(1)]):
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        expected = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
+        self.assertEqual(results[0]["posted_date"], expected)
+
+    def test_http_failure_returns_partial(self):
+        from agents.job_agent import _fetch_workday_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(50, 0), None]):
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        self.assertEqual(len(results), 50)
+
+
+class TestParseWorkdayPostedOn(unittest.TestCase):
+    """REQ-004-10: deterministic postedOn relative-string parser."""
+
+    from datetime import date as _date
+    TODAY = _date(2026, 7, 7)
+
+    def _p(self, text):
+        from agents.job_agent import _parse_workday_posted_on
+        return _parse_workday_posted_on(text, today=self.TODAY)
+
+    def test_today_and_yesterday(self):
+        self.assertEqual(self._p("Posted Today"), "2026-07-07")
+        self.assertEqual(self._p("Posted Yesterday"), "2026-07-06")
+
+    def test_days_ago(self):
+        self.assertEqual(self._p("Posted 2 Days Ago"), "2026-07-05")
+        self.assertEqual(self._p("Posted 14 Days Ago"), "2026-06-23")
+
+    def test_thirty_plus_saturates_past_gate(self):
+        # "30+" → 31 days back: correctly fails the 15-day freshness gate.
+        self.assertEqual(self._p("Posted 30+ Days Ago"), "2026-06-06")
+
+    def test_unparseable_is_unknown_not_aged(self):
+        self.assertEqual(self._p(""), "")
+        self.assertEqual(self._p(None), "")
+        self.assertEqual(self._p("Posted recently"), "")
+
+
+class TestFirecrawlMapUncapped(unittest.TestCase):
+    """REQ-004-13: the Firecrawl map call must not pass a result limit."""
+
+    def test_map_called_without_limit(self):
+        from agents.job_agent import _firecrawl_map
+        fake_app = MagicMock()
+        fake_app.map.return_value = {"links": []}
+        # FirecrawlApp is imported inside the function - patch at the source.
+        with patch("firecrawl.FirecrawlApp", return_value=fake_app):
+            _firecrawl_map("https://example.com/careers", "fc-key")
+        self.assertTrue(fake_app.map.called)
+        self.assertNotIn("limit", fake_app.map.call_args.kwargs,
+                         "Firecrawl map must not cap results (REQ-004-13)")
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T5/T6/T7 — write-time gates, date parsing, geo tightening
+# ═════════════════════════════════════════════════════════════════════════════
+class TestWriteTimeGates(unittest.IsolatedAsyncioTestCase):
+    """REQ-004-08/09/10/11: domain / YoE / work-auth gates + date flags run at
+    write time on the staging path — skipped rows are never written."""
+
+    BASE = {
+        "job_title": "Technical Program Manager",
+        "company": "TestCo", "location": "Seattle, WA",
+        "salary_range": "$200k", "requirements": ["stuff"],
+        "additional_qualifications": [], "key_responsibilities": ["lead"],
+        "job_domain": "AI", "min_yoe": 5, "work_auth": "none_stated",
+    }
+
+    async def _run(self, overrides: dict, track="AI-native", posted_date="",
+                   check_us_location=False):
+        import json as _json
+        from agents.job_agent import _process_scraped_jd
+        parsed = {**self.BASE, **overrides}
+        pending, ts_only = [], []
+        with patch("agents.job_agent.extract_jd", return_value=_json.dumps(parsed)), \
+             patch("agents.job_agent._save_md_to_cache"), \
+             patch("agents.job_agent._save_structured_jd_md"):
+            await _process_scraped_jd(
+                "https://x.co/jd", "# markdown", "TestCo", track,
+                set(), {}, pending, ts_only, "generic",
+                check_us_location=check_us_location,
+                posted_date=posted_date,
+            )
+        return pending
+
+    async def test_yoe_boundary_table(self):
+        # (min_yoe, kept?) — B2: keep [4,10]; skip ≤3 and ≥12.
+        for yoe, kept in [(3, False), (4, True), (10, True), (12, False)]:
+            pending = await self._run({"min_yoe": yoe})
+            self.assertEqual(bool(pending), kept, f"min_yoe={yoe}")
+
+    async def test_yoe_unstated_senior_title_auto_qualifies(self):
+        import json as _json
+        pending = await self._run({"min_yoe": None,
+                                   "job_title": "Senior TPM, Infrastructure"})
+        self.assertEqual(len(pending), 1)
+        row = _json.loads(pending[0][1])
+        self.assertEqual(row["yoe_flag"], "auto-qualified (title)")
+
+    async def test_yoe_unstated_plain_title_flagged_never_dropped(self):
+        import json as _json
+        pending = await self._run({"min_yoe": None,
+                                   "job_title": "Technical Program Manager"})
+        self.assertEqual(len(pending), 1)
+        self.assertIn("manual review", _json.loads(pending[0][1])["yoe_flag"])
+
+    async def test_work_auth_gate(self):
+        for wa, kept in [("citizenship_required", False),
+                         ("clearance_required", False),
+                         ("us_person_ok", True), ("none_stated", True)]:
+            pending = await self._run({"work_auth": wa})
+            self.assertEqual(bool(pending), kept, f"work_auth={wa}")
+
+    async def test_kept_rows_carry_work_auth_audit_value(self):
+        import json as _json
+        pending = await self._run({"work_auth": "us_person_ok"})
+        self.assertEqual(_json.loads(pending[0][1])["work_auth"], "us_person_ok")
+
+    async def test_domain_gate_skips_none_on_midlarge(self):
+        pending = await self._run({"job_domain": "None"}, track="Mid-large Tech")
+        self.assertEqual(pending, [])
+
+    async def test_vertical_override_forces_domain(self):
+        """Even if the LLM says None, a vertical company's track wins."""
+        import json as _json
+        pending = await self._run({"job_domain": "None"}, track="Space")
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(_json.loads(pending[0][1])["job_domain"], "Space")
+
+    async def test_posted_date_threaded_from_list_meta(self):
+        import json as _json
+        from datetime import datetime, timedelta
+        posted = (datetime.now().date() - timedelta(days=2)).strftime("%Y-%m-%d")
+        pending = await self._run({}, posted_date=posted)
+        row = _json.loads(pending[0][1])
+        self.assertEqual(row["posted_date"], posted)
+        self.assertNotIn("date_flag", row)
+
+    async def test_unknown_date_kept_with_flag(self):
+        import json as _json
+        pending = await self._run({})
+        row = _json.loads(pending[0][1])
+        self.assertEqual(row.get("posted_date", ""), "")
+        self.assertIn("unknown posted date", row["date_flag"])
+
+    async def test_out_of_region_generic_jd_skipped(self):
+        # check_us_location=True mirrors the generic-crawl path in fetch_one.
+        pending = await self._run({"location": "New York, NY"},
+                                  check_us_location=True)
+        self.assertEqual(pending, [])
+
+
+class TestParseIsoDate(unittest.TestCase):
+    """REQ-004-10: ATS date normalization (ISO strings + Lever epoch-ms)."""
+
+    def test_iso_string(self):
+        from agents.job_agent import _parse_iso_date
+        self.assertEqual(_parse_iso_date("2026-07-01T12:34:56Z"), "2026-07-01")
+        self.assertEqual(_parse_iso_date("2026-07-01"), "2026-07-01")
+
+    def test_lever_epoch_ms(self):
+        from agents.job_agent import _parse_iso_date
+        from datetime import datetime
+        ms = int(datetime(2026, 7, 1, 12, 0).timestamp() * 1000)
+        self.assertEqual(_parse_iso_date(ms), "2026-07-01")
+        self.assertEqual(_parse_iso_date(str(ms)), "2026-07-01")
+
+    def test_blank_and_garbage_are_unknown(self):
+        from agents.job_agent import _parse_iso_date
+        self.assertEqual(_parse_iso_date(None), "")
+        self.assertEqual(_parse_iso_date(""), "")
+        self.assertEqual(_parse_iso_date("last Tuesday"), "")
+
+
+class TestTpmFilterGeo(unittest.TestCase):
+    """REQ-004-12: _tpm_filter keeps only Seattle/CA/TX/US-Remote."""
+
+    @staticmethod
+    def _links():
+        return [
+            {"url": "u1", "title": "TPM", "location": "Seattle, WA"},
+            {"url": "u2", "title": "TPM", "location": "New York, NY"},
+            {"url": "u3", "title": "TPM", "location": "Austin, TX"},
+            {"url": "u4", "title": "TPM", "location": "Remote"},
+            {"url": "u5", "title": "TPM", "location": "El Segundo, CA"},
+            {"url": "u6", "title": "TPM", "location": ""},  # unknown → keep
+            {"url": "u7", "title": "TPM", "location": "Boston, MA"},
+        ]
+
+    def test_only_target_regions_kept(self):
+        from agents.job_agent import _tpm_filter
+        kept = {l["url"] for l in _tpm_filter(self._links())}
+        self.assertEqual(kept, {"u1", "u3", "u4", "u5", "u6"})
+
+
+class TestBackfillPostedDate(unittest.TestCase):
+    """REQ-004-10/19: Tavily-scoped LinkedIn search-signal backfill."""
+
+    def tearDown(self):
+        import agents.job_agent as jm
+        jm._TAVILY_CLIENT = None
+
+    def test_no_client_returns_empty(self):
+        import agents.job_agent as jm
+        jm._TAVILY_CLIENT = None
+        self.assertEqual(jm._backfill_posted_date("Co", "TPM"), "")
+
+    def test_parses_iso_date_from_snippet(self):
+        import agents.job_agent as jm
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"title": "TPM at Co", "content": "Posted 2026-07-01 on LinkedIn"}]}
+        jm._TAVILY_CLIENT = client
+        self.assertEqual(jm._backfill_posted_date("Co", "TPM"), "2026-07-01")
+        # REQ-004-19: search query is LinkedIn-scoped, never a page fetch
+        q = client.search.call_args.kwargs["query"]
+        self.assertIn("site:linkedin.com/jobs", q)
+
+    def test_parses_relative_days_ago(self):
+        import agents.job_agent as jm
+        from datetime import datetime, timedelta
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"title": "", "content": "posted 3 days ago"}]}
+        jm._TAVILY_CLIENT = client
+        expected = (datetime.now().date() - timedelta(days=3)).strftime("%Y-%m-%d")
+        self.assertEqual(jm._backfill_posted_date("Co", "TPM"), expected)
+
+    def test_failure_returns_empty_never_raises(self):
+        import agents.job_agent as jm
+        client = MagicMock()
+        client.search.side_effect = Exception("quota")
+        jm._TAVILY_CLIENT = client
+        self.assertEqual(jm._backfill_posted_date("Co", "TPM"), "")
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T14 — Amazon.jobs adapter (REQ-004-17, G6b) + T15 Tesla regression
+# ═════════════════════════════════════════════════════════════════════════════
+class TestAmazonAdapter(unittest.TestCase):
+
+    @staticmethod
+    def _page(n, start=0, total=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "jobs": [
+                {"title": f"Sr. Technical Program Manager {start + i}",
+                 "job_path": f"/en/jobs/{start + i}/sr-tpm",
+                 "normalized_location": "Seattle, Washington",
+                 "posted_date": "July 1, 2026",
+                 "description": "Own programs across Kuiper.",
+                 "basic_qualifications": "5+ years of program management",
+                 "preferred_qualifications": "Hardware program experience"}
+                for i in range(n)
+            ],
+            **({"hits": total} if total is not None else {}),
+        }
+        return resp
+
+    def test_registered_in_platforms_and_registry(self):
+        from agents.job_agent import ATS_PLATFORMS, _resolve_list_fn, ALL_ATS
+        self.assertIn("amazon", ATS_PLATFORMS)
+        self.assertIn("amazon.jobs", ATS_PLATFORMS["amazon"]["domains"])
+        self.assertEqual(ATS_PLATFORMS["amazon"]["strategy"], "json_api")
+        self.assertTrue(callable(_resolve_list_fn("_fetch_amazon_jobs")))
+        # ATS-trusted path: amazon.jobs is in ALL_ATS so process_company
+        # takes Path A, not the crawler.
+        self.assertIn("amazon.jobs", ALL_ATS)
+
+    def test_fetch_maps_fields_and_prefetches_jd(self):
+        from agents.job_agent import _fetch_amazon_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=[self._page(2)]):
+            results = _fetch_amazon_jobs("https://www.amazon.jobs/")
+        self.assertEqual(len(results), 2)
+        r = results[0]
+        self.assertTrue(r["url"].startswith("https://www.amazon.jobs/en/jobs/"))
+        self.assertEqual(r["location"], "Seattle, Washington")
+        self.assertEqual(r["posted_date"], "2026-07-01")  # "July 1, 2026" parsed
+        self.assertIn("Basic Qualifications", r["_prefetched_md"])
+        self.assertIn("Kuiper", r["_prefetched_md"])
+        self.assertEqual(r["_platform"], "Amazon")
+
+    def test_paginates(self):
+        from agents.job_agent import _fetch_amazon_jobs
+        pages = [self._page(100, 0, total=130), self._page(30, 100, total=130)]
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=pages) as mock_http:
+            results = _fetch_amazon_jobs("https://www.amazon.jobs/")
+        self.assertEqual(len(results), 130)
+        self.assertEqual(mock_http.call_count, 2)
+
+
+class TestRouteScraperPrefetch(unittest.IsolatedAsyncioTestCase):
+    """G6b: prefetched JD markdown short-circuits routing — zero crawler calls."""
+
+    async def test_prefetched_md_wins_priority_zero(self):
+        from agents.job_agent import _route_scraper
+        list_meta = {"https://www.amazon.jobs/en/jobs/1/tpm": {
+            "_prefetched_md": "# Sr TPM\nJD body", "_platform": "Amazon"}}
+        with patch("agents.job_agent.scrape_jd") as mock_crawl:
+            md, label = await _route_scraper(
+                "https://www.amazon.jobs/en/jobs/1/tpm", "fc", MagicMock(),
+                list_meta)
+        self.assertEqual(md, "# Sr TPM\nJD body")
+        self.assertEqual(label, "Amazon")
+        mock_crawl.assert_not_called()
+
+    async def test_workday_meta_still_routes(self):
+        from agents.job_agent import _route_scraper
+        list_meta = {"https://co.myworkdayjobs.com/x/job/1": {"_workday": True}}
+        with patch("agents.job_agent._scrape_workday_jd",
+                   return_value="# WD JD") as mock_wd:
+            md, label = await _route_scraper(
+                "https://co.myworkdayjobs.com/x/job/1", "fc", MagicMock(),
+                list_meta)
+        self.assertEqual((md, label), ("# WD JD", "Workday"))
+        mock_wd.assert_called_once()
+
+
+class TestTeslaRegression(unittest.TestCase):
+    """PRJ-004 T15 (REQ-004-20): the Tesla custom scraper stays wired and its
+    output shape survives the new schema — verification, not a rebuild."""
+
+    def test_tesla_still_registered(self):
+        from agents.job_agent import ATS_PLATFORMS, _JD_FN_REGISTRY
+        self.assertEqual(ATS_PLATFORMS["tesla"]["jd_fn"], "_scrape_tesla_jd")
+        self.assertIn("tesla.com/careers", ATS_PLATFORMS["tesla"]["jd_domains"])
+        self.assertIn("_scrape_tesla_jd", _JD_FN_REGISTRY)
+
+    def test_extracted_tesla_jd_defaults_pass_schema(self):
+        """A Tesla JD extracted without PRJ-004 fields still validates —
+        defaults route it to keep+flag paths, never a crash."""
+        from agents.job_agent import JobDetails
+        obj = JobDetails(
+            job_title="Technical Program Manager, Energy",
+            company="Tesla", location="Palo Alto, CA", salary_range="",
+            requirements=["5+ years"], additional_qualifications=[],
+            key_responsibilities=["Deliver"],
+        )
+        self.assertEqual(obj.work_auth, "none_stated")   # kept by gate 3
+        self.assertEqual(obj.posted_date, "")            # keep + Date Flag
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 4 QA follow-ups — pre-scrape gate, prompt anchors, llm_filter rules
+# ═════════════════════════════════════════════════════════════════════════════
+class TestPrescrapeFreshnessGate(unittest.TestCase):
+    """P0 gap from test analysis: the enforcement point of REQ-004-10/G4."""
+
+    @staticmethod
+    def _days_ago(n):
+        from datetime import datetime, timedelta
+        return (datetime.now().date() - timedelta(days=n)).strftime("%Y-%m-%d")
+
+    def _gate(self, to_process, list_meta, known=None):
+        from agents.job_agent import _apply_prescrape_freshness_gate
+        return _apply_prescrape_freshness_gate(to_process, list_meta, known or {})
+
+    def test_aged_new_posting_skipped_fresh_kept(self):
+        meta = {"u_old": {"posted_date": self._days_ago(20)},
+                "u_new": {"posted_date": self._days_ago(10)}}
+        kept, aged = self._gate(["u_old", "u_new"], meta)
+        self.assertEqual(kept, ["u_new"])
+        self.assertEqual(aged, 1)
+
+    def test_day_14_keeps_day_15_skips(self):
+        meta = {"u14": {"posted_date": self._days_ago(14)},
+                "u15": {"posted_date": self._days_ago(15)}}
+        kept, aged = self._gate(["u14", "u15"], meta)
+        self.assertEqual(kept, ["u14"])
+        self.assertEqual(aged, 1)
+
+    def test_already_tracked_url_never_gated(self):
+        """G7/REQ-004-16: rows already in the sheet are never retroactively
+        dropped, even if their list-API date is aged."""
+        meta = {"u_known": {"posted_date": self._days_ago(30)}}
+        kept, aged = self._gate(["u_known"], meta,
+                                known={"u_known": {"age_days": 5}})
+        self.assertEqual(kept, ["u_known"])
+        self.assertEqual(aged, 0)
+
+    def test_unparseable_date_is_unknown_not_aged(self):
+        """Hardening (code review F4): raw/unparseable date text must take the
+        keep+flag path, never be treated as aged."""
+        meta = {"u_raw": {"posted_date": "Posted 30+ Days Ago"},
+                "u_blank": {"posted_date": ""}, "u_nometa": {}}
+        kept, aged = self._gate(["u_raw", "u_blank", "u_nometa"], meta)
+        self.assertEqual(kept, ["u_raw", "u_blank", "u_nometa"])
+        self.assertEqual(aged, 0)
+
+
+class TestExtractJdPromptAnchors(unittest.TestCase):
+    """P1 gap: the D-10 mapping anchors must actually be in the mid-large
+    system prompt; vertical prompts must force the track's domain."""
+
+    def setUp(self):
+        import agents.job_agent as jm
+        self._orig = jm._KEY_POOL
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = "{}"
+        pool.generate_content.return_value = resp
+        jm._KEY_POOL = pool
+
+    def tearDown(self):
+        import agents.job_agent as jm
+        jm._KEY_POOL = self._orig
+
+    def _sys_instr(self, track):
+        import agents.job_agent as jm
+        jm.types.GenerateContentConfig.reset_mock()
+        jm.extract_jd("# JD body", company="TestCo", track=track)
+        return jm.types.GenerateContentConfig.call_args.kwargs["system_instruction"]
+
+    def test_midlarge_prompt_contains_all_five_anchors(self):
+        instr = self._sys_instr("Mid-large Tech")
+        for anchor in ("GPU fleet", "Google Pay", "Amazon Robotics",
+                       "Project Kuiper", "Azure Government"):
+            self.assertIn(anchor, instr, f"missing mapping anchor: {anchor}")
+        self.assertIn("SECURITY:", instr)
+        # YoE + work-auth clauses ride the same call (no extra round-trip)
+        self.assertIn("min_yoe", instr)
+        self.assertIn("clearance_required", instr)
+
+    def test_vertical_prompt_forces_domain(self):
+        instr = self._sys_instr("Space")
+        self.assertIn('set job_domain to "Space"', instr)
+        self.assertIn("SECURITY:", instr)
+
+
+class TestLlmFilterJobsRuleSelection(unittest.TestCase):
+    """P1 gap: vertical fast-path vs mid-large 5-track rule (REQ-004-09)."""
+
+    def setUp(self):
+        import agents.job_agent as jm
+        self._orig = jm._KEY_POOL
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = '{"urls": ["https://x.co/1"]}'
+        pool.generate_content.return_value = resp
+        jm._KEY_POOL = pool
+
+    def tearDown(self):
+        import agents.job_agent as jm
+        jm._KEY_POOL = self._orig
+
+    def _sys_instr(self, track):
+        import agents.job_agent as jm
+        jm.types.GenerateContentConfig.reset_mock()
+        jm.llm_filter_jobs("TestCo", [{"url": "https://x.co/1", "title": "TPM"}],
+                           track)
+        return jm.types.GenerateContentConfig.call_args.kwargs["system_instruction"]
+
+    def test_vertical_track_gets_permissive_rule(self):
+        instr = self._sys_instr("Defense")
+        self.assertIn("Defense-track company", instr)
+        self.assertIn("every genuine Technical Program Manager", instr)
+        self.assertNotIn("five tracks", instr)
+
+    def test_midlarge_gets_five_track_rule(self):
+        instr = self._sys_instr("Mid-large Tech")
+        self.assertIn("five tracks", instr)
+        self.assertIn("Project Kuiper", instr)
+        self.assertIn("SECURITY:", instr)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ import re
 import logging
 import time
 import requests
+from datetime import datetime, timedelta
+from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from google import genai
@@ -34,6 +36,7 @@ from shared.excel_store import (
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
     get_archived_companies, get_company_archive_info, update_archive_status,
     count_valid_tpm_jobs_by_company, sort_jd_tracker_by_tier,
+    JOB_DOMAIN_VALUES, classify_region, compute_freshness_tier,
 )
 
 from shared.gemini_pool import _GeminiKeyPoolBase
@@ -200,7 +203,18 @@ class JobDetails(BaseModel):
     # PRJ-002 / REQ-100: 8-15 high-signal keywords that an ATS scanner / recruiter
     # search would key on. Default empty so cached JDs without this field round-trip.
     ats_keywords:             list[str] = Field(default_factory=list)
-    is_ai_tpm:                bool
+    # PRJ-004 REQ-004-09: 5-track domain classifier replaces is_ai_tpm.
+    # "None" = mid-large-tech role matching no track → skipped at write time.
+    job_domain:               Literal["AI", "Robotics", "Fintech", "Space",
+                                      "Defense", "None"] = "None"
+    # PRJ-004 REQ-004-08: minimum stated years of experience; None if unstated.
+    min_yoe:                  int | None = None
+    # PRJ-004 REQ-004-11: work-authorization screen result.
+    work_auth:                Literal["citizenship_required", "clearance_required",
+                                      "us_person_ok", "none_stated"] = "none_stated"
+    # PRJ-004 REQ-004-10: NOT LLM-extracted — injected by code from ATS list
+    # metadata; declared here so cached JDs round-trip through the schema.
+    posted_date:              str = ""
     data_quality:             str | None = None  # BUG-47: populated by _assess_jd_quality
 
 # ── ATS config (declarative routing table — REQ-062) ─────────────────────────
@@ -251,6 +265,19 @@ ATS_PLATFORMS = {
         "strategy":           "internal_api",
         "list_fn":            "_fetch_workday_jobs",
         "jd_fn":              "_scrape_workday_jd",
+    },
+    # PRJ-004 REQ-004-17 (G6b): Amazon.jobs public JSON search endpoint —
+    # replaces the chronically-failing generic browser-crawl path. search.json
+    # returns full JD text, so candidates carry _prefetched_md and never touch
+    # Firecrawl or the crawler. Same undocumented-API risk class as Workday/
+    # Ashby (R-09); adapter failure falls back to the crawler path as before.
+    "amazon": {
+        "domains":            ["amazon.jobs"],
+        "board_url_template": None,
+        "slug_pattern":       r"(amazon\.jobs)",
+        "strategy":           "json_api",
+        "list_fn":            "_fetch_amazon_jobs",
+        "jd_fn":              None,
     },
     "google": {
         "domains":            [],  # Google has no ATS board URLs for discovery
@@ -335,20 +362,31 @@ def _classify(name: str) -> str:
     if "ai" in n.split():               return "ai_native"
     return "unknown"
 
-def _classify_by_domain(ai_domain: str) -> str:
-    """Classify using the ai_domain field stored in the company Excel row.
-    Takes precedence over the hardcoded name-matching fallback.
+# PRJ-004 REQ-004-09: Track → job_domain mapping for vertical-bucket
+# companies. Every TPM role at a vertical company qualifies with the
+# company's own track domain; mid-large-tech roles get per-JD judgment.
+_TRACK_TO_DOMAIN = {"AI-native": "AI", "Robotics": "Robotics",
+                    "Fintech": "Fintech", "Space": "Space", "Defense": "Defense"}
+VERTICAL_TRACKS = frozenset(_TRACK_TO_DOMAIN)
 
-    Big Tech AND Consumer ML Tech both classify as big_tech so the AI title
-    prefilter is applied — Netflix/Spotify/Pinterest etc. post many non-AI
-    TPM roles that should be filtered out before extraction.
+
+def _vertical_domain(track: str) -> str | None:
+    """Return the forced job_domain for a vertical-track company, or None for
+    mid-large-tech / unknown values (per-JD classifier path).
+
+    Unknown/unmigrated Track values route through the strict mid-large path
+    with a logged warning (D-17) — never silently coerced, never skipped.
+    A blank value falls back to the legacy name-based _classify() so manual
+    rows without a Track still behave sensibly.
     """
-    d = (ai_domain or "").lower().strip()
-    if not d or d in ("n/a", "unknown", ""):
-        return "unknown"
-    if "big tech" in d or "consumer ml" in d:
-        return "big_tech"
-    return "ai_native"
+    t = (track or "").strip()
+    if t in VERTICAL_TRACKS:
+        return _TRACK_TO_DOMAIN[t]
+    if t and t not in ("Mid-large Tech", "N/A"):
+        logging.warning(f"[Track] unmigrated/unknown Track value {t!r} — "
+                        "treating as Mid-large Tech (strict per-JD classification). "
+                        "Run `python agents/company_agent.py --migrate-tracks`.")
+    return None
 
 # ── US location detection via pycountry (no hardcoded non-US lists) ───────────
 def _build_us_index() -> tuple:
@@ -450,6 +488,28 @@ TPM_KW = ["technical program manager", "tpm", "technical program mgr",
           "tech program manager"]
 
 # ── ATS API fetch (Path A: Greenhouse / Lever) ────────────────────────────────
+def _parse_iso_date(value) -> str:
+    """PRJ-004 REQ-004-10: normalize an ATS date field to 'YYYY-MM-DD'.
+    Accepts ISO strings (Greenhouse updated_at, Ashby publishedDate) and
+    epoch-milliseconds (Lever createdAt). Unparseable → '' (unknown-date
+    keep+flag path, never treated as aged)."""
+    if value is None or value == "":
+        return ""
+    try:
+        if isinstance(value, (int, float)):  # epoch ms (Lever)
+            return datetime.fromtimestamp(value / 1000).strftime("%Y-%m-%d")
+        s = str(value).strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+            return s[:10]
+        if s.isdigit():  # epoch ms as string
+            return datetime.fromtimestamp(int(s) / 1000).strftime("%Y-%m-%d")
+        # Amazon.jobs style: "July 1, 2026"
+        return datetime.strptime(s, "%B %d, %Y").strftime("%Y-%m-%d")
+    except (ValueError, OSError, OverflowError):
+        pass
+    return ""
+
+
 _ATS_FETCH = {
     "greenhouse.io": {
         "slug_pattern":  r"greenhouse\.io/([^/?#]+)",
@@ -459,6 +519,7 @@ _ATS_FETCH = {
         "url_field":     "absolute_url",
         "id_field":      "id",
         "id_url":        "https://job-boards.greenhouse.io/{slug}/jobs/{id}",
+        "date_field":    "updated_at",       # PRJ-004 REQ-004-10
     },
     "lever.co": {
         "slug_pattern":  r"lever\.co/([^/?#]+)",
@@ -468,6 +529,7 @@ _ATS_FETCH = {
         "url_field":     "hostedUrl",
         "id_field":      "id",
         "id_url":        "https://jobs.lever.co/{slug}/{id}",
+        "date_field":    "createdAt",        # epoch-ms
     },
 }
 
@@ -503,7 +565,8 @@ def _fetch_ats_jobs(career_url: str) -> list:
             loc = job.get("location", {})
             loc = loc.get("name", "") if isinstance(loc, dict) else str(loc or "")
             if job_url and title:
-                results.append({"url": job_url, "title": title, "location": loc.strip()})
+                results.append({"url": job_url, "title": title, "location": loc.strip(),
+                                "posted_date": _parse_iso_date(job.get(cfg["date_field"]))})
         logging.info(f"[ATS API] {len(results)} jobs for {slug}")
         return results
     except (ValueError, KeyError, TypeError) as e:
@@ -546,7 +609,9 @@ def _fetch_ashby_jobs(career_url: str) -> list:
                 loc = loc.get("name", "")
             loc = str(loc or "").strip()
             if job_url and title:
-                results.append({"url": job_url, "title": title, "location": loc})
+                results.append({"url": job_url, "title": title, "location": loc,
+                                "posted_date": _parse_iso_date(
+                                    job.get("publishedDate") or job.get("publishedAt"))})
         logging.info(f"[Ashby API] {len(results)} jobs for {slug}")
         return results
     except (ValueError, KeyError, TypeError) as e:
@@ -608,7 +673,8 @@ def _fetch_workable_jobs(career_url: str) -> list:
                 job_url = f"https://apply.workable.com/j/{shortcode}"
             location = _format_workable_location(job)
             if job_url and title:
-                results.append({"url": job_url, "title": title, "location": location})
+                results.append({"url": job_url, "title": title, "location": location,
+                                "posted_date": _parse_iso_date(job.get("published_on"))})
         logging.info(f"[Workable API] {len(results)} jobs for {slug}")
         return results
     except (ValueError, KeyError, TypeError) as e:
@@ -621,26 +687,37 @@ def _tpm_filter(links: list) -> list:
     for lnk in links:
         if not any(kw in lnk.get("title","").lower() for kw in TPM_KW):
             continue
-        if not _is_us(lnk.get("location", "")):
+        # PRJ-004 REQ-004-12: tightened geo — keep only Seattle / CA / TX /
+        # US-Remote. "Unknown" (blank/placeholder) keeps, conservative as
+        # before; dropped rows are logged for early post-launch spot checks
+        # (R-10 mitigation).
+        loc = lnk.get("location", "")
+        if classify_region(loc) == "Other":
+            logging.info(f"[GeoFilter] Dropped out-of-region job "
+                         f"({loc!r}): {lnk.get('title', '?')}")
             skipped += 1; continue
         filtered.append(lnk)
     if skipped:
-        print(f"    Location filter: skipped {skipped} non-US jobs.")
+        print(f"    [GeoFilter] skipped {skipped} out-of-region jobs (kept: Seattle/CA/TX/US-Remote).")
     return filtered
 
-# Title keywords that flag clearly non-AI TPM roles at Big Tech companies
+# Title keywords that flag clearly non-track TPM roles at mid-large-tech
+# companies (pre-Gemini cost saver). PRJ-004: "operations" removed from the
+# blocklist — space/defense "Mission Operations TPM" is a legitimate track role.
 _TITLE_BLOCK_KW = frozenset([
     "finance", "legal", "hr", "human resources", "supply chain",
-    "logistics", "retail", "marketing", "sales", "operations",
+    "logistics", "retail", "marketing", "sales",
     "recruiting", "facilities", "real estate", "accounting",
     "tax", "treasury", "procurement", "customer success",
     "sox", "compliance", "audit", "governance", "grc",
 ])
 
-def _ai_title_prefilter(links: list, ai_domain: str) -> list:
-    """Block TPM roles with explicit non-AI domain keywords in the title.
-    Only applied to Big Tech companies; AI-native companies pass all through."""
-    if "big tech" not in ai_domain.lower():
+def _nontech_title_prefilter(links: list, track: str) -> list:
+    """Block TPM roles with explicitly non-technical domain keywords in the
+    title. Applied only on the mid-large-tech path (incl. unmigrated values —
+    the strict path per D-17); vertical-track companies pass all through
+    because every TPM role there is domain-qualified (REQ-004-09)."""
+    if (track or "").strip() in VERTICAL_TRACKS:
         return links
     filtered, blocked = [], 0
     for lnk in links:
@@ -649,10 +726,32 @@ def _ai_title_prefilter(links: list, ai_domain: str) -> list:
             continue
         filtered.append(lnk)
     if blocked:
-        print(f"    AI title pre-filter: removed {blocked} non-AI-domain TPM roles.")
+        print(f"    Non-tech title pre-filter: removed {blocked} out-of-track TPM roles.")
     return filtered
 
 # ── Path W: Workday JSON API ──────────────────────────────────────────────────
+def _parse_workday_posted_on(text: str, today=None) -> str:
+    """PRJ-004 REQ-004-10: deterministic parse of Workday's relative postedOn
+    strings ("Posted Today", "Posted 2 Days Ago", "Posted 30+ Days Ago") into
+    an ISO date string. "30+" maps to 31 days back, which correctly fails the
+    15-day freshness gate. Unparseable/blank text → "" (unknown date — the
+    keep+flag path, never treated as aged)."""
+    if not text:
+        return ""
+    t = str(text).strip().lower()
+    today = today or datetime.now().date()
+    if "today" in t:
+        days = 0
+    elif "yesterday" in t:
+        days = 1
+    else:
+        m = re.search(r"(\d+)(\+?)\s*days?\s*ago", t)
+        if not m:
+            return ""
+        days = int(m.group(1)) + (1 if m.group(2) else 0)
+    return (today - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def _fetch_workday_jobs(career_url: str) -> list:
     """
     Workday exposes an undocumented but widely-used POST JSON API.
@@ -675,24 +774,35 @@ def _fetch_workday_jobs(career_url: str) -> list:
     host   = host_m.group(1)
 
     api_url = f"{host}/wday/cxs/{company_slug}/{site_slug}/jobs"
-    payload = {"limit": 20, "offset": 0, "searchText": "Technical Program Manager"}
-    logging.info(f"[Workday API] POST {api_url}")
-    r = _http_request_with_retry(
-        "POST", api_url, timeout=12, json=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "PathFinder/1.0"},
-    )
-    if r is None:
-        return []
-    if r.status_code != 200:
-        logging.warning(f"[Workday API] {r.status_code} for {api_url}")
-        return []
-    try:
-        base     = f"{host}/{site_slug}"
-        postings = r.json().get("jobPostings", [])
-        results  = []
+    base    = f"{host}/{site_slug}"
+    # PRJ-004 REQ-004-13: paginate instead of the old hardcoded limit:20 —
+    # no artificial cap on scraped job count. The page-count guard is a
+    # runaway/corruption backstop (5,000 postings), not a result cap.
+    _PAGE_SIZE, _MAX_PAGES = 50, 100
+    results, offset = [], 0
+    for page in range(_MAX_PAGES):
+        payload = {"limit": _PAGE_SIZE, "offset": offset,
+                   "searchText": "Technical Program Manager"}
+        logging.info(f"[Workday API] POST {api_url} offset={offset}")
+        r = _http_request_with_retry(
+            "POST", api_url, timeout=12, json=payload,
+            headers={"Content-Type": "application/json", "User-Agent": "PathFinder/1.0"},
+        )
+        if r is None:
+            break
+        if r.status_code != 200:
+            logging.warning(f"[Workday API] {r.status_code} for {api_url}")
+            break
+        try:
+            data     = r.json()
+            postings = data.get("jobPostings", [])
+            total    = data.get("total")
+        except (ValueError, KeyError, TypeError) as e:
+            logging.error(f"[Workday API] parse error for {api_url}: {type(e).__name__}: {e}")
+            break
         for p in postings:
             path  = p.get("externalPath", "")
-            title = p.get("title", "").strip()
+            title = (p.get("title", "") or "").strip()
             loc   = p.get("locationsText", "") or ""
             # For "N Locations", fall back to the country/city in the URL path
             # e.g. /job/Israel-Yokneam/... → "Israel-Yokneam"
@@ -702,12 +812,18 @@ def _fetch_workday_jobs(career_url: str) -> list:
                     loc = url_loc_m.group(1).replace('-', ', ')
             if path and title:
                 results.append({"url": base + path, "title": title, "location": loc,
+                                 "posted_date": _parse_workday_posted_on(p.get("postedOn", "")),
                                  "_workday": True})
-        logging.info(f"[Workday API] {len(results)} postings for {company_slug}/{site_slug}")
-        return results
-    except (ValueError, KeyError, TypeError) as e:
-        logging.error(f"[Workday API] parse error for {api_url}: {type(e).__name__}: {e}")
-        return []
+        offset += _PAGE_SIZE
+        if len(postings) < _PAGE_SIZE:
+            break
+        if isinstance(total, int) and offset >= total:
+            break
+    else:
+        logging.error(f"[Workday API] hit {_MAX_PAGES}-page runaway guard for "
+                      f"{company_slug}/{site_slug} — response likely corrupt")
+    logging.info(f"[Workday API] {len(results)} postings for {company_slug}/{site_slug}")
+    return results
 
 # ── ATS link detection in rendered pages ─────────────────────────────────────
 def _detect_ats(links: list) -> dict:
@@ -771,7 +887,8 @@ def _firecrawl_map(career_url: str, fc_key: str) -> list:
     for attempt in range(3):
         try:
             logging.info(f"[Firecrawl] map attempt {attempt + 1}/3: {career_url}")
-            res = app.map(url=career_url, search="Technical Program Manager", limit=100)
+            # PRJ-004 REQ-004-13: no artificial cap on mapped URLs.
+            res = app.map(url=career_url, search="Technical Program Manager")
             urls = getattr(res, "links", None) or (res.get("links",[]) if isinstance(res,dict) else res if isinstance(res,list) else [])
             out  = []
             for u in urls:
@@ -808,6 +925,63 @@ def _merge_filter(batches: list) -> list:
             and (any(k in l["url"].lower() for k in URL_KW)
                  or any(k in l.get("title","").lower() for k in TITLE_KW))]
 
+def _fetch_amazon_jobs(career_url: str) -> list:
+    """PRJ-004 REQ-004-17 (G6b): fetch TPM jobs from Amazon.jobs' public JSON
+    search endpoint, paginated (no artificial cap, REQ-004-13). search.json
+    returns titles, locations, posting dates AND full JD text, so each
+    candidate carries `_prefetched_md` — zero browser/Firecrawl calls and no
+    generic-crawler fallback for Amazon JDs."""
+    results, offset = [], 0
+    _PAGE, _MAX_PAGES = 100, 50  # runaway guard: 5,000 postings
+    for _page in range(_MAX_PAGES):
+        api_url = ("https://www.amazon.jobs/en/search.json"
+                   "?base_query=technical+program+manager&country=USA"
+                   f"&result_limit={_PAGE}&offset={offset}")
+        logging.info(f"[Amazon API] GET offset={offset}")
+        r = _http_request_with_retry("GET", api_url, timeout=12,
+                                     headers={"User-Agent": "PathFinder/1.0"})
+        if r is None:
+            break
+        if r.status_code != 200:
+            logging.warning(f"[Amazon API] {r.status_code} for {api_url}")
+            break
+        try:
+            data  = r.json()
+            jobs  = data.get("jobs", [])
+            total = data.get("hits")
+        except (ValueError, KeyError, TypeError) as e:
+            logging.error(f"[Amazon API] parse error: {type(e).__name__}: {e}")
+            break
+        for job in jobs:
+            title = (job.get("title") or "").strip()
+            path  = (job.get("job_path") or "").strip()
+            url   = f"https://www.amazon.jobs{path}" if path else ""
+            loc   = job.get("normalized_location") or job.get("location") or ""
+            if isinstance(loc, list):
+                loc = "; ".join(str(x) for x in loc)
+            if not (url and title):
+                continue
+            md_parts = [f"# {title}", "**Company:** Amazon",
+                        f"**Location:** {loc}"]
+            for label, key in (("Description", "description"),
+                               ("Basic Qualifications", "basic_qualifications"),
+                               ("Preferred Qualifications", "preferred_qualifications")):
+                v = job.get(key)
+                if v:
+                    md_parts.append(f"## {label}\n{v}")
+            results.append({"url": url, "title": title, "location": str(loc),
+                            "posted_date": _parse_iso_date(job.get("posted_date")),
+                            "_prefetched_md": "\n\n".join(md_parts),
+                            "_platform": "Amazon"})
+        offset += _PAGE
+        if len(jobs) < _PAGE:
+            break
+        if isinstance(total, int) and offset >= total:
+            break
+    logging.info(f"[Amazon API] {len(results)} postings total")
+    return results
+
+
 # ── Job discovery helpers (routing table lookup) ─────────────────────────────
 def _resolve_list_fn(fn_name: str):
     """Resolve a list_fn name string to the actual callable."""
@@ -816,6 +990,7 @@ def _resolve_list_fn(fn_name: str):
         "_fetch_ashby_jobs":    _fetch_ashby_jobs,
         "_fetch_workable_jobs": _fetch_workable_jobs,
         "_fetch_workday_jobs":  _fetch_workday_jobs,
+        "_fetch_amazon_jobs":   _fetch_amazon_jobs,
     }[fn_name]
 
 
@@ -907,22 +1082,39 @@ async def discover_jobs(career_url: str, fc_key: str, crawler) -> list:
     return merged
 
 # ── LLM job filter (Path B non-ATS) ──────────────────────────────────────────
-def llm_filter_jobs(company: str, links: list) -> list:
+def llm_filter_jobs(company: str, links: list, track: str = "") -> list:
     if not links: return []
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking llm_filter_jobs()")
+    forced_domain = _vertical_domain(track) if track else None
+    if forced_domain:
+        # PRJ-004 REQ-004-09: at a vertical-track company every genuine TPM
+        # role qualifies — filter only for role type and link validity.
+        rule = (f"Company: {company} is a {forced_domain}-track company; every "
+                "genuine Technical Program Manager / TPM role qualifies. "
+                "Return ONLY URLs for TPM roles. "
+                "Reject Product Manager, Engineering Manager, Project Manager, "
+                "and similar non-TPM titles. Reject ghost/closed/404 links.")
+    else:
+        rule = (
+            "You are a strict Technical Recruiter at a mid-large tech company. "
+            "Return ONLY URLs for Technical Program Manager / TPM roles that "
+            "belong to one of five tracks:\n"
+            "  - AI: AI/ML models, AI products/platforms, AI/ML infrastructure, "
+            "cloud/compute infrastructure (datacenter, silicon, GPU fleet)\n"
+            "  - Fintech: payments orgs (Google Pay, Apple Pay, Amazon Payments, "
+            "checkout/risk/ledger platforms)\n"
+            "  - Robotics: robotics sub-orgs (fulfillment robotics, "
+            "autonomous-mobility hardware, humanoid programs)\n"
+            "  - Space: space sub-orgs (Project Kuiper, Amazon Leo, Azure Space, "
+            "satellite/ground-segment programs)\n"
+            "  - Defense: defense/gov sub-orgs (Azure Government, AWS GovCloud/DoD, "
+            "mission-systems teams)\n"
+            "Reject TPM roles in Finance, HR, Legal, Marketing, or generic non-track "
+            "engineering. Reject Product Manager, Engineering Manager, Project "
+            "Manager, and similar titles. Reject ghost/closed/404 links.")
     cfg = types.GenerateContentConfig(
-        system_instruction=(
-            "You are a strict Technical Recruiter specializing in AI. "
-            "Return ONLY URLs for Technical Program Manager / TPM roles that are "
-            "directly related to one or more of: AI/ML models (LLM, GenAI, foundation models), "
-            "AI products or platforms, AI/ML infrastructure (model serving, MLOps, GPU clusters), "
-            "compute or cloud infrastructure for AI, or chips/semiconductors. "
-            "Reject TPM roles in Finance, HR, Legal, Marketing, or general non-AI engineering. "
-            "Reject Product Manager, Engineering Manager, Project Manager, and similar titles. "
-            "Reject ghost/closed/404 links."
-            + SECURITY_CLAUSE
-        ),
+        system_instruction=rule + SECURITY_CLAUSE,
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=TargetJobURLs,
@@ -933,7 +1125,7 @@ def llm_filter_jobs(company: str, links: list) -> list:
             contents=(
                 f"Company: {company}\nJobs:\n"
                 f"<scraped_content>\n{json.dumps(links)}\n</scraped_content>\n\n"
-                "Extract AI TPM URLs."
+                "Extract qualifying TPM URLs."
             ),
             config=cfg,
         )
@@ -1540,10 +1732,14 @@ def md5(text: str) -> str:
     t = re.sub(r'\s+', ' ', t).strip()
     return hashlib.md5(t.encode()).hexdigest()
 
-def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
+def extract_jd(markdown: str, company: str = "", track: str = "") -> str:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking extract_jd()")
-    cls = _classify_by_domain(ai_domain) if ai_domain else _classify(company)
+    if track:
+        forced_domain = _vertical_domain(track)
+    else:
+        # Legacy name-based fallback for manual rows without a Track value.
+        forced_domain = "AI" if _classify(company) == "ai_native" else None
     _common_instr = (
         " Extract the job_title from the posting's title or main heading."
         " Extract the salary or compensation range if mentioned anywhere in the posting "
@@ -1577,22 +1773,50 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
         " methodologies (Agile, OKRs). EXCLUDE adjectives ('strong', 'excellent'),"
         " generic verbs ('build', 'lead', 'collaborate'), full sentences, and soft skills."
         " Deduplicate. If the JD explicitly lists tools or skills, prioritize those."
+        # PRJ-004 REQ-004-08: YoE extraction rides the same call — no extra round-trip.
+        " For 'min_yoe': extract the minimum required years of experience as an integer"
+        " if the JD states one (e.g. '7+ years of program management' → 7). Use the"
+        " requirements section's stated minimum; if multiple minimums are stated, use the"
+        " one attached to overall/program-management experience. null if no numeric"
+        " minimum is stated — never guess."
+        # PRJ-004 REQ-004-11: work-authorization screen.
+        " For 'work_auth', classify the posting's work-authorization requirement:"
+        " 'citizenship_required' if US citizenship is required;"
+        " 'clearance_required' if an active security clearance OR the ability to"
+        " obtain one is required;"
+        " 'us_person_ok' if the JD says US person / permanent resident / green card"
+        " is acceptable (ITAR standard);"
+        " 'none_stated' if no authorization requirement appears."
+        " Leave 'posted_date' as an empty string — it is filled by the pipeline, not you."
     )
-    if cls == "ai_native":
-        sys_instr = (f"Extract structured JD data. Company: {company} is AI-native; "
-                     "set is_ai_tpm=true unconditionally." + _common_instr)
+    if forced_domain:
+        sys_instr = (f"Extract structured JD data. Company: {company} is a "
+                     f"{forced_domain}-track company; every TPM role here is "
+                     f"domain-qualified — set job_domain to \"{forced_domain}\"."
+                     + _common_instr)
     else:
-        sys_instr = ("Extract structured JD data. Set is_ai_tpm=true ONLY if the role "
-                     "explicitly involves one or more of: AI/ML models (LLM, GenAI, "
-                     "foundation models), AI products or platforms, AI/ML infrastructure "
-                     "(model serving, MLOps, GPU clusters), compute or cloud infrastructure "
-                     "for AI workloads, or chips/semiconductors. "
-                     "Be strict — TPM roles in Finance, HR, Legal, Marketing, SOX, audit, "
-                     "compliance, governance, GRC, or general software engineering do NOT qualify. "
-                     "Examples: ACCEPT 'TPM, ML Infrastructure', 'Sr TPM, GPU Cluster Operations', "
-                     "'TPM, Foundation Models'. REJECT 'TPM, SOX Compliance', 'TPM, Marketing "
-                     "Technology' (unless NLP/ML is explicit), 'TPM, Trust & Safety' (unless AI "
-                     "moderation is explicit), 'Federal TPM' (clearance/DoD focus)." + _common_instr)
+        # PRJ-004 REQ-004-09 (D-10): mid-large-tech per-JD judgment with
+        # explicit mapping anchors for all five tracks.
+        sys_instr = (
+            "Extract structured JD data. Classify job_domain into exactly one of "
+            "AI / Robotics / Fintech / Space / Defense — or \"None\" if the role "
+            "matches no track. Mapping anchors:\n"
+            "  - Cloud/compute infrastructure (AWS/GCP/Azure infra, datacenter, "
+            "silicon, GPU fleet), AI/ML models, AI products/platforms, MLOps → \"AI\"\n"
+            "  - Payments orgs (Google Pay, Apple Pay, Amazon Payments, checkout/"
+            "risk/ledger platforms) → \"Fintech\"\n"
+            "  - Robotics sub-orgs (Amazon Robotics, fulfillment/warehouse robotics, "
+            "autonomous-mobility hardware, humanoid programs) → \"Robotics\"\n"
+            "  - Space sub-orgs (Project Kuiper, Amazon Leo, Azure Space, satellite/"
+            "ground-segment programs) → \"Space\"\n"
+            "  - Defense/gov sub-orgs (Azure Government, AWS GovCloud/DoD programs, "
+            "mission-systems teams) → \"Defense\"\n"
+            "  - Anything else (Office 365, general finance/HR/retail TPM, generic "
+            "web products, SOX/audit/GRC) → \"None\"\n"
+            "Examples: ACCEPT 'TPM, ML Infrastructure' → AI; 'Sr TPM, Project Kuiper' "
+            "→ Space; 'TPM, Google Pay Risk' → Fintech. REJECT 'TPM, SOX Compliance' "
+            "→ None; 'TPM, Marketing Technology' → None (unless NLP/ML is explicit)."
+            + _common_instr)
     sys_instr += SECURITY_CLAUSE  # P0-3: prompt-injection guard
     cfg = types.GenerateContentConfig(
         system_instruction=sys_instr,
@@ -1612,7 +1836,7 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
         return resp.text
     except Exception as e:
         logging.error(f"[Extract] failed for {company} ({len(markdown)} chars, "
-                      f"class={cls}): {type(e).__name__}: {e}")
+                      f"track={track!r}): {type(e).__name__}: {e}")
         return "{}"
 
 # ── JD scraper function registry (for routing table lookup) ──────────────────
@@ -1625,10 +1849,20 @@ _JD_FN_REGISTRY = {
 }
 
 # ── Shared scraper routing & JD processing pipeline ──────────────────────────
-async def _route_scraper(url: str, fc_key: str, crawler, workday_meta: dict | None = None) -> tuple[str, str]:
-    """Route URL to the appropriate scraper.  Returns (markdown, label)."""
+async def _route_scraper(url: str, fc_key: str, crawler, list_meta: dict | None = None) -> tuple[str, str]:
+    """Route URL to the appropriate scraper.  Returns (markdown, label).
+
+    list_meta (PRJ-004): per-URL metadata from the list-API phase — carries
+    prefetched JD markdown (Amazon) and the Workday marker; generalizes the
+    pre-PRJ-004 workday_meta parameter."""
+    meta = (list_meta or {}).get(url) or {}
+    # Priority 0 (REQ-004-17/G6b): JD text already came with the list API —
+    # zero additional calls, never falls to the generic crawler.
+    if meta.get("_prefetched_md"):
+        return meta["_prefetched_md"], meta.get("_platform", "prefetched")
+
     # Priority 1: Workday discovery metadata (no browser fallback)
-    if workday_meta is not None and url in workday_meta:
+    if meta.get("_workday"):
         return _scrape_workday_jd(url), "Workday"
 
     # Priority 2: Greenhouse-embedded (e.g. CoreWeave ?gh_jid=...), then browser
@@ -1703,13 +1937,73 @@ def _assess_jd_quality(jd_data: dict) -> str:
     return "partial"
 
 
+def _apply_prescrape_freshness_gate(to_process: list, list_meta: dict,
+                                    known_url_meta: dict) -> tuple:
+    """PRJ-004 REQ-004-10 (D-11/D-18): pre-scrape freshness gate.
+
+    Skips a URL iff ALL of: it is NOT already in the sheet, the list API
+    supplied a date that PARSES as ISO (YYYY-MM-DD), and that date is ≥15 days
+    old. Unparseable/blank dates are explicitly NOT treated as aged — they take
+    the unknown-date keep+flag path (never a silent drop), so a future adapter
+    forwarding raw date text cannot cause aged-drops. Rows already tracked are
+    never retroactively touched. Returns (kept_urls, aged_skipped_count)."""
+    kept, aged_skipped = [], 0
+    for u in to_process:
+        posted = str((list_meta.get(u) or {}).get("posted_date", "") or "").strip()
+        is_parseable_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", posted))
+        if u not in known_url_meta and is_parseable_date \
+                and compute_freshness_tier(posted) is None:
+            logging.info(f"[FreshnessGate] Skipped ≥15-day-old posting "
+                         f"({posted}): {u}")
+            aged_skipped += 1
+            continue
+        kept.append(u)
+    return kept, aged_skipped
+
+
+# PRJ-004 REQ-004-08: Senior/Staff-prefix titles auto-qualify when YoE is unstated.
+_SENIOR_TITLE_RE = re.compile(r"\b(senior|sr\.?|staff|principal|director)\b", re.I)
+
+# PRJ-004 REQ-004-10: optional Tavily client for posting-date backfill.
+_TAVILY_CLIENT = None
+
+
+def _backfill_posted_date(company: str, title: str) -> str:
+    """Best-effort posting-date backfill via a Tavily search scoped to
+    site:linkedin.com/jobs (REQ-004-19: LinkedIn is a search signal only —
+    result snippets are parsed, pages are never fetched). Returns '' when
+    unavailable/unfound; the caller leaves the manual-review flag in place."""
+    if _TAVILY_CLIENT is None or not (company and title):
+        return ""
+    try:
+        r = _TAVILY_CLIENT.search(
+            query=f'site:linkedin.com/jobs "{title}" "{company}"', max_results=3)
+        for item in r.get("results", []):
+            text = f"{item.get('title', '')} {item.get('content', '')}"
+            m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+            if m:
+                return m.group(1)
+            m = re.search(r"(\d+)\s+(day|week)s?\s+ago", text.lower())
+            if m:
+                days = int(m.group(1)) * (7 if m.group(2) == "week" else 1)
+                return (datetime.now().date() - timedelta(days=days)).strftime("%Y-%m-%d")
+    except Exception as e:
+        logging.debug(f"[Tavily backfill] failed for {company}/{title}: {e}")
+    return ""
+
+
 async def _process_scraped_jd(
-    url: str, markdown: str, company: str, ai_domain: str,
+    url: str, markdown: str, company: str, track: str,
     stale_set: set, known_url_meta: dict,
     pending: list, timestamp_only: list,
     label: str, check_us_location: bool = False,
+    posted_date: str = "",
 ) -> None:
-    """Common pipeline: hash → stale check → cache → extract → validate → stage."""
+    """Common pipeline: hash → stale check → cache → extract → gates → stage.
+
+    PRJ-004 write-time gates (REQ-004-08/09/11): skipped rows are never
+    written; existing sheet rows are never touched by these gates (they run
+    only on the staging path — no auto-delete, REQ-004-16)."""
     hash_val = md5(markdown)
     if url in stale_set and known_url_meta.get(url, {}).get("hash") == hash_val:
         timestamp_only.append(url)
@@ -1718,7 +2012,7 @@ async def _process_scraped_jd(
         return
     _save_md_to_cache(url, markdown)
     await _GEMINI_LIMITER.acquire()
-    jd_json = extract_jd(markdown, company=company, ai_domain=ai_domain)
+    jd_json = extract_jd(markdown, company=company, track=track)
     try:
         parsed = json.loads(jd_json)
     except Exception:
@@ -1728,9 +2022,45 @@ async def _process_scraped_jd(
         return
     if check_us_location:
         loc = parsed.get("location", "")
-        if loc and not _is_us(loc):
-            print(f"      🌍 Skipped non-US ({loc}): {url}")
+        if loc and classify_region(loc) == "Other":
+            print(f"      🌍 [GeoFilter] Skipped out-of-region ({loc}): {url}")
             return
+    # ── Gate 1 (REQ-004-09): domain. Vertical companies can't hit "None"
+    # because the classifier output is deterministically overridden.
+    forced = _vertical_domain(track) if track else None
+    if forced:
+        parsed["job_domain"] = forced
+    domain = parsed.get("job_domain") or "None"
+    if domain not in JOB_DOMAIN_VALUES:
+        print(f"      🚫 [DomainGate] No track match (domain={domain!r}): {url}")
+        return
+    # ── Gate 2 (REQ-004-08): YoE — skip iff stated min ≤3 or ≥12
+    # ("10+ years" keeps, "12+ years" skips). Unstated → keep + flag.
+    min_yoe = parsed.get("min_yoe")
+    if isinstance(min_yoe, int):
+        if min_yoe <= 3 or min_yoe >= 12:
+            print(f"      🚫 [YoEGate] stated min {min_yoe} yrs (skip rule: ≤3 or ≥12): {url}")
+            return
+        parsed["yoe_flag"] = ""
+    else:
+        title = parsed.get("job_title", "") or ""
+        parsed["yoe_flag"] = ("auto-qualified (title)" if _SENIOR_TITLE_RE.search(title)
+                              else "manual review — YoE unstated")
+    # ── Gate 3 (REQ-004-11): work authorization (global, all buckets).
+    work_auth = parsed.get("work_auth", "none_stated")
+    if work_auth in ("citizenship_required", "clearance_required"):
+        print(f"      🚫 [WorkAuthGate] {work_auth}: {url}")
+        return
+    # PRJ-004 REQ-004-10: posted date comes from ATS list metadata, not the LLM.
+    if posted_date:
+        parsed["posted_date"] = posted_date
+    if not parsed.get("posted_date"):
+        backfilled = _backfill_posted_date(parsed.get("company", ""),
+                                           parsed.get("job_title", ""))
+        if backfilled:
+            parsed["posted_date"] = backfilled
+    if not parsed.get("posted_date"):
+        parsed["date_flag"] = "manual review — unknown posted date"
     # REQ-060: assess JD field completeness and inject into record
     parsed["data_quality"] = _assess_jd_quality(parsed)
     jd_json = json.dumps(parsed)
@@ -1738,7 +2068,7 @@ async def _process_scraped_jd(
     pending.append((url, jd_json, hash_val))
     known_url_meta[url] = {"hash": hash_val, "age_days": 0, "title": ""}
     suffix = f" ({label})" if label != "generic" else ""
-    print(f"      ✅ Staged{suffix}: {url}")
+    print(f"      ✅ Staged{suffix} [{domain}]: {url}")
 
 
 # ── Per-company async pipeline ────────────────────────────────────────────────
@@ -1747,14 +2077,14 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
                            excel_lock: asyncio.Lock, crawler) -> None:
     if len(row) < 4: return
     name       = str(row[0]).strip() if row[0] else ""
-    ai_domain  = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+    track      = str(row[1]).strip() if len(row) > 1 and row[1] else ""
     career_url = str(row[3]).strip() if row[3] else ""
     if not career_url or career_url == "N/A": return
     if not career_url.startswith("http"):
         career_url = "https://" + career_url
 
     print(f"\n{'─'*55}")
-    print(f"🏢  {name}  [{ai_domain}]  ({career_url})")
+    print(f"🏢  {name}  [{track}]  ({career_url})")
 
     # Rate-limit delay for crawler path
     if not any(d in career_url for d in ALL_ATS):
@@ -1767,28 +2097,36 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
         return
 
     if any(d in career_url for d in ALL_ATS):
-        raw  = _ai_title_prefilter(raw, ai_domain)
+        raw  = _nontech_title_prefilter(raw, track)
         urls = [l["url"] for l in raw]
         print(f"    ✅ {len(urls)} TPM roles (ATS-trusted, title-filtered).")
     else:
         await _GEMINI_LIMITER.acquire()
-        urls = llm_filter_jobs(name, raw)
+        urls = llm_filter_jobs(name, raw, track)
         if not urls:
             print("    LLM filtered out all URLs.")
             return
-        print(f"    LLM identified {len(urls)} AI TPM roles.")
+        print(f"    LLM identified {len(urls)} qualifying TPM roles.")
 
     await asyncio.sleep(4)
 
-    # Build a lookup of prefetched Workday data: url → {title, location}
-    workday_meta = {l["url"]: l for l in raw if l.get("_workday")}
+    # PRJ-004 REQ-004-10: generalize the Workday-only prefetch lookup into
+    # list-level metadata for ALL platforms — carries posted_date (and, for
+    # adapters like Amazon, prefetched JD markdown).
+    list_meta = {l["url"]: l for l in raw if l.get("url")}
 
     fresh_set = {u for u, m in known_url_meta.items() if m["age_days"] < FRESH_DAYS}
     stale_set = {u for u, m in known_url_meta.items() if m["age_days"] >= FRESH_DAYS}
 
     to_process = [u for u in urls if u not in fresh_set]
+
+    to_process, aged_skipped = _apply_prescrape_freshness_gate(
+        to_process, list_meta, known_url_meta)
+    if aged_skipped:
+        print(f"    🕰️  Freshness gate: skipped {aged_skipped} posting(s) ≥15 days old.")
+
     if not to_process:
-        print(f"    All {len(urls)} JDs fresh (< {FRESH_DAYS} days). Skipping.")
+        print(f"    All {len(urls)} JDs fresh (< {FRESH_DAYS} days) or aged out. Skipping.")
         return
 
     new_urls_list   = [u for u in to_process if u not in stale_set]
@@ -1807,17 +2145,18 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
                 return
             seen_urls.add(url)
             print(f"      🕷️  {url}")
-            markdown, label = await _route_scraper(url, fc_key, crawler, workday_meta)
+            markdown, label = await _route_scraper(url, fc_key, crawler, list_meta)
         if not markdown:
             tag = "Scrape" if label == "generic" else label
             logging.warning(f"[{tag}] Empty {'markdown' if label == 'generic' else 'JD'} for {url}")
             return
         # ── Gemini phase: rate-limited only (semaphore released, won't block scraping) ──
         await _process_scraped_jd(
-            url, markdown, name, ai_domain,
+            url, markdown, name, track,
             stale_set, known_url_meta,
             pending, timestamp_only, label,
             check_us_location=(label == "generic"),
+            posted_date=(list_meta.get(url) or {}).get("posted_date", ""),
         )
 
     results = await asyncio.gather(*[fetch_one(u) for u in to_process], return_exceptions=True)
@@ -1860,6 +2199,13 @@ async def main():
         summary.note(f"Run aborted: {type(e).__name__}: {e}")
         raise
     finally:
+        # PRJ-004 REQ-004-25/26: token-usage snapshot in every run log —
+        # the measurement carrier for the trial-run cost gate.
+        try:
+            from shared.gemini_pool import get_usage_summary
+            summary.note(f"gemini usage: {get_usage_summary()}")
+        except Exception:
+            pass
         summary.mark_finished()
         log_path = summary.write()
         print(f"📊 Run summary: {log_path}")
@@ -1883,6 +2229,20 @@ async def _main_inner(summary: RunSummary):
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
+
+    # PRJ-004 REQ-004-10/19 (D-19): optional Tavily client for posting-date
+    # backfill (LinkedIn-scoped SEARCH only — pages are never fetched).
+    # Degrades gracefully: without the key the keep+flag path still satisfies
+    # the requirement.
+    global _TAVILY_CLIENT
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            from tavily import TavilyClient
+            _TAVILY_CLIENT = TavilyClient(api_key=tavily_key)
+            logging.info("[Tavily] posting-date backfill enabled.")
+        except Exception as e:
+            logging.warning(f"[Tavily] backfill unavailable: {e}")
 
     class _SuppressPageEvalFilter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
@@ -1946,13 +2306,13 @@ async def _main_inner(summary: RunSummary):
         if incomplete:
             print(f"\n{'='*60}")
             print(f"🔄 Retrying {len(incomplete)} incomplete JD records...")
-            # Build company→ai_domain lookup (case-insensitive)
-            company_domain_map = {}
+            # Build company→track lookup (case-insensitive)
+            company_track_map = {}
             for r in companies:
-                cname = str(r[0]).strip() if r[0] else ""
-                cdomain = str(r[1]).strip() if len(r) > 1 and r[1] else ""
+                cname  = str(r[0]).strip() if r[0] else ""
+                ctrack = str(r[1]).strip() if len(r) > 1 and r[1] else ""
                 if cname:
-                    company_domain_map[cname.lower()] = cdomain
+                    company_track_map[cname.lower()] = ctrack
 
             retry_pending = []
             retry_lock    = asyncio.Lock()
@@ -1960,7 +2320,7 @@ async def _main_inner(summary: RunSummary):
             async def retry_one(rec: dict) -> None:
                 url          = rec["url"]
                 company_name = rec["company"]
-                ai_domain    = company_domain_map.get(company_name.lower(), "")
+                track        = company_track_map.get(company_name.lower(), "")
                 print(f"  🔄 {url}")
 
                 markdown, _ = await _route_scraper(url, fc_key, crawler)
@@ -1970,7 +2330,7 @@ async def _main_inner(summary: RunSummary):
                 _save_md_to_cache(url, markdown)
                 hash_val = md5(markdown)
                 await _GEMINI_LIMITER.acquire()
-                jd_json  = extract_jd(markdown, company=company_name, ai_domain=ai_domain)
+                jd_json  = extract_jd(markdown, company=company_name, track=track)
                 try:
                     parsed = json.loads(jd_json)
                 except Exception:
@@ -1978,6 +2338,11 @@ async def _main_inner(summary: RunSummary):
                 if not parsed.get("company"):
                     logging.warning(f"[Retry] Gemini returned empty data for {url}, skipping")
                     return
+                # PRJ-004: vertical-track override applies on retry too, so the
+                # refreshed row keeps a valid Job Domain (G2).
+                forced = _vertical_domain(track) if track else None
+                if forced:
+                    parsed["job_domain"] = forced
                 # Verify the previously-missing key fields are now populated.
                 # If Gemini still returns empty lists, writing "None" would keep the record
                 # in _JD_MISSING and cause an infinite retry loop on every run.
@@ -2020,13 +2385,13 @@ async def _main_inner(summary: RunSummary):
     print("📊 Computing job counts per company...")
     counts = count_tpm_jobs_by_company(xlsx_path)
     update_company_job_counts(xlsx_path, counts)
-    total_tpm    = sum(v["tpm"]    for v in counts.values())
-    total_ai_tpm = sum(v["ai_tpm"] for v in counts.values())
-    print(f"   Total TPM jobs tracked:    {total_tpm}")
-    print(f"   Total AI TPM jobs tracked: {total_ai_tpm}")
-    for cname, v in sorted(counts.items(), key=lambda x: -x[1]["ai_tpm"]):
+    total_tpm       = sum(v["tpm"]       for v in counts.values())
+    total_qualified = sum(v["qualified"] for v in counts.values())
+    print(f"   Total TPM jobs tracked:       {total_tpm}")
+    print(f"   Total qualified jobs tracked: {total_qualified}")
+    for cname, v in sorted(counts.items(), key=lambda x: -x[1]["qualified"]):
         if v["tpm"] > 0:
-            print(f"   {cname}: {v['tpm']} TPM | {v['ai_tpm']} AI TPM")
+            print(f"   {cname}: {v['tpm']} TPM | {v['qualified']} qualified")
 
     # ── Phase: REQ-063 auto-archive companies with no TPM jobs ────────────────
     print(f"\n{'='*60}")

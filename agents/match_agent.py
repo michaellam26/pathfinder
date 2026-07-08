@@ -35,7 +35,7 @@ from shared.excel_store import (
     get_jd_rows_for_match, get_match_pairs, upsert_match_record,
     batch_upsert_match_records, MATCH_HEADERS,
 )
-from shared.prompts import COARSE_SYSTEM_PROMPT, FINE_SYSTEM_PROMPT
+from shared.prompts import get_prompt_pair, HM_PROMPTS, TRACKS
 from shared.schemas import CoarseItem, BatchCoarseResult, MatchResult
 
 # ── JD Markdown cache ──────────────────────────────────────────────────────────
@@ -90,10 +90,12 @@ FINE_TOP_PERCENT     = float(os.getenv("MATCH_FINE_TOP_PERCENT", "60"))
 
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 
-# P0-1: optional Gemini Context Cache name (resume + FINE_SYSTEM_PROMPT).
-# Set by main() when caching is supported; evaluate_match uses it instead of
-# repeating the resume / system prompt in every per-JD call.
-_FINE_CACHE_NAME: str | None = None
+# P0-1 / PRJ-004 REQ-004-22: optional Gemini Context Caches, one per track.
+# A cache binds its system_instruction, and each track has its own HM prompt,
+# so one cache cannot serve five tracks. main() creates caches lazily for
+# tracks with ≥2 fine-eval candidates; evaluate_match looks up its track's
+# cache and falls back transparently to the uncached path on a miss.
+_FINE_CACHE_NAMES: dict = {}
 
 
 # ── Pydantic schemas: see shared/schemas.py ───────────────────────────────────
@@ -159,8 +161,25 @@ def compute_ats_for_jds(resume_text: str, jds: list[dict]) -> dict[str, dict]:
     return out
 
 
-def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
+def _track_batches(jds: list, size: int = 10) -> list:
+    """Partition JDs by job_domain, then chunk each group by `size`.
+    Returns [(track, [jd, ...]), ...] — a batch never mixes tracks because a
+    Gemini batch call shares one system prompt (PRJ-004 REQ-004-22)."""
+    by_track: dict = {}
+    for jd in jds:
+        by_track.setdefault(jd.get("job_domain", "AI"), []).append(jd)
+    return [(track, group[i * size : (i + 1) * size])
+            for track, group in by_track.items()
+            for i in range(math.ceil(len(group) / size))]
+
+
+def batch_coarse_score(resume_text: str, jds_batch: list[dict],
+                       job_domain: str = "AI") -> list[int]:
     """Send resume + up to 10 JDs in one Gemini call; return list of int scores.
+
+    PRJ-004 REQ-004-22: a batch shares one system prompt, so every JD in
+    jds_batch must belong to the same track — callers partition by
+    job_domain before chunking.
 
     P0-4: returns [] (empty list) on a structural error so the caller can
     drop the affected JDs without writing fake score=1 records. Transient
@@ -173,7 +192,7 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
         f"[JD {i}]\n{_format_jd_for_coarse(jd)}" for i, jd in enumerate(jds_batch)
     )
     cfg = types.GenerateContentConfig(
-        system_instruction=COARSE_SYSTEM_PROMPT,
+        system_instruction=get_prompt_pair(job_domain)[0],
         temperature=0.0,
         response_mime_type="application/json",
         response_schema=BatchCoarseResult,
@@ -208,20 +227,26 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
 
 
 # ── Stage 2: fine match evaluation ───────────────────────────────────────────
-def evaluate_match(resume_text: str, jd_json: str) -> str | None:
+def evaluate_match(resume_text: str, jd_json: str,
+                   job_domain: str = "AI") -> str | None:
     """Run Stage 2 fine evaluation. Returns Gemini JSON string on success.
 
-    P0-1: when _FINE_CACHE_NAME is set, uses Gemini Context Caching —
-    the resume + FINE_SYSTEM_PROMPT are referenced via cached_content
-    so only the JD is sent fresh per call (~30-40% input-token savings).
-    P0-4: returns None on structural error so the caller can drop the
-    record. Transient errors propagate as GeminiTransientError.
+    PRJ-004 REQ-004-22/23: the HM prompt is selected by the JD's track via
+    get_prompt_pair — the identical constant resume_optimizer.re_score uses,
+    so before/after deltas stay comparable per track (REQ-052).
+
+    P0-1: when the track has an entry in _FINE_CACHE_NAMES, uses Gemini
+    Context Caching — the resume + that track's HM prompt are referenced via
+    cached_content so only the JD is sent fresh per call (~30-40% input-token
+    savings). P0-4: returns None on structural error so the caller can drop
+    the record. Transient errors propagate as GeminiTransientError.
     """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking evaluate_match()")
-    if _FINE_CACHE_NAME:
+    cache_name = _FINE_CACHE_NAMES.get(job_domain)
+    if cache_name:
         cfg = types.GenerateContentConfig(
-            cached_content=_FINE_CACHE_NAME,
+            cached_content=cache_name,
             temperature=0.0,
             response_mime_type="application/json",
             response_schema=MatchResult,
@@ -233,7 +258,7 @@ def evaluate_match(resume_text: str, jd_json: str) -> str | None:
         )
     else:
         cfg = types.GenerateContentConfig(
-            system_instruction=FINE_SYSTEM_PROMPT,
+            system_instruction=get_prompt_pair(job_domain)[1],
             temperature=0.0,
             response_mime_type="application/json",
             response_schema=MatchResult,
@@ -313,6 +338,13 @@ async def main():
         summary.note(f"Run aborted: {type(e).__name__}: {e}")
         raise
     finally:
+        # PRJ-004 REQ-004-25/26: token-usage snapshot in every run log —
+        # the measurement carrier for the trial-run cost gate.
+        try:
+            from shared.gemini_pool import get_usage_summary
+            summary.note(f"gemini usage: {get_usage_summary()}")
+        except Exception:
+            pass
         summary.mark_finished()
         log_path = summary.write()
         print(f"📊 Run summary: {log_path}")
@@ -320,7 +352,7 @@ async def main():
 
 
 async def _main_inner(summary: RunSummary):
-    global _KEY_POOL, _FINE_CACHE_NAME
+    global _KEY_POOL, _FINE_CACHE_NAMES
     gemini_keys = [k for k in [
         os.getenv("GEMINI_API_KEY"),
         os.getenv("GEMINI_API_KEY_2"),
@@ -331,7 +363,7 @@ async def _main_inner(summary: RunSummary):
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
-    _FINE_CACHE_NAME = None  # reset between runs
+    _FINE_CACHE_NAMES = {}  # reset between runs
 
     print("\n" + "="*60)
     print("MATCH AGENT")
@@ -350,12 +382,12 @@ async def _main_inner(summary: RunSummary):
     xlsx_path = get_or_create_excel()
     jds       = get_jd_rows_for_match(xlsx_path)
     if not jds:
-        print("⚠️  No AI-TPM JDs in tracker. Run job_agent.py first.")
+        print("⚠️  No domain-qualified JDs in tracker. Run job_agent.py first.")
         summary.note("No JDs in tracker")
         return
 
     # ── Stage 1: batch coarse scoring ─────────────────────────────────────────
-    # Trust job_agent's `is_ai_tpm` classification — no second-pass keyword filter.
+    # Trust job_agent's Job Domain classification — no second-pass keyword filter.
     existing_pairs = get_match_pairs(xlsx_path)
 
     # Detect stale pairs (resume changed since last score)
@@ -377,7 +409,7 @@ async def _main_inner(summary: RunSummary):
         and (resume_id, jd["url"]) not in already_coarse
     ]
 
-    print(f"📋 JDs in tracker (AI-TPM): {len(jds)}")
+    print(f"📋 JDs in tracker (domain-qualified): {len(jds)}")
     print(f"✅ Already fine-scored:      {len(already_fine)}")
     print(f"~  Already coarse-scored:   {len(already_coarse)}")
     print(f"🔍 Needs coarse scoring:     {len(pending_jds)}\n")
@@ -403,18 +435,21 @@ async def _main_inner(summary: RunSummary):
         if legacy:
             print(f"   ({legacy} JD(s) lack ats_keywords — re-run job_agent to populate.)")
 
-    # Batch coarse scoring in groups of 10
+    # Batch coarse scoring in groups of 10. PRJ-004 REQ-004-22: a batch shares
+    # one system prompt, so partition by track first, then chunk within each
+    # group — same total call count (±4 partial batches worst case).
     coarse_scores: dict[str, int] = {}
     if pending_jds:
         limiter    = _GEMINI_LIMITER
         pass_jds   = pending_jds
-        n_batches  = math.ceil(len(pass_jds) / 10)
+        batches    = _track_batches(pass_jds)
 
-        for b in range(n_batches):
-            batch = pass_jds[b * 10 : (b + 1) * 10]
-            print(f"[Coarse batch {b+1}/{n_batches}] Scoring {len(batch)} JDs...")
+        for b, (track, batch) in enumerate(batches):
+            print(f"[Coarse batch {b+1}/{len(batches)}] Scoring {len(batch)} "
+                  f"{track} JDs...")
             await limiter.acquire()
-            scores = await asyncio.to_thread(batch_coarse_score, resume_text, batch)
+            scores = await asyncio.to_thread(batch_coarse_score, resume_text,
+                                             batch, track)
             # P0-4: empty list = structural error; do not write fake score=1.
             if not scores:
                 logging.warning(
@@ -426,7 +461,7 @@ async def _main_inner(summary: RunSummary):
                 continue
             for jd, score in zip(batch, scores):
                 coarse_scores[jd["url"]] = score
-            logging.info(f"[Stage1] Batch {b+1} scores: {scores}")
+            logging.info(f"[Stage1] Batch {b+1} ({track}) scores: {scores}")
         summary.succeeded += len(coarse_scores)
 
         # Stage 1 records: dict format. Score column mirrors Recruiter Score.
@@ -488,8 +523,9 @@ async def _main_inner(summary: RunSummary):
         total_fine = len(to_fine)
         fine_records: list[tuple] = []
 
-        # P0-1: try Gemini Context Caching for the resume + FINE_SYSTEM_PROMPT.
-        # Many fine evaluations send the same resume + system prompt; caching
+        # P0-1 / PRJ-004: try Gemini Context Caching per track. A cache binds
+        # its system_instruction (one HM prompt), so each track with ≥2 fine
+        # candidates gets its own cache of resume + HM_PROMPTS[track]; caching
         # cuts ~30-40% of input tokens. Falls back transparently if the model
         # doesn't support caching (preview models often don't).
         cache_contents = [types.Content(
@@ -499,16 +535,27 @@ async def _main_inner(summary: RunSummary):
                 f"<scraped_content>\n{resume_text}\n</scraped_content>"
             ))],
         )] if hasattr(types, "Content") else None
-        if cache_contents is not None and len(to_fine) >= 2:
-            _FINE_CACHE_NAME = _KEY_POOL.create_cache(
-                model=MODEL,
-                system_instruction=FINE_SYSTEM_PROMPT,
-                contents=cache_contents,
-                ttl="3600s",
-                display_name=f"match-{summary.run_id}",
-            )
-            if _FINE_CACHE_NAME:
-                summary.note(f"Using context cache: {_FINE_CACHE_NAME}")
+        if cache_contents is not None:
+            fine_track_counts: dict[str, int] = {}
+            for key in to_fine:
+                jd = jd_lookup.get(key[1])
+                if jd:
+                    t = jd.get("job_domain", "AI")
+                    fine_track_counts[t] = fine_track_counts.get(t, 0) + 1
+            for track, count in fine_track_counts.items():
+                if count < 2 or track not in HM_PROMPTS:
+                    continue
+                cache_name = _KEY_POOL.create_cache(
+                    model=MODEL,
+                    system_instruction=HM_PROMPTS[track],
+                    contents=cache_contents,
+                    ttl="3600s",
+                    display_name=f"match-{summary.run_id}-{track}",
+                )
+                if cache_name:
+                    _FINE_CACHE_NAMES[track] = cache_name
+            if _FINE_CACHE_NAMES:
+                summary.note(f"Using context caches: {_FINE_CACHE_NAMES}")
 
         async def fine_one(key: tuple, i: int) -> None:
             async with sem:
@@ -520,7 +567,8 @@ async def _main_inner(summary: RunSummary):
                 await limiter.acquire()
                 jd_content  = _load_jd_markdown(url) or jd["jd_json"]
                 result_json = await asyncio.to_thread(
-                    evaluate_match, resume_text, jd_content
+                    evaluate_match, resume_text, jd_content,
+                    jd.get("job_domain", "AI"),
                 )
                 # P0-4: structural error — drop the record, keep coarse score in Excel.
                 if result_json is None:
@@ -560,9 +608,9 @@ async def _main_inner(summary: RunSummary):
             await asyncio.gather(*[fine_one(k, i) for i, k in enumerate(to_fine, 1)])
         finally:
             # P0-1: best-effort cache cleanup; never let teardown crash main.
-            if _FINE_CACHE_NAME:
-                _KEY_POOL.delete_cache(_FINE_CACHE_NAME)
-                _FINE_CACHE_NAME = None
+            for cache_name in list(_FINE_CACHE_NAMES.values()):
+                _KEY_POOL.delete_cache(cache_name)
+            _FINE_CACHE_NAMES.clear()
         batch_upsert_match_records(xlsx_path, fine_records)
         logging.info(f"[Stage2] Wrote {len(fine_records)} fine records.")
 

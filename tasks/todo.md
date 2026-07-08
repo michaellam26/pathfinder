@@ -1,6 +1,41 @@
 # Task Tracker
 
-## Active (2026-04-28 evening): REVIEW_2026-04-28 follow-up
+## Active (2026-07-07): PRJ-004 Multi-Track Expansion — Phase 3 Implementation
+
+**Source of truth**: `docs/sdlc/PRJ-004-multi-track-expansion/design.md` §6 (T1–T17)
+**Branch**: `prj-004-multi-track-expansion`
+**Critical path**: T1 → T5 → T6 → T9 → T17
+
+### P0 (launch-blocking)
+- [x] T1 excel_store schema (commit 49e3b1b — landed atomically with T2/T9; suite 876 green)
+- [x] T2 row selector all-valid-rows + job_domain passthrough; qualified-count rework (49e3b1b)
+- [x] T3 company_agent taxonomy/quotas/rules (suite 902 green)
+- [x] T4 --migrate-tracks CLI (code done; RUN still blocked on user pruning; suite 907)
+- [x] T5 job_agent extraction core (suite 923)
+- [x] T6 posting dates + freshness gate + backfill (with T5 commit)
+- [x] T7 geo tighten (with T5 commit)
+- [x] T8 Workday pagination; Firecrawl limit removal (6ffd36c; suite 885)
+- [x] T9 sort_jd_tracker_by_tier rewrite (49e3b1b — landed with T1; recompute-at-sort verified by test)
+- [x] T10 prompts.py per-track pairs + accessors (986500b; suite 885)
+- [x] T11 match_agent per-track routing + per-track caches (5fab05a + fixups)
+- [x] T12 resume_optimizer per-track routing (suite 891 green)
+
+### P1/P2 (non-blocking)
+- [x] T13 launchd failure surfacing (2577913)
+- [x] T14 Amazon.jobs adapter + prefetch routing (suite 930)
+- [x] T15 Tesla regression verification (registry + schema tests)
+- [ ] T16 Google Careers adapter (P2 stretch — deliberately deferred post-launch per design)
+
+### Rollout (T17 — Phase 5 launch checklist; see docs/sdlc/PRJ-004-multi-track-expansion/launch-readiness.md §2)
+- [ ] User: prune Company_List → run `--migrate-tracks` → user spot-check
+- [ ] User: wipe JD_Tracker (schema guard verifies)
+- [ ] Discovery top-up runs → uncapped trial run → cost confirmation (REQ-004-26 gate 2) → enable daily schedule
+
+**Working rules**: full suite after each task, never left red; tests in tests/; bugs found en route go to BUGS.md.
+
+---
+
+## Backlog (stale, 2026-04-28): REVIEW_2026-04-28 follow-up
 
 **Source doc**: `docs/REVIEW_2026-04-28.md`
 **Status**: P0 done (7/8, P0-8 WONTFIX); P1 5 fixed today + 2 fixed earlier; P2 3 fixed earlier

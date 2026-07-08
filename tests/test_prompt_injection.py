@@ -157,7 +157,7 @@ class TestJobAgentWrapsScrapedContent(unittest.TestCase):
 
     def test_extract_jd_wraps_markdown(self):
         job_mod.extract_jd("MALICIOUS_MARKDOWN_BODY",
-                           company="Acme", ai_domain="Big Tech (AI Investment)")
+                           company="Acme", track="Mid-large Tech")
         contents = self._captured_contents()
         self.assertIn("<scraped_content>", contents)
         self.assertIn("</scraped_content>", contents)

@@ -679,7 +679,7 @@ class TestSchemaNoCareerUrl(unittest.TestCase):
 
     def test_required_fields_present(self):
         fields = AICompanyInfo.model_fields
-        for f in ["company_name", "ai_domain", "business_focus"]:
+        for f in ["company_name", "track", "business_focus"]:
             self.assertIn(f, fields)
 
     def test_business_focus_description_mentions_sentences(self):
@@ -689,7 +689,7 @@ class TestSchemaNoCareerUrl(unittest.TestCase):
     def test_instantiation_without_url(self):
         obj = AICompanyInfo(
             company_name="TestCo",
-            ai_domain="AI Startups",
+            track="AI-native",
             business_focus="TestCo builds AI tools. They serve enterprise customers. "
                            "Their edge is speed. They raised $200M in 2025."
         )
@@ -813,7 +813,7 @@ class TestBug44TavilyQuotaDetection(unittest.TestCase):
         mock_client.search.side_effect = Exception("HTTP 402 Payment Required - quota exhausted")
 
         with patch("tavily.TavilyClient", return_value=mock_client):
-            result = discover_ai_companies("fake-key", {"ExistingCo"}, 5)
+            result = discover_ai_companies("fake-key", {"ExistingCo"}, {"AI-native": 5})
 
         # Should have called search only once (broke on quota error)
         self.assertEqual(mock_client.search.call_count, 1)
@@ -828,7 +828,7 @@ class TestBug44TavilyQuotaDetection(unittest.TestCase):
         mock_client.search.side_effect = Exception("429 Too Many Requests")
 
         with patch("tavily.TavilyClient", return_value=mock_client):
-            result = discover_ai_companies("fake-key", set(), 3)
+            result = discover_ai_companies("fake-key", set(), {"AI-native": 3})
 
         self.assertEqual(mock_client.search.call_count, 1)
 
@@ -842,7 +842,7 @@ class TestBug44TavilyQuotaDetection(unittest.TestCase):
         mock_client.search.side_effect = Exception("Connection timeout")
 
         with patch("tavily.TavilyClient", return_value=mock_client):
-            result = discover_ai_companies("fake-key", set(), 3)
+            result = discover_ai_companies("fake-key", set(), {"AI-native": 3})
 
         # Should have tried all queries, not just one
         self.assertEqual(mock_client.search.call_count, len(TAVILY_QUERIES))
@@ -880,7 +880,7 @@ class TestBug49DiscoverCompaniesSetMutation(unittest.TestCase):
 
         # Mock Gemini to return a company
         mock_pool.generate_content.return_value = MagicMock(
-            text='{"companies": [{"company_name": "NewAICo", "ai_domain": "NLP", "business_focus": "chatbots"}]}'
+            text='{"companies": [{"company_name": "NewAICo", "track": "AI-native", "business_focus": "chatbots"}]}'
         )
 
         original_names = {"ExistingCo", "OtherCo"}
@@ -888,7 +888,7 @@ class TestBug49DiscoverCompaniesSetMutation(unittest.TestCase):
 
         with patch("tavily.TavilyClient", return_value=mock_client), \
              patch("agents.company_agent.find_career_url", return_value="https://newai.co/careers"):
-            discover_ai_companies("fake-key", original_names, 5)
+            discover_ai_companies("fake-key", original_names, {"AI-native": 5})
 
         # The original set must NOT have been modified
         self.assertEqual(original_names, original_copy)
@@ -903,13 +903,13 @@ class TestBug49DiscoverCompaniesSetMutation(unittest.TestCase):
 
         # Return two companies with the same name
         mock_pool.generate_content.return_value = MagicMock(
-            text='{"companies": [{"company_name": "DupCo", "ai_domain": "ML", "business_focus": "x"}, '
-                 '{"company_name": "DupCo", "ai_domain": "ML", "business_focus": "y"}]}'
+            text='{"companies": [{"company_name": "DupCo", "track": "AI-native", "business_focus": "x"}, '
+                 '{"company_name": "DupCo", "track": "AI-native", "business_focus": "y"}]}'
         )
 
         with patch("tavily.TavilyClient", return_value=mock_client), \
              patch("agents.company_agent.find_career_url", return_value="https://dupco.com/careers"):
-            results = discover_ai_companies("fake-key", set(), 5)
+            results = discover_ai_companies("fake-key", set(), {"AI-native": 5})
 
         # Only one DupCo should be in results (dedup within batch)
         names = [c.get("company_name") for c in results]
@@ -924,7 +924,7 @@ class TestBug54KeyPoolNoneGuard(unittest.TestCase):
         try:
             company_agent_mod._KEY_POOL = None
             with self.assertRaises(RuntimeError) as ctx:
-                discover_ai_companies("fake_key", set(), 5)
+                discover_ai_companies("fake_key", set(), {"AI-native": 5})
             self.assertIn("_KEY_POOL not initialized", str(ctx.exception))
         finally:
             company_agent_mod._KEY_POOL = original
@@ -1009,20 +1009,249 @@ class TestPhase15ManualBackfill(unittest.TestCase):
         self.assertIn(url_by_name["ManualCo"], (None, ""))
 
 
-class TestAIDomainWhitelist(unittest.TestCase):
-    """Defense/Robotics AI must be a recognized ai_domain for Gemini discovery."""
+class TestTrackWhitelist(unittest.TestCase):
+    """PRJ-004: the 6-track taxonomy must be the recognized bucket set."""
 
-    def test_defense_robotics_in_whitelist(self):
-        self.assertIn("Defense/Robotics AI", company_agent_mod.AI_DOMAIN_VALUES)
+    def test_track_values_and_quotas(self):
+        self.assertEqual(company_agent_mod.TRACK_VALUES,
+                         ("AI-native", "Mid-large Tech", "Robotics",
+                          "Fintech", "Space", "Defense"))
+        self.assertEqual(sum(company_agent_mod.TRACK_QUOTAS.values()),
+                         company_agent_mod.MAX_TOTAL)
+        self.assertEqual(company_agent_mod.MAX_TOTAL, 500)
 
-    def test_aicompanyinfo_accepts_defense_robotics(self):
-        # Pydantic Literal must accept the new value without raising.
+    def test_companyinfo_accepts_defense(self):
+        # Pydantic Literal must accept every track value without raising.
         info = AICompanyInfo(
             company_name="Anduril",
-            ai_domain="Defense/Robotics AI",
+            track="Defense",
             business_focus="Defense AI products for the US military and allies.",
         )
-        self.assertEqual(info.ai_domain, "Defense/Robotics AI")
+        self.assertEqual(info.track, "Defense")
+
+    def test_companyinfo_rejects_legacy_value(self):
+        from pydantic import ValidationError
+        with self.assertRaises(ValidationError):
+            AICompanyInfo(company_name="X", track="AI Startups",
+                          business_focus="legacy bucket must be rejected")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T3 — per-bucket quota math + deterministic bucket rules
+# ═════════════════════════════════════════════════════════════════════════════
+class TestComputeNeedByTrack(unittest.TestCase):
+
+    @staticmethod
+    def _rows(counts):
+        rows = []
+        for track, n in counts.items():
+            rows += [[f"{track}Co{i}", track, "focus", "url"] for i in range(n)]
+        return rows
+
+    def test_open_slots_computed_per_bucket(self):
+        from agents.company_agent import compute_need_by_track
+        need = compute_need_by_track(self._rows({"AI-native": 100, "Space": 50}))
+        self.assertEqual(need["AI-native"], 50)
+        self.assertEqual(need["Space"], 0)
+        self.assertEqual(need["Robotics"], 50)
+        self.assertEqual(need["Mid-large Tech"], 150)
+
+    def test_grandfathered_overage_gets_zero_never_negative(self):
+        """D-12: a bucket over quota (migration survivors) → 0 slots, no trim."""
+        from agents.company_agent import compute_need_by_track
+        need = compute_need_by_track(self._rows({"AI-native": 170}))
+        self.assertEqual(need["AI-native"], 0)
+
+    def test_unmigrated_values_count_toward_no_bucket(self):
+        from agents.company_agent import compute_need_by_track
+        rows = self._rows({"Fintech": 10})
+        rows.append(["LegacyCo", "AI Startups", "focus", "url"])  # legacy value
+        need = compute_need_by_track(rows)
+        self.assertEqual(need["Fintech"], 40)
+        # Legacy value consumed no bucket's quota
+        self.assertEqual(sum(need.values()),
+                         sum(company_agent_mod.TRACK_QUOTAS.values()) - 10)
+
+
+class TestAllocateBatch(unittest.TestCase):
+
+    def test_under_batch_size_passthrough(self):
+        from agents.company_agent import allocate_batch
+        need = {"AI-native": 5, "Space": 3}
+        self.assertEqual(allocate_batch(need, 50), need)
+
+    def test_proportional_allocation_caps_total(self):
+        from agents.company_agent import allocate_batch
+        need = {"AI-native": 150, "Mid-large Tech": 150, "Robotics": 50,
+                "Fintech": 50, "Space": 50, "Defense": 50}
+        alloc = allocate_batch(need, 50)
+        self.assertEqual(sum(alloc.values()), 50)
+        for track, n in alloc.items():
+            self.assertLessEqual(n, need[track])
+        # Big buckets get proportionally more
+        self.assertGreater(alloc["AI-native"], alloc["Space"])
+
+    def test_full_bucket_allocated_zero(self):
+        from agents.company_agent import allocate_batch
+        alloc = allocate_batch({"AI-native": 100, "Space": 0}, 50)
+        self.assertEqual(alloc["Space"], 0)
+        self.assertEqual(alloc["AI-native"], 50)
+
+
+class TestApplyBucketRules(unittest.TestCase):
+
+    @staticmethod
+    def _co(name, track="Defense"):
+        return {"company_name": name, "track": track, "business_focus": "x"}
+
+    def test_defense_primes_dropped(self):
+        from agents.company_agent import _apply_bucket_rules
+        out = _apply_bucket_rules(
+            [self._co("Lockheed Martin"), self._co("Anduril"),
+             self._co("Raytheon"), self._co("Boeing"), self._co("L3Harris")],
+            {"Defense": 50})
+        self.assertEqual([c["company_name"] for c in out], ["Anduril"])
+
+    def test_palantir_allowlisted(self):
+        from agents.company_agent import _apply_bucket_rules
+        out = _apply_bucket_rules([self._co("Palantir Technologies")],
+                                  {"Defense": 50})
+        self.assertEqual(len(out), 1)
+
+    def test_prime_name_ok_outside_defense_bucket(self):
+        """Primes are only hard-excluded from the Defense bucket."""
+        from agents.company_agent import _apply_bucket_rules
+        out = _apply_bucket_rules([self._co("Boeing", track="Mid-large Tech")],
+                                  {"Mid-large Tech": 150})
+        self.assertEqual(len(out), 1)
+
+    def test_quota_trim_per_bucket(self):
+        from agents.company_agent import _apply_bucket_rules
+        cos = [self._co(f"Def{i}") for i in range(5)] \
+            + [self._co("SpaceCo", track="Space")]
+        out = _apply_bucket_rules(cos, {"Defense": 3, "Space": 0})
+        names = [c["company_name"] for c in out]
+        self.assertEqual(len([n for n in names if n.startswith("Def")]), 3)
+        self.assertNotIn("SpaceCo", names)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T4 — --migrate-tracks re-bucketing pass (REQ-004-06)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestMigrateTracks(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        from shared.excel_store import get_or_create_excel, upsert_companies
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        self._orig_pool = company_agent_mod._KEY_POOL
+
+    def tearDown(self):
+        company_agent_mod._KEY_POOL = self._orig_pool
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _seed(self, rows):
+        """rows: [(name, track_value)]"""
+        from shared.excel_store import upsert_companies
+        upsert_companies(self.path, [
+            {"company_name": n, "track": t, "business_focus": f"{n} does things.",
+             "career_url": f"https://{n.lower()}.com/careers"}
+            for n, t in rows
+        ])
+
+    @staticmethod
+    def _pool_returning(classifications):
+        import json
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = json.dumps({"classifications": classifications})
+        pool.generate_content.return_value = resp
+        return pool
+
+    def _tracks(self):
+        from shared.excel_store import get_company_rows
+        return {r[0]: r[1] for r in get_company_rows(self.path)}
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_already_migrated_rows_skipped_idempotent(self):
+        self._seed([("DoneCo", "Space"), ("OldCo", "AI Startups")])
+        company_agent_mod._KEY_POOL = self._pool_returning([
+            {"company_name": "OldCo", "track": "AI-native",
+             "rationale": "AI product startup", "confident": True},
+        ])
+        out = company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(out, {"migrated": 1, "skipped": 1, "flagged": 0})
+        # Gemini saw only the unmigrated row
+        sent = company_agent_mod._KEY_POOL.generate_content.call_args.kwargs["contents"]
+        self.assertIn("OldCo", sent)
+        self.assertNotIn("DoneCo", sent)
+        self.assertEqual(self._tracks()["OldCo"], "AI-native")
+        self.assertEqual(self._tracks()["DoneCo"], "Space")
+        # Second run: nothing left to do
+        out2 = company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(out2["migrated"], 0)
+        self.assertEqual(out2["skipped"], 2)
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_unconfident_flagged_never_guessed(self):
+        self._seed([("MysteryCo", "Legacy Bucket")])
+        company_agent_mod._KEY_POOL = self._pool_returning([
+            {"company_name": "MysteryCo", "track": "Fintech",
+             "rationale": "thin description", "confident": False},
+        ])
+        out = company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(out["flagged"], 1)
+        self.assertEqual(self._tracks()["MysteryCo"], "UNMIGRATED — manual review")
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_defense_prime_forced_to_midlarge(self):
+        """Deterministic post-check: even if the LLM says Defense, a legacy
+        prime can only survive in Mid-large Tech."""
+        self._seed([("Lockheed Martin", "Defense/Robotics AI")])
+        company_agent_mod._KEY_POOL = self._pool_returning([
+            {"company_name": "Lockheed Martin", "track": "Defense",
+             "rationale": "defense company", "confident": True},
+        ])
+        company_agent_mod.migrate_tracks(self.path)
+        self.assertEqual(self._tracks()["Lockheed Martin"], "Mid-large Tech")
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "fake"})
+    def test_no_rows_deleted_and_batch_failure_leaves_unmigrated(self):
+        self._seed([("ACo", "old"), ("BCo", "old")])
+        pool = MagicMock()
+        pool.generate_content.side_effect = Exception("boom")
+        company_agent_mod._KEY_POOL = pool
+        out = company_agent_mod.migrate_tracks(self.path)
+        tracks = self._tracks()
+        # Both rows still present (never deleted), flagged for manual review.
+        self.assertEqual(set(tracks.keys()), {"ACo", "BCo"})
+        self.assertEqual(out["flagged"], 2)
+
+
+class TestUpdateCompanyTrack(unittest.TestCase):
+
+    def test_writes_track_in_place(self):
+        import tempfile
+        from shared.excel_store import (get_or_create_excel, upsert_companies,
+                                        get_company_rows, update_company_track)
+        fd, path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(path)
+        try:
+            get_or_create_excel(path)
+            upsert_companies(path, [{"company_name": "TrackCo", "track": "old",
+                                     "business_focus": "x", "career_url": "u"}])
+            update_company_track(path, 2, "Robotics")
+            rows = get_company_rows(path)
+            self.assertEqual(rows[0][1], "Robotics")
+            self.assertEqual(rows[0][0], "TrackCo")  # nothing else touched
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

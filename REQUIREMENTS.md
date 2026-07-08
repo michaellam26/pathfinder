@@ -274,7 +274,7 @@ Five small features landed between PRJ-003 and the next named project. Tracked h
 
 | ID | Requirement Description | Status |
 |----|----------|------|
-| REQ-130 | `company_agent.run_phase_1_5` detects manually-inserted `Company_List` rows (`Company Name` + `AI Domain` present, `Career URL` blank) and runs the full `find_career_url` discovery pipeline (Tavily ATS-targeted → general search → Greenhouse / Lever / Ashby / Workable slug probes → Workday-via-Tavily fallback → homepage crawl) to backfill the URL. Tavily is a hard requirement for this path; rows that resist discovery are reported and left blank for the next run to retry. `AI Domain` accepts any of the 6 whitelisted buckets *or* a custom string (job_agent treats unknown buckets as `ai_native`). | `[t]` |
+| REQ-130 | `company_agent.run_phase_1_5` detects manually-inserted `Company_List` rows (`Company Name` + `AI Domain` present, `Career URL` blank) and runs the full `find_career_url` discovery pipeline (Tavily ATS-targeted → general search → Greenhouse / Lever / Ashby / Workable slug probes → Workday-via-Tavily fallback → homepage crawl) to backfill the URL. Tavily is a hard requirement for this path; rows that resist discovery are reported and left blank for the next run to retry. ~~`AI Domain` accepts any of the 6 whitelisted buckets *or* a custom string~~ **PRJ-004: column renamed `Track`; accepts the 6 track buckets — unknown/custom values take the strict Mid-large-Tech classifier path with a logged warning (D-17)**. | `[t]` |
 
 ### Tailored-resume user-edit protection
 
@@ -286,7 +286,7 @@ Five small features landed between PRJ-003 and the next named project. Tracked h
 
 | ID | Requirement Description | Status |
 |----|----------|------|
-| REQ-132 | After each `job_agent` run, `JD_Tracker` is sorted into three location tiers — **Greater Seattle** → **Remote (US)** → **Other** — with a new `Location Tier` column and per-tier row highlighting. Sort is stable within-tier (preserves recency order). Classifier recognises Seattle / Bellevue / Redmond / Kirkland / Greater Seattle metro variants and standard Remote phrasings. | `[t]` |
+| REQ-132 | After each `job_agent` run, `JD_Tracker` is sorted into three location tiers — **Greater Seattle** → **Remote (US)** → **Other** — with a new `Location Tier` column and per-tier row highlighting. Sort is stable within-tier (preserves recency order). Classifier recognises Seattle / Bellevue / Redmond / Kirkland / Greater Seattle metro variants and standard Remote phrasings. **Superseded by PRJ-004 REQ-004-15: combined 1–6 `Sort Tier` (freshness × region), tier 9 sink.** | `[t]` |
 
 ### Operational scheduling
 
@@ -307,6 +307,24 @@ Five small features landed between PRJ-003 and the next named project. Tracked h
 > **Code location (REQ-134)**: `shared/config.py:MODEL`.
 
 ---
+
+## 9.7 PRJ-004: Multi-Track Expansion (2026-07)
+
+Six-track/500-company expansion with freshness, YoE, and work-authorization
+filtering. SDLC record: `docs/sdlc/PRJ-004-multi-track-expansion/` (BRD holds
+the full REQ-004-01…26 table with per-REQ priority; status.md holds the
+decision log D-01…D-20 and risk register R-01…R-13).
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-004-01…06 | Company discovery: 6-bucket taxonomy (AI-native/Mid-large Tech/Robotics/Fintech/Space/Defense) at quotas 150/150/50/50/50/50; early-company rule (~2000+) on verticals; defense legacy-prime hard exclusion + Palantir allowlist (deterministic post-filter, not LLM-trusted); hires-in-region geography (Seattle/CA incl. SoCal/TX); one-time `--migrate-tracks` LLM re-bucketing with grandfathering (D-12), idempotent, audit table, `UNMIGRATED — manual review` flagging | `[t]` |
+| REQ-004-07…13 | Job filtering: permissive TPM title filter retained; YoE gate (skip stated min ≤3 or ≥12; unstated → keep + auto-qualify on Senior/Staff/Principal/Director title else manual-review flag); 5-track domain classifier with mid-large mapping anchors (D-10), vertical-track deterministic override; posting-date extraction (Greenhouse/Lever/Ashby/Workable/Workday/Amazon) + pre-scrape ≤14-day gate on parseable dates only (D-11/D-18, never retroactive, unparseable = unknown → keep+flag + optional Tavily backfill, D-19); global work-auth screen (citizenship/clearance → skip, `Work-Auth Status` audit); geo keep-set Seattle/CA/TX/US-Remote; Workday pagination + Firecrawl uncap | `[t]` |
+| REQ-004-14…16 | Excel: `Job Domain` replaces `Is AI TPM`; 6 new JD_Tracker columns; `Track`/`Qualified Jobs` renames (D-09/D-15); combined 1–6 `Sort Tier` (freshness primary, Seattle+Remote > CA/TX; 9 = unknown/aged/other sink) recomputed each sort; assert-empty legacy-schema guard; no auto-delete lifecycle preserved | `[t]` |
+| REQ-004-17…20 | Scrapers: Amazon.jobs JSON adapter with prefetched JD markdown (zero crawler fallback, G6b); LinkedIn search-signal-only policy; Tesla scraper regression-verified; Google Careers adapter deferred (P2 stretch) | `[t]` (REQ-004-18 deferred) |
+| REQ-004-21…24 | Match layer: selector returns all valid rows with `job_domain`; 5 per-track Recruiter/HM prompt pairs + tailor emphasis from user-approved narratives (D-13); same-track byte-identity across match/optimizer (REQ-052 preserved per track); per-track context caches; batches never mix tracks | `[t]` |
+| REQ-004-25…26 | Ops: launchd failure surfacing (`LAST_RUN_FAILED`/`LAST_RUN_OK` markers, subprocess-tested); RunSummary Gemini-usage notes; cost gates — static sizing confirmed at BRD (D-14), uncapped trial-run readout + user go/no-go still gates daily automation | `[t]` (trial gate open) |
+
+> **Code location**: `agents/company_agent.py` (taxonomy, quotas, `_apply_bucket_rules`, `migrate_tracks`), `agents/job_agent.py` (`JobDetails`, `extract_jd`, write-time gates, `_apply_prescrape_freshness_gate`, `_fetch_amazon_jobs`), `shared/excel_store.py` (`JD_HEADERS`, migrations, `classify_region`, `compute_freshness_tier`, `compute_sort_tier`, sorter, selector), `shared/prompts.py` (`RECRUITER_PROMPTS`/`HM_PROMPTS`/`TAILOR_EMPHASIS` + accessors), `agents/match_agent.py`/`agents/resume_optimizer.py` (per-track routing), `scripts/run_pipeline_scheduled.sh`.
 
 ## 10. Technical Decision Record
 
@@ -351,3 +369,4 @@ Five small features landed between PRJ-003 and the next named project. Tracked h
 | v1.9 | 2026-04-28 | Added "9. PRJ-002: 3-Dimension Scoring Requirements" section: REQ-100~112 covering ATS dimension (deterministic keyword coverage, REQ-100~102, REQ-110), Excel schema extensions (REQ-103, REQ-104, REQ-109, REQ-111), prompt rename pivot (REQ-105), match_agent integration (REQ-106), resume_optimizer integration (REQ-107~108), test coverage (REQ-112). Implemented across 5 sequential PRs (`feat/3d-scoring` branch). Tests: 619 → 718 (+99). Also updated REQ-033 (marked obsolete: keyword pre-filter removed in P0-8), REQ-035 (top 20% → UNION threshold/top-N% per P0-9), REQ-052 (renamed FINE_SYSTEM_PROMPT to HM_SYSTEM_PROMPT, dropped batch_re_score reference per P0-10). |
 | v2.0 | 2026-05-05 | Added "9.5 PRJ-003: PDF Resume I/O" section: REQ-120~127 covering PDF→MD input via `pdfplumber` (deterministic, no LLM) with layout-aware section/bullet detection (REQ-120~123), MD→PDF output via WeasyPrint with ATS-safe CSS (REQ-124~126), and `load_resume` centralization in `shared/resume_io.py` (REQ-127). Tests: 736 → 749 (+13). Companion artifact: `docs/sdlc/PRJ-003-pdf-io-opus-eval/eval.md` — Claude Opus 4.7 vs Gemini 3.1 Flash Lite tailor-step memo (verdict: not as full swap; opt-in fallback only). |
 | v2.1 | 2026-05-20 | Added "9.6 Post-PRJ-003 Operational Hardening" section: REQ-130 (manual-entry Career URL backfill), REQ-131 (tailored-resume user-edit protection via Last Written Hash), REQ-132 (JD_Tracker auto-sort by Location Tier), REQ-133 (launchd daily pipeline runner), REQ-134 (Gemini model name → GA). REQ-030 updated to include `.pdf` cross-reference. Tests: 749 → 859 (+110, spanning Workable/Workday discovery work + the 5 features above). |
+| v2.2 | 2026-07-07 | Added "9.7 PRJ-004: Multi-Track Expansion": REQ-004-01~26 (six-track taxonomy, YoE/freshness/work-auth gates, schema renames, Amazon adapter, per-track match routing). REQ-130's `AI Domain` semantics superseded by `Track`; REQ-132's 3-tier location sort superseded by the combined 1–6 Sort Tier. Tests: 859 → 945 (+86). |

@@ -711,5 +711,67 @@ class TestBug54KeyPoolNoneGuard(unittest.TestCase):
             optimizer_mod._KEY_POOL = original
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PRJ-004 T12 — per-track routing (Phase 4 QA follow-up; mirrors match tests)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestOptimizerPerTrackRouting(unittest.TestCase):
+
+    def setUp(self):
+        import agents.resume_optimizer as ro
+        self._orig = ro._KEY_POOL
+        pool = MagicMock()
+        resp = MagicMock()
+        resp.text = "{}"
+        pool.generate_content.return_value = resp
+        ro._KEY_POOL = pool
+
+    def tearDown(self):
+        import agents.resume_optimizer as ro
+        ro._KEY_POOL = self._orig
+
+    def _cfg_kwargs(self, fn, *args):
+        import agents.resume_optimizer as ro
+        ro.types.GenerateContentConfig.reset_mock()
+        fn(*args)
+        return ro.types.GenerateContentConfig.call_args.kwargs
+
+    def test_re_score_uses_same_hm_prompt_object_as_match_agent(self):
+        """G8/REQ-052: byte identity per track — assertIs, not equality."""
+        import agents.resume_optimizer as ro
+        from shared.prompts import HM_PROMPTS
+        for track in ("AI", "Space", "Fintech"):
+            kwargs = self._cfg_kwargs(ro.re_score, "# tailored md", "jd", track)
+            self.assertIs(kwargs["system_instruction"], HM_PROMPTS[track],
+                          f"re_score HM prompt differs for {track}")
+
+    def test_tailor_resume_uses_track_emphasis(self):
+        import agents.resume_optimizer as ro
+        from shared.prompts import get_tailor_prompts
+        kwargs = self._cfg_kwargs(ro.tailor_resume, "resume", "jd", "Space")
+        self.assertEqual(kwargs["system_instruction"], get_tailor_prompts("Space")[0])
+        self.assertIn("do NOT push GenAI/LLM experience",
+                      kwargs["system_instruction"])
+
+    def test_batch_tailor_uses_track_batch_prompt(self):
+        import agents.resume_optimizer as ro
+        from shared.prompts import get_tailor_prompts
+        kwargs = self._cfg_kwargs(ro.batch_tailor_resume, "resume", ["jd1"], "Defense")
+        self.assertEqual(kwargs["system_instruction"],
+                         get_tailor_prompts("Defense")[1])
+        self.assertIn("BATCH MODE", kwargs["system_instruction"])
+
+    def test_tailor_batching_groups_by_track(self):
+        """T12 mirror of match's TestTrackBatches: a tailor batch never mixes
+        tracks (one system prompt per Gemini call)."""
+        from agents.match_agent import _track_batches
+        items = [{"url": f"u{i}", "job_domain": d}
+                 for i, d in enumerate(["AI", "Space", "AI", "Space", "AI"])]
+        batches = _track_batches(items, size=2)
+        for track, batch in batches:
+            self.assertEqual({it["job_domain"] for it in batch}, {track})
+        self.assertEqual(sum(len(b) for _, b in batches), 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
