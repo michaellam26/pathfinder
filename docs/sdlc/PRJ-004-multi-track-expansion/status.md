@@ -1,7 +1,7 @@
 # PRJ-004: Multi-Track Expansion
 
 **Phase**: Phase 5 — Launch Readiness
-**Status**: 🟡 In Progress
+**Status**: 🟢 Signed off — launch checklist in progress (merged to main)
 **Priority**: P1
 **Created**: 2026-07-07
 **Last Updated**: 2026-07-07
@@ -50,7 +50,7 @@
 
 ### Phase 5: Launch Readiness
 - [x] TPM launch readiness report (2026-07-07, 🟢 Go — launch-readiness.md; merge-now recommendation)
-- [ ] User final sign-off ← **the only remaining gate**
+- [x] User final sign-off (2026-07-07 — "signed off — merge and start the checklist"; merge-to-main approved)
 - [x] Engineer Lead confirmation (2026-07-07 — suite 945 green at HEAD; launch steps 2/4/5/6/8 executable on user's go)
 - [x] PM confirmation (via ACCEPT WITH CONDITIONS; conditions carried into launch checklist)
 
@@ -96,6 +96,7 @@
 | D-18 | Pre-scrape freshness gating accepted; log-line audit sufficient (design Q3) | 2026-07-07 | User |
 | D-19 | Tavily accepted as optional job_agent dependency for date backfill (design Q5) | 2026-07-07 | User |
 | D-20 | Tech design approved | 2026-07-07 | User |
+| D-21 | Final launch sign-off; merge to main approved; checklist execution started | 2026-07-07 | User |
 
 ## Blockers
 
