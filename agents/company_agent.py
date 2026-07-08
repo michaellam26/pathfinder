@@ -247,6 +247,13 @@ TAVILY_QUERIES = [
         "Castelion Epirus Vannevar Palantir careers technical program manager "
         "El Segundo Costa Mesa Washington state Texas"
     ),
+    # ── Launch tune (G1 yield): list-style variants for the thin verticals ────
+    "list of robotics startups 2026 well funded series B C hiring California Texas Washington",
+    "list of fintech startups 2026 series B C payments infrastructure hiring San Francisco Seattle",
+    "new space companies startups list 2026 funded satellites launch hiring California Washington Texas",
+    "defense tech startup list 2026 funded autonomous systems hiring careers",
+    "AI startups list 2026 series A B C enterprise infrastructure hiring careers San Francisco Seattle Austin",
+    "mid size technology companies 2026 hiring technical program managers cloud platform Seattle Bay Area Texas",
 ]
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
@@ -670,7 +677,9 @@ def discover_ai_companies(tavily_key: str, existing_names: set,
     # Step 1: Batch Tavily search for company discovery
     for q in TAVILY_QUERIES:
         try:
-            r = client.search(query=q, search_depth="advanced", max_results=10)
+            # Launch tune (G1 yield): 20 results/query — static queries exhaust
+            # fast against a large known-list; wider fetch feeds dedup better.
+            r = client.search(query=q, search_depth="advanced", max_results=20)
             for item in r.get("results", []):
                 u = item.get("url", "")
                 if u not in seen_urls:
@@ -688,7 +697,7 @@ def discover_ai_companies(tavily_key: str, existing_names: set,
     logging.info(f"Tavily: {len(results)} deduplicated results collected.")
 
     # Step 2: Gemini extracts company info only — no URL generation
-    existing_list = sorted(existing_names)[:150]
+    existing_list = sorted(existing_names)[:450]  # launch tune: cover the full known universe
     logging.info("Feeding context to Gemini for company extraction (no URL generation)...")
     _bucket_guidance = {
         "AI-native": (
