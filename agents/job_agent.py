@@ -778,7 +778,9 @@ def _fetch_workday_jobs(career_url: str) -> list:
     # PRJ-004 REQ-004-13: paginate instead of the old hardcoded limit:20 —
     # no artificial cap on scraped job count. The page-count guard is a
     # runaway/corruption backstop (5,000 postings), not a result cap.
-    _PAGE_SIZE, _MAX_PAGES = 50, 100
+    # BUG-64 (found at G6a live check): Workday CXS rejects limit>20 with
+    # HTTP 400 — 20 is the API's hard page-size cap, so we paginate at 20.
+    _PAGE_SIZE, _MAX_PAGES = 20, 250
     results, offset = [], 0
     for page in range(_MAX_PAGES):
         payload = {"limit": _PAGE_SIZE, "offset": offset,

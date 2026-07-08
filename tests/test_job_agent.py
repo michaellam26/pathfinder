@@ -2166,16 +2166,21 @@ class TestWorkdayPagination(unittest.TestCase):
 
     def test_paginates_across_pages(self):
         from agents.job_agent import _fetch_workday_jobs
-        # 3 pages: 50 + 50 + 20 = 120 postings — far beyond the old cap of 20.
-        pages = [self._page(50, 0, total=120), self._page(50, 50, total=120),
-                 self._page(20, 100, total=120)]
+        # BUG-64: Workday CXS hard-caps limit at 20 (>20 → HTTP 400, verified
+        # live against NVIDIA at the G6a gate) — pagination must use 20/page.
+        # 3 pages: 20 + 20 + 15 = 55 postings — beyond the old single-page cap.
+        pages = [self._page(20, 0, total=55), self._page(20, 20, total=55),
+                 self._page(15, 40, total=55)]
         with patch("agents.job_agent._http_request_with_retry", side_effect=pages) as mock_http:
             results = _fetch_workday_jobs("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite")
-        self.assertEqual(len(results), 120)
+        self.assertEqual(len(results), 55)
         self.assertEqual(mock_http.call_count, 3)
-        # offsets advance by page size
+        # offsets advance by page size; limit never exceeds the API's cap of 20
         offsets = [c.kwargs["json"]["offset"] for c in mock_http.call_args_list]
-        self.assertEqual(offsets, [0, 50, 100])
+        self.assertEqual(offsets, [0, 20, 40])
+        for call in mock_http.call_args_list:
+            self.assertLessEqual(call.kwargs["json"]["limit"], 20,
+                                 "BUG-64: Workday rejects limit>20 with HTTP 400")
         self.assertGreater(len(results), 20, "G6a: must exceed the old 20-job cap")
 
     def test_short_page_terminates(self):
@@ -2198,9 +2203,9 @@ class TestWorkdayPagination(unittest.TestCase):
     def test_http_failure_returns_partial(self):
         from agents.job_agent import _fetch_workday_jobs
         with patch("agents.job_agent._http_request_with_retry",
-                   side_effect=[self._page(50, 0), None]):
+                   side_effect=[self._page(20, 0), None]):
             results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
-        self.assertEqual(len(results), 50)
+        self.assertEqual(len(results), 20)
 
 
 class TestParseWorkdayPostedOn(unittest.TestCase):
