@@ -23,8 +23,8 @@ All code is complete and merge-ready. T1–T15 landed across 9 feature commits p
 | 4 | **Discovery top-up** | **Engineer Lead** | 🟡 **10-run window closed 2026-07-08 at 347/500** — 100% valid Track values (hard req PASS); AI-native 116/120 and Mid-large 119/120 just under band; verticals 42–68% of band. **Measurement is quota-truncated, not converged**: runs 9–10 hit Tavily's plan usage limit while yield was still alive (+16 on run 8; mid-run yield tune: 20 results/query, 6 vertical query variants, full-universe exclusion list). Disposition decided at the step-7 gate: resume top-up after Tavily quota reset vs. accept named per-bucket exceptions (D-16 fail-handling) with daily runs topping up organically. |
 | 5 | **Live G6a NVIDIA verification** — HARD GATE | **Engineer Lead** runs; **User** reviews | ✅ **PASSED 2026-07-07** — 40 postings returned live (>20), 40/40 with parsed posted_date. Found+fixed BUG-64 en route (Workday caps page size at 20; the 50/page request 400'd). |
 | 6 | **Uncapped trial run + RunSummary cost readout** | **Engineer Lead** | ✅ **Done 2026-07-08** — full pipeline over 347 companies: 122 qualified JDs (all 5 tracks), 60 gate-rejected, 116 coarse + 93 fine-scored, 93 tailored+3-dim rescored, zero structural errors. Consumption: ~813 Gemini calls ≈ 2.1M in / 0.3M out tokens (≈$0.3–1 at flash-lite-class pricing); 160 Firecrawl calls; Tavily exhausted its plan limit during the DISCOVERY phase (not the pipeline). Steady-state daily runs are incremental (fresh-JD skip + hash cache) — a fraction of the cold-start trial. |
-| 7 | **Cost go/no-go** — HARD GATE (REQ-004-26 second gate) | **User** | User reviews the trial-run cost readout and **explicitly approves** the projected daily cost before any automation is enabled. |
-| 8 | **Enable launchd daily schedule** | **Engineer Lead** | Only after step 7 approval. Marker-file failure surfacing (T13) deploys with it. |
+| 7 | **Cost go/no-go** — HARD GATE (REQ-004-26 second gate) | **User** | ✅ **GO 2026-07-08** (D-22). G1 disposition: option (a) — named per-bucket exceptions accepted (D-23); daily runs top up organically as Tavily quota allows. |
+| 8 | **Enable launchd daily schedule** | **Engineer Lead** | ✅ **Done 2026-07-08** — com.pathfinder.daily installed to ~/Library/LaunchAgents and loaded; fires 04:00 daily; LAST_RUN_FAILED/LAST_RUN_OK markers active. |
 | 9 | **Post-launch early audits** | **User** (Engineer Lead pulls samples) | Within the first few daily cycles: **G3** YoE spot-check (20+ JDs), **G5** work-auth audit (space/defense), **R-10** geo dropped-row spot-check, **R-02** domain-boundary spot-check, **D-07** space early-company rule review. Findings feed prompt tuning, not a launch block. |
 
 ---
@@ -72,7 +72,7 @@ Nice-to-have (non-blocking): close BUG-63 before the step-6 trial run.
 ---
 
 ## Sign-off Status
-- [ ] User (Business Owner) — final launch decision
+- [x] User (Business Owner) — final launch decision (2026-07-07 checklist sign-off; 2026-07-08 cost GO, D-22)
 - [x] Engineer Lead — confirmation (2026-07-07: code state as reported; suite 945 green at HEAD; checklist steps 2/4/5/6/8 are mine to execute on the user's go)
 - [x] PM Agent — confirmation (via phase4-pm-acceptance.md, ACCEPT WITH CONDITIONS — conditions == checklist items)
 - [x] TPM Agent — this report

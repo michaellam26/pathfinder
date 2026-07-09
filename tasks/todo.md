@@ -27,9 +27,10 @@
 - [ ] T16 Google Careers adapter (P2 stretch — deliberately deferred post-launch per design)
 
 ### Rollout (T17 — Phase 5 launch checklist; see docs/sdlc/PRJ-004-multi-track-expansion/launch-readiness.md §2)
-- [ ] User: prune Company_List → run `--migrate-tracks` → user spot-check
-- [ ] User: wipe JD_Tracker (schema guard verifies)
-- [ ] Discovery top-up runs → uncapped trial run → cost confirmation (REQ-004-26 gate 2) → enable daily schedule
+- [x] User pruned; migrate-tracks 201/201, 0 UNMIGRATED, spot-check accepted
+- [x] JD_Tracker was already wiped; schema upgraded cleanly
+- [x] 10 discovery runs (347/500, Tavily quota-truncated; G1 option (a) accepted) → trial run clean (122 JDs, 93 tailored, ~$0.3-1 Gemini) → user GO 2026-07-08 → launchd daily 04:00 LIVE
+- [ ] Step-9 early audits (first few daily cycles): G3 YoE 20+ spot-check, G5 work-auth sample, R-10 geo drops, R-02 domain boundaries, D-07 space-rule review; watch Tavily quota reset
 
 **Working rules**: full suite after each task, never left red; tests in tests/; bugs found en route go to BUGS.md.
 

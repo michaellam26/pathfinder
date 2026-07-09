@@ -1,7 +1,7 @@
 # PRJ-004: Multi-Track Expansion
 
-**Phase**: Phase 5 — Launch Readiness
-**Status**: 🟢 Signed off — launch checklist in progress (merged to main)
+**Phase**: Complete — Launched
+**Status**: ✅ Launched 2026-07-08 (daily schedule live; step-9 early audits pending as post-launch follow-ups)
 **Priority**: P1
 **Created**: 2026-07-07
 **Last Updated**: 2026-07-07
@@ -97,6 +97,8 @@
 | D-19 | Tavily accepted as optional job_agent dependency for date backfill (design Q5) | 2026-07-07 | User |
 | D-20 | Tech design approved | 2026-07-07 | User |
 | D-21 | Final launch sign-off; merge to main approved; checklist execution started | 2026-07-07 | User |
+| D-22 | Trial-run cost readout approved (GO) — daily automation enabled (REQ-004-26 gate 2 closed) | 2026-07-08 | User |
+| D-23 | G1 option (a): named per-bucket exceptions at quota-truncated convergence (347/500, all buckets below band, 100% valid values); daily discovery tops up organically | 2026-07-08 | User |
 
 ## Blockers
 
