@@ -1,5 +1,107 @@
 # CHANGELOG
 
+## 2026-07-10
+
+### Company agent: discover-to-500 loop, blank-Track enrichment, Track sort
+
+One company_agent run now tries to fill the whole 500-company universe, and
+every enrichable gap in Company_List self-heals. Plan:
+`.claude/plans/tingly-riding-meerkat.md`.
+
+**Features**:
+- **Discovery loop (`run_discovery_loop`)**: replaces the single
+  50-company batch — discovery repeats in `BATCH_SIZE=50` batches until all
+  track buckets hit quota (`MAX_TOTAL=500`), a batch yields nothing new
+  (Tavily quota exhausted / query-pool convergence — retried next run), or
+  the 10-iteration runaway cap fires. Exclusion list re-read every iteration;
+  run summary accumulates attempted/succeeded/failed and notes the stop
+  reason.
+- **Blank-Track enrichment (`run_enrich_missing_tracks`)**: blank/N-A `Track`
+  cells (typical of manual name-only inserts) are classified every run via
+  the batched Gemini classifier shared with `--migrate-tracks`
+  (`_classify_tracks_batch`). Unconfident rows stay blank for retry; custom
+  values (incl. `UNMIGRATED — manual review`) are never touched; defense
+  legacy primes deterministically forced to Mid-large Tech. With the existing
+  Career-URL backfill (Phase 1.5) and Business Focus re-enrich (BUG-69), a
+  manual row with just a name now fully self-heals: URL → focus → track.
+- **Company_List sorted by Track (`sort_company_list_by_track`)**: final
+  step of every run — canonical `TRACK_ORDER` (now in `shared/config.py`,
+  shared source of truth), name-alphabetical within a track, unknown/custom
+  tracks sink to the bottom. Count-preserving in-place rewrite (the
+  `sort_jd_tracker_by_tier` pattern); all 9 columns travel with their row.
+
+**Notes**:
+- The 2026-07-09 "attempted 50 / succeeded 0" run was Tavily plan-limit
+  exhaustion, not a code defect — discovery stops cleanly on quota and
+  resumes next run once the Tavily quota resets.
+
+### Tavily key pool (BUG-70)
+
+- **`shared/tavily_pool.py`** (new, mirror of the BUG-68 Firecrawl pool):
+  `TAVILY_API_KEY` + optional `TAVILY_API_KEY_2`, rotation on quota errors —
+  now **including Tavily's real plan-limit text "exceeds your plan's set
+  usage limit"**, which contains none of 402/429/quota and therefore evaded
+  every existing quota-abort check on the 2026-07-09 run. Once ALL keys are
+  exhausted: one loud console warning, then instant `TavilyQuotaExhausted`
+  whose message contains "429"+"quota" so all existing call-site checks
+  recognize it unchanged (search has no free fallback — callers abort via
+  exception, unlike Firecrawl's None-return).
+- Wired everywhere a `TavilyClient` was built: company_agent `main()` builds
+  ONE pool and threads it through discovery loop → Phase 1.5 → focus
+  re-enrich (exhaustion state carries across steps); job_agent posting-date
+  backfill client replaced. The pool is duck-type compatible (`.search`), so
+  downstream signatures are unchanged.
+
+**Tests**: +13 loop/enrich/sort (above) +14 tavily_pool (rotation incl.
+real usage-limit text, one-warning exhaustion, call-site-check-compatible
+message, non-quota re-raise, caching, env pickup).
+
+## 2026-07-09
+
+### Excel-review follow-up batch (BUG-62, BUG-65~69 + Google adapter T16)
+
+Post-launch fixes from the user's manual review of the dashboard. Plan:
+`.claude/plans/lovely-tinkering-bumblebee.md`; details in BUGS.md.
+
+**Features**:
+- **User triage tabs (BUG-65)**: `JD_ToApply` and `Skipped JD` tabs are now
+  first-class — URLs the user moves there are permanently excluded from
+  re-scraping/re-insertion (`get_triaged_jd_urls` + exclusion in
+  `process_company` and the retry phase). Tabs auto-created on new/migrated
+  workbooks; existing user rows never touched. Do not rename the tabs.
+- **Google Careers discovery adapter (T16 / REQ-004-18, was deferred)**:
+  `_fetch_google_jobs` paginates the server-rendered careers search page
+  (`AF_initDataCallback` payload) — titles, locations, posted dates AND
+  prefetched JD text with zero Firecrawl/browser calls. Documented deviation:
+  design.md's `careers.google.com/api/v3/search/` endpoint is dead (404).
+  Live check 2026-07-09: 291 postings → 106 TPM candidates.
+- **Firecrawl key pool (BUG-68)**: new `shared/firecrawl_pool.py` —
+  `FIRECRAWL_API_KEY` + optional `FIRECRAWL_API_KEY_2`, rotation on
+  402/429, one loud console warning when all keys are exhausted, instant
+  fallback to free scrapers afterwards (no wasted retry delays).
+- **Business Focus self-heal (BUG-69)**: blank/N-A `Business Focus` cells are
+  re-enriched every company_agent run (Tavily context + one batched Gemini
+  call), mirroring the existing blank-Career-URL backfill.
+
+**Fixes**:
+- **Geo filter (BUG-66)**: extraction prompt now captures ALL locations
+  verbatim (was US-only, which blinded the gate); the write-time gate block
+  is factored into `_gate_and_finalize` and runs on EVERY path — custom
+  scrapers (Microsoft/Tesla/Google/Workday/prefetched) and the incomplete-row
+  retry included. **User-visible tightening**: retry/custom paths now also
+  drop non-WA/CA/TX US rows per REQ-004-12. Dead `_is_us*`/pycountry code
+  removed (`classify_region` is the live filter; pycountry no longer used).
+- **Posted dates (BUG-67)**: shared JSON-LD parser now reads `datePosted`;
+  date chain = ATS list-meta → scrape-time JSON-LD → one plain-GET JSON-LD →
+  Tavily backfill → keep+flag. `retry_one` no longer wipes existing Posted
+  Dates (the Zebra/Workday blank-date cause). Workday "Just Posted" parsed.
+- **BUG-62**: empty-company extractions now write a sheet-visible
+  JSON-ERROR audit row instead of silently retrying forever.
+
+**Tests**: 945 → 995+ (new: firecrawl_pool suite, triage exclusion, geo-gate
+matrix, JSON-LD parser, date fallback chain, Google adapter fixtures,
+Business Focus re-enrich; removed: dead `_is_us*` tests).
+
 ## 2026-07-07
 
 ### PRJ-004: Multi-Track Expansion (breaking schema change)

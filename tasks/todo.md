@@ -1,5 +1,28 @@
 # Task Tracker
 
+## Completed (2026-07-10): Company agent — discover-to-500 loop + self-heal + Track sort
+
+**Plan**: `.claude/plans/tingly-riding-meerkat.md` | **Trigger**: 2026-07-09 run attempted 50 / succeeded 0
+**Root cause of 0 successes**: Tavily plan-limit exhaustion (not code) — watch quota reset (already on the step-9 audit list).
+
+- [x] `shared/config.py` — `TRACK_ORDER` canonical 6-bucket order (shared source of truth)
+- [x] `run_discovery_loop` — batches of 50 until 500 quota / zero-yield batch / 10-iteration cap; exclusion list re-read per iteration; stop reason in run summary (REQ-145)
+- [x] `run_enrich_missing_tracks` — blank/N-A Track filled via `_classify_tracks_batch` (factored out of `migrate_tracks`); unconfident stays blank for retry; custom values untouched; primes forced Mid-large Tech (REQ-146)
+- [x] `sort_company_list_by_track` — canonical order, name secondary, unknowns sink last; count-preserving in-place rewrite; final main() step (REQ-147)
+- [x] main() order locked by test: discovery → phase 1.5 → focus re-enrich → track enrich → sort
+- [x] Tests +13 (loop stop matrix, track-enrich matrix, sort integrity); full suite 1003 passed / 1 skipped
+- [x] Real-data check: sorted a copy of the live dashboard — 355 rows grouped correctly, 2 blank-track rows sink last, idempotent
+- [x] Docs: CHANGELOG, REQUIREMENTS (§9.9 REQ-145–147, v2.4), ARCHITECTURE §3.1
+
+### Follow-up same day: Tavily key pool (BUG-70)
+- [x] `shared/tavily_pool.py` — mirror of Firecrawl pool; rotates on 402/429/quota/**usage-limit** ("exceeds your plan's set usage limit" — the real Tavily error text that evaded all BUG-44 abort checks on 2026-07-09); exhaustion → one warning + `TavilyQuotaExhausted` (message contains "429"+"quota" so call sites work unchanged)
+- [x] Wired: company_agent main() builds ONE pool threaded through discovery → phase 1.5 → focus re-enrich (shared exhaustion state); job_agent backfill client; `TAVILY_API_KEY_2` added to `.env`
+- [x] Tests: tests/test_tavily_pool.py (14) + discover_ai_companies tests now pass client directly (signature: key → client-like)
+- [x] Docs: BUGS.md BUG-70, CLAUDE.md env keys + structure, CHANGELOG, REQUIREMENTS REQ-148/v2.4, ARCHITECTURE §5
+- [x] Live smoke: key #1 raised the real "exceeds your plan's set usage limit" text → pool rotated → search succeeded on key #2 (1 result). Rotation + usage-limit detection confirmed live.
+
+---
+
 ## Active (2026-07-07): PRJ-004 Multi-Track Expansion — Phase 3 Implementation
 
 **Source of truth**: `docs/sdlc/PRJ-004-multi-track-expansion/design.md` §6 (T1–T17)
@@ -24,7 +47,7 @@
 - [x] T13 launchd failure surfacing (2577913)
 - [x] T14 Amazon.jobs adapter + prefetch routing (suite 930)
 - [x] T15 Tesla regression verification (registry + schema tests)
-- [ ] T16 Google Careers adapter (P2 stretch — deliberately deferred post-launch per design)
+- [x] T16 Google Careers adapter (done 2026-07-09; design deviation — v3 API dead, uses server-rendered AF_initDataCallback payload; live check: 291 postings → 106 TPM candidates)
 
 ### Rollout (T17 — Phase 5 launch checklist; see docs/sdlc/PRJ-004-multi-track-expansion/launch-readiness.md §2)
 - [x] User pruned; migrate-tracks 201/201, 0 UNMIGRATED, spot-check accepted

@@ -31,7 +31,7 @@ from google.genai import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.excel_store import (
     EXCEL_PATH, PROJECT_ROOT, get_or_create_excel, get_company_rows,
-    get_jd_url_meta, batch_update_jd_timestamps,
+    get_jd_url_meta, get_triaged_jd_urls, batch_update_jd_timestamps,
     get_jd_urls, upsert_jd_record, batch_upsert_jd_records,
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
     get_archived_companies, get_company_archive_info, update_archive_status,
@@ -40,6 +40,7 @@ from shared.excel_store import (
 )
 
 from shared.gemini_pool import _GeminiKeyPoolBase
+from shared.firecrawl_pool import build_pool_from_env
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL, AUTO_ARCHIVE_THRESHOLD, JD_CACHE_DIR
 from shared.prompts import SECURITY_CLAUSE
@@ -125,6 +126,7 @@ def _save_structured_jd_md(url: str, jd_dict: dict) -> None:
 _GEMINI_LIMITER = _RateLimiter(rpm=10)  # conservative: 15 RPM hard limit
 
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
+_FC_POOL = None  # BUG-68: FirecrawlKeyPool, initialised in main()
 _FC_MAP_LIMITER  = _RateLimiter(rpm=1)  # hard limit: 1 crawl/min (Firecrawl map)
 
 # ── HTTP retry helper (audit P1: ATS API silent failures) ─────────────────────
@@ -280,12 +282,15 @@ ATS_PLATFORMS = {
         "jd_fn":              None,
     },
     "google": {
-        "domains":            [],  # Google has no ATS board URLs for discovery
+        # T16 / REQ-004-18: discovery via the server-rendered careers search
+        # page (AF_initDataCallback payload) — see _fetch_google_jobs for the
+        # documented deviation from design.md's dead v3 API endpoint.
+        "domains":            ["google.com/about/careers", "careers.google.com"],
         "jd_domains":         ["careers.google.com", "google.com/about/careers"],
         "board_url_template": None,
         "slug_pattern":       None,
-        "strategy":           "custom",
-        "list_fn":            None,
+        "strategy":           "json_api",
+        "list_fn":            "_fetch_google_jobs",
         "jd_fn":              "_scrape_google_jd",
     },
     "microsoft": {
@@ -387,102 +392,6 @@ def _vertical_domain(track: str) -> str | None:
                         "treating as Mid-large Tech (strict per-JD classification). "
                         "Run `python agents/company_agent.py --migrate-tracks`.")
     return None
-
-# ── US location detection via pycountry (no hardcoded non-US lists) ───────────
-def _build_us_index() -> tuple:
-    """Build sets of US state names and 2-letter codes from pycountry."""
-    import pycountry
-    names, codes = set(), set()
-    for sub in pycountry.subdivisions.get(country_code='US'):
-        names.add(sub.name.lower())
-        codes.add(sub.code.split('-')[1].lower())  # e.g. "US-CA" → "ca"
-    return names, codes
-
-# Hardcoded fallback used when pycountry is not installed.
-_US_STATES_FALLBACK = [
-    ("alabama", "al"), ("alaska", "ak"), ("arizona", "az"), ("arkansas", "ar"),
-    ("california", "ca"), ("colorado", "co"), ("connecticut", "ct"),
-    ("delaware", "de"), ("florida", "fl"), ("georgia", "ga"), ("hawaii", "hi"),
-    ("idaho", "id"), ("illinois", "il"), ("indiana", "in"), ("iowa", "ia"),
-    ("kansas", "ks"), ("kentucky", "ky"), ("louisiana", "la"), ("maine", "me"),
-    ("maryland", "md"), ("massachusetts", "ma"), ("michigan", "mi"),
-    ("minnesota", "mn"), ("mississippi", "ms"), ("missouri", "mo"),
-    ("montana", "mt"), ("nebraska", "ne"), ("nevada", "nv"),
-    ("new hampshire", "nh"), ("new jersey", "nj"), ("new mexico", "nm"),
-    ("new york", "ny"), ("north carolina", "nc"), ("north dakota", "nd"),
-    ("ohio", "oh"), ("oklahoma", "ok"), ("oregon", "or"),
-    ("pennsylvania", "pa"), ("rhode island", "ri"), ("south carolina", "sc"),
-    ("south dakota", "sd"), ("tennessee", "tn"), ("texas", "tx"),
-    ("utah", "ut"), ("vermont", "vt"), ("virginia", "va"),
-    ("washington", "wa"), ("west virginia", "wv"), ("wisconsin", "wi"),
-    ("wyoming", "wy"), ("district of columbia", "dc"),
-]
-
-try:
-    _US_STATE_NAMES, _US_STATE_CODES = _build_us_index()
-except ImportError:
-    _US_STATE_NAMES = {name for name, _ in _US_STATES_FALLBACK}
-    _US_STATE_CODES = {code for _, code in _US_STATES_FALLBACK}
-# A few well-known US metro areas not captured by state names alone
-_US_METRO = {
-    "bay area", "silicon valley", "nyc", "sf", "d.c.", "greater seattle",
-    # Common US cities that don't match state names/codes alone
-    "san francisco", "new york", "new york city", "los angeles", "seattle",
-    "chicago", "boston", "austin", "denver", "atlanta", "dallas", "houston",
-    "portland", "miami", "san jose", "palo alto", "menlo park",
-    "mountain view", "sunnyvale", "redwood city", "bellevue", "brooklyn",
-    "manhattan", "san diego", "phoenix", "las vegas", "detroit",
-    "minneapolis", "st. louis", "pittsburgh", "philadelphia",
-}
-
-
-def _is_us_segment(seg: str) -> bool:
-    """Return True if a single location segment is a US location."""
-    s = seg.lower().strip()
-    if not s:
-        return False
-    if "remote" in s:
-        return True
-    if re.search(r'\bus\b|\busa\b|\bu\.s\.a?\b|united states', s):
-        return True
-    # Full state name (word-boundary)
-    for name in _US_STATE_NAMES:
-        if re.search(r'\b' + re.escape(name) + r'\b', s):
-            return True
-    # 2-letter state code: require "City, ST" pattern or standalone segment.
-    # Simple \b matching causes false positives for common words like "in"
-    # (Indiana), "or" (Oregon), "de" (Delaware), "me" (Maine), "ok" (Oklahoma).
-    for code in _US_STATE_CODES:
-        if s == code or re.search(r',\s*' + re.escape(code) + r'\b', s):
-            return True
-    # Metro aliases
-    if any(m in s for m in _US_METRO):
-        return True
-    return False
-
-
-def _is_us(location: str) -> bool:
-    """
-    Return True if the location string should be kept (US or unknown).
-    - Empty / None  → keep (unknown)
-    - "N Locations" → keep (resolved earlier via URL path)
-    - Single location → keep only if confirmed US
-    - Multiple locations (semicolon/pipe separated) → keep if any segment is US
-    """
-    if not location:
-        return True
-    loc = location.strip()
-    _UNKNOWN_PLACEHOLDERS = frozenset([
-        "not specified", "n/a", "unknown", "not available",
-        "not listed", "unspecified", "tbd", "tba",
-    ])
-    if loc.lower() in _UNKNOWN_PLACEHOLDERS:
-        return True
-    if re.match(r'^\d+\s+location', loc.lower()):
-        return True  # already resolved via URL path fallback
-    # Split on common multi-location separators
-    segments = re.split(r'[;|]', loc)
-    return any(_is_us_segment(seg) for seg in segments)
 
 TPM_KW = ["technical program manager", "tpm", "technical program mgr",
           "tech program manager"]
@@ -623,7 +532,8 @@ def _format_workable_location(job: dict) -> str:
 
     Workable returns city / state / country plus an optional locations[] array
     for multi-location postings, and a `telecommuting` bool for remote roles.
-    Multiple segments are joined with "; " so _is_us multi-location parsing works.
+    Multiple segments are joined with "; " so classify_region's multi-segment
+    parsing works.
     """
     parts: list[str] = []
     if job.get("telecommuting"):
@@ -740,7 +650,7 @@ def _parse_workday_posted_on(text: str, today=None) -> str:
         return ""
     t = str(text).strip().lower()
     today = today or datetime.now().date()
-    if "today" in t:
+    if "today" in t or "just posted" in t or "just now" in t:
         days = 0
     elif "yesterday" in t:
         days = 1
@@ -883,14 +793,19 @@ async def _crawl_ats_board(board_url: str, platform: str, crawler) -> list:
     url   = f"{board_url}?{param}" if param else board_url
     return await _crawl_page(url, crawler)
 
-def _firecrawl_map(career_url: str, fc_key: str) -> list:
-    from firecrawl import FirecrawlApp
-    app = FirecrawlApp(api_key=fc_key)
+def _firecrawl_map(career_url: str) -> list:
+    # BUG-68: quota/credit errors (402/429) are handled inside the key pool —
+    # rotation first, then a run-wide skip with one visible warning. Only
+    # non-quota transients (network blips, timeouts) reach the retry loop.
+    if _FC_POOL is None or _FC_POOL.exhausted:
+        return []
     for attempt in range(3):
         try:
             logging.info(f"[Firecrawl] map attempt {attempt + 1}/3: {career_url}")
             # PRJ-004 REQ-004-13: no artificial cap on mapped URLs.
-            res = app.map(url=career_url, search="Technical Program Manager")
+            res = _FC_POOL.map(url=career_url, search="Technical Program Manager")
+            if res is None:  # pool exhausted mid-call
+                return []
             urls = getattr(res, "links", None) or (res.get("links",[]) if isinstance(res,dict) else res if isinstance(res,list) else [])
             out  = []
             for u in urls:
@@ -902,12 +817,9 @@ def _firecrawl_map(career_url: str, fc_key: str) -> list:
                     out.append({"url": u, "title": ""})
             return out
         except Exception as e:
-            err = str(e)
-            logging.error(f"[Firecrawl] attempt {attempt + 1}/3 failed: {err}")
-            # Rate-limit errors need a long back-off; other transient errors
-            # (network blip, timeout) deserve a short retry rather than giving up.
+            logging.error(f"[Firecrawl] attempt {attempt + 1}/3 failed: {e}")
             if attempt < 2:
-                sleep_s = 30 * (attempt + 1) if ("Rate limit" in err or "429" in err) else 5 * (attempt + 1)
+                sleep_s = 5 * (attempt + 1)
                 logging.info(f"[Firecrawl] retrying in {sleep_s}s...")
                 time.sleep(sleep_s)
     return []
@@ -984,6 +896,118 @@ def _fetch_amazon_jobs(career_url: str) -> list:
     return results
 
 
+def _fetch_google_jobs(career_url: str) -> list:
+    """T16 / REQ-004-18: fetch TPM jobs from Google Careers.
+
+    Design deviation from design.md §T16: the documented
+    careers.google.com/api/v3/search/ endpoint is dead (404, verified
+    2026-07-09). Instead, the search results page at
+    google.com/about/careers/applications/jobs/results is SERVER-RENDERED —
+    plain requests, no JS — and embeds an AF_initDataCallback JSON payload
+    with, per job: id[0], title[1], responsibilities-HTML[3], min-quals[4],
+    preferred-quals[19], location list[9] (display strings with state +
+    country), and publish epoch-seconds [12][0]. 20 jobs/page via page=N.
+
+    Like Amazon (REQ-004-17), each candidate carries `_prefetched_md` +
+    `posted_date` — zero browser/Firecrawl calls for Google JDs. The payload
+    is undocumented and index-based, so every job is parsed defensively; a
+    total parse failure falls back to href-regex URL harvesting, and an HTTP
+    failure returns [] (existing crawler fallback takes over).
+
+    Note: Google clamps page=N to the last page (repeats its results), so
+    pagination stops when a page yields no NEW job ids, not on an empty page.
+    """
+    _BASE = ("https://www.google.com/about/careers/applications/jobs/results"
+             "?q=%22technical+program+manager%22&location=United+States")
+    _HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36"}
+    _MAX_PAGES = 25  # runaway guard: 500 postings
+    results, seen_ids = [], set()
+    html_pages = []
+
+    def _strip_html(fragment) -> str:
+        # payload HTML fields are [None, "<html>"] pairs
+        if isinstance(fragment, list):
+            fragment = next((x for x in fragment if isinstance(x, str)), "")
+        text = re.sub(r"<[^>]+>", " ", fragment or "")
+        text = re.sub(r"&[a-z]+;|&#\d+;", " ", text)
+        return re.sub(r"[ \t]+", " ", text).strip()
+
+    for page in range(1, _MAX_PAGES + 1):
+        logging.info(f"[Google Careers] GET page={page}")
+        r = _http_request_with_retry("GET", f"{_BASE}&page={page}",
+                                     timeout=15, headers=_HEADERS)
+        if r is None or r.status_code != 200:
+            if r is not None:
+                logging.warning(f"[Google Careers] HTTP {r.status_code} on page {page}")
+            break
+        html_pages.append(r.text)
+        try:
+            blocks = re.findall(r"AF_initDataCallback\((\{.*?\})\);",
+                                r.text, re.DOTALL)
+            if not blocks:
+                break
+            payload_src = max(blocks, key=len)
+            m = re.search(r"data:\s*", payload_src)
+            payload, _ = json.JSONDecoder().raw_decode(payload_src[m.end():])
+            jobs = payload[0] or []
+        except Exception as e:
+            logging.error(f"[Google Careers] payload parse failed on page {page}: "
+                          f"{type(e).__name__}: {e}")
+            break
+        new_this_page = 0
+        for job in jobs:
+            try:
+                job_id = str(job[0] or "").strip()
+                title  = str(job[1] or "").strip()
+                if not job_id or not title or job_id in seen_ids:
+                    continue
+                seen_ids.add(job_id)
+                new_this_page += 1
+                slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+                url  = (f"https://www.google.com/about/careers/applications/"
+                        f"jobs/results/{job_id}-{slug}")
+                loc_entries = job[9] or []
+                location = "; ".join(str(l[0]) for l in loc_entries
+                                     if isinstance(l, list) and l and l[0])
+                posted = ""
+                ts = job[12]
+                if isinstance(ts, list) and ts and isinstance(ts[0], (int, float)):
+                    posted = datetime.fromtimestamp(ts[0]).strftime("%Y-%m-%d")
+                md_parts = [f"# {title}", "**Company:** Google",
+                            f"**Location:** {location}"]
+                for label, idx in (("Minimum Qualifications", 4),
+                                   ("Preferred Qualifications", 19),
+                                   ("Responsibilities", 3)):
+                    v = _strip_html(job[idx]) if len(job) > idx else ""
+                    if v:
+                        md_parts.append(f"## {label}\n{v}")
+                results.append({"url": url, "title": title,
+                                "location": location, "posted_date": posted,
+                                "_prefetched_md": "\n\n".join(md_parts),
+                                "_platform": "Google"})
+            except Exception as e:
+                logging.warning(f"[Google Careers] skipped one malformed job on "
+                                f"page {page}: {type(e).__name__}: {e}")
+        if new_this_page == 0:
+            break  # page=N clamps to the last page — no new ids means done
+    if not results and html_pages:
+        # Secondary fallback: harvest job URLs from hrefs so discovery still
+        # yields candidates even if the payload layout shifts.
+        hrefs = set()
+        for html in html_pages:
+            hrefs.update(re.findall(r"jobs/results/(\d+[a-z0-9-]*)", html))
+        results = [{"url": f"https://www.google.com/about/careers/applications/jobs/results/{h}",
+                    "title": h.split("-", 1)[1].replace("-", " ") if "-" in h else "",
+                    "location": "", "posted_date": ""}
+                   for h in sorted(hrefs)]
+        logging.warning(f"[Google Careers] payload unusable — href fallback "
+                        f"yielded {len(results)} candidates")
+    logging.info(f"[Google Careers] {len(results)} postings total")
+    return results
+
+
 # ── Job discovery helpers (routing table lookup) ─────────────────────────────
 def _resolve_list_fn(fn_name: str):
     """Resolve a list_fn name string to the actual callable."""
@@ -993,6 +1017,7 @@ def _resolve_list_fn(fn_name: str):
         "_fetch_workable_jobs": _fetch_workable_jobs,
         "_fetch_workday_jobs":  _fetch_workday_jobs,
         "_fetch_amazon_jobs":   _fetch_amazon_jobs,
+        "_fetch_google_jobs":   _fetch_google_jobs,
     }[fn_name]
 
 
@@ -1039,7 +1064,7 @@ async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler) 
 
 
 # ── Job discovery router ──────────────────────────────────────────────────────
-async def discover_jobs(career_url: str, fc_key: str, crawler) -> list:
+async def discover_jobs(career_url: str, crawler) -> list:
     # 1. Direct URL match against routing table
     match = _match_ats(career_url)
     if match:
@@ -1054,7 +1079,7 @@ async def discover_jobs(career_url: str, fc_key: str, crawler) -> list:
     print("    ⏳ Waiting for Firecrawl rate limiter (1 RPM)...")
     await _FC_MAP_LIMITER.acquire()
     print(f"    🌐 Firecrawl map: {career_url}")
-    fc_links  = await asyncio.to_thread(_firecrawl_map, career_url, fc_key)
+    fc_links  = await asyncio.to_thread(_firecrawl_map, career_url)
     print(f"    🕷️ Crawl4AI: rendering page (timeout 60s)...")
     c4_links  = await _crawl_page(career_url, crawler)
     ats       = _detect_ats(fc_links + c4_links)
@@ -1138,7 +1163,124 @@ def llm_filter_jobs(company: str, links: list, track: str = "") -> list:
         return []
 
 # ── Google Careers JD scraper (Firecrawl only_main_content avoids sidebar) ─────
-def _scrape_google_jd(url: str, fc_key: str = "") -> str:
+# BUG-67: side-channel for posted dates found in scraped pages' JSON-LD.
+# Scrapers return plain markdown text, so a structured date discovered during
+# the scrape is stashed here and consumed by the date chain in
+# _gate_and_finalize. Keyed by JD URL; cleared at the start of each run.
+_JSONLD_DATE_BY_URL: dict = {}
+
+
+def _parse_jsonld_jobposting(html: str) -> dict:
+    """Parse the first JobPosting JSON-LD block found in `html`.
+
+    Returns {"title", "location", "salary", "description", "date_posted"}
+    (all "" when absent). Consolidates the near-identical blocks that lived
+    in the Workday / Google / Microsoft / Tesla scrapers, and — new for
+    BUG-67 — reads `datePosted`, which those blocks all ignored.
+    """
+    empty = {"title": "", "location": "", "salary": "",
+             "description": "", "date_posted": ""}
+    blocks = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html or "", re.DOTALL | re.IGNORECASE,
+    )
+
+    def _fmt_addr(addr: dict) -> str:
+        parts = [addr.get("addressLocality", ""),
+                 addr.get("addressRegion", ""),
+                 addr.get("addressCountry", "")]
+        return ", ".join(p for p in parts if p)
+
+    for block in blocks:
+        try:
+            d = json.loads(block)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        # Some Workday tenants omit @type; require a description instead,
+        # but reject blocks explicitly typed as something else.
+        if d.get("@type") not in (None, "JobPosting"):
+            continue
+        desc = d.get("description", "")
+        if not desc:
+            continue
+        # Fix common Mojibake (UTF-8 bytes stored as Latin-1 JSON escapes)
+        try:
+            desc = desc.encode("latin-1").decode("utf-8")
+        except Exception:
+            pass
+        desc = re.sub(r"<[^>]+>", " ", desc)
+        desc = re.sub(r"&[a-z]+;|&#\d+;", " ", desc)
+        desc = re.sub(r"\s+", " ", desc).strip()
+
+        job_loc = d.get("jobLocation", {})
+        if isinstance(job_loc, list):
+            loc_parts = []
+            for _loc in job_loc:
+                if isinstance(_loc, dict):
+                    s = _fmt_addr(_loc.get("address", {}))
+                    if s:
+                        loc_parts.append(s)
+            location = "; ".join(loc_parts)
+        elif isinstance(job_loc, dict):
+            location = _fmt_addr(job_loc.get("address", {}))
+        else:
+            location = ""
+
+        # Salary: prefer the structured baseSalary field, fall back to regex.
+        salary = ""
+        base_sal = d.get("baseSalary", {})
+        if isinstance(base_sal, dict):
+            val = base_sal.get("value", {})
+            if isinstance(val, dict):
+                min_v = val.get("minValue", "")
+                max_v = val.get("maxValue", "")
+                currency = base_sal.get("currency", "USD")
+                if min_v and max_v:
+                    try:
+                        salary = f"${int(float(min_v)):,} - ${int(float(max_v)):,} {currency}"
+                    except Exception:
+                        salary = f"{min_v} - {max_v} {currency}"
+        if not salary:
+            sal_m = re.search(
+                r'\$[\d,]+\s*(?:USD)?\s*(?:[-–]|to)\s*\$[\d,]+\s*(?:USD)?',
+                desc, re.IGNORECASE,
+            )
+            if sal_m:
+                salary = sal_m.group(0)
+
+        return {"title": d.get("title", ""), "location": location,
+                "salary": salary, "description": desc,
+                "date_posted": _parse_iso_date(d.get("datePosted", ""))}
+    return empty
+
+
+def _format_jd_text(parsed: dict, desc_limit: int) -> str:
+    """Assemble the Title/Location/Salary + description text that the
+    JSON-LD-based scrapers feed to extract_jd()."""
+    if not parsed.get("description"):
+        return ""
+    lines = []
+    if parsed.get("title"):
+        lines.append(f"Title: {parsed['title']}")
+    if parsed.get("location"):
+        lines.append(f"Location: {parsed['location']}")
+    if parsed.get("salary"):
+        lines.append(f"Salary: {parsed['salary']}")
+    lines.append("")
+    lines.append(parsed["description"][:desc_limit])
+    return "\n".join(lines)
+
+
+def _stash_jsonld_date(url: str, parsed: dict) -> None:
+    """BUG-67: remember the structured datePosted found while scraping `url`.
+    Records "" too — that marks the page's JSON-LD as already examined, so
+    the date chain won't fetch the same page a second time."""
+    _JSONLD_DATE_BY_URL[url] = parsed.get("date_posted", "")
+
+
+def _scrape_google_jd(url: str) -> str:
     """
     Google Careers pages are JS SPAs — server-rendered HTML contains no JSON-LD.
     Crawl4AI renders the full page including the sidebar job list, which causes
@@ -1149,11 +1291,9 @@ def _scrape_google_jd(url: str, fc_key: str = "") -> str:
     Falls back to plain requests + JSON-LD check (in case Google ever adds it).
     """
     # ── 1. Firecrawl with only_main_content (primary) ────────────────────────
-    if fc_key:
+    if _FC_POOL is not None and not _FC_POOL.exhausted:
         try:
-            from firecrawl import FirecrawlApp
-            app = FirecrawlApp(api_key=fc_key)
-            result = app.scrape(url, formats=["markdown"], only_main_content=True)
+            result = _FC_POOL.scrape(url, formats=["markdown"], only_main_content=True)
             md = getattr(result, "markdown", None) or (
                 result.get("markdown", "") if isinstance(result, dict) else "")
             if md and len(md) > 200:
@@ -1172,59 +1312,12 @@ def _scrape_google_jd(url: str, fc_key: str = "") -> str:
     try:
         r = requests.get(url, timeout=15, headers=_headers)
         if r.status_code == 200:
-            blocks = re.findall(
-                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-                r.text, re.DOTALL | re.IGNORECASE,
-            )
-            for block in blocks:
-                try:
-                    d = json.loads(block)
-                except Exception:
-                    continue
-                if d.get("@type") != "JobPosting":
-                    continue
-                desc = d.get("description", "")
-                if not desc:
-                    continue
-                try:
-                    desc = desc.encode("latin-1").decode("utf-8")
-                except Exception:
-                    pass
-                desc = re.sub(r"<[^>]+>", " ", desc)
-                desc = re.sub(r"&[a-z]+;|&#\d+;", " ", desc)
-                desc = re.sub(r"\s+", " ", desc).strip()
-                job_loc = d.get("jobLocation", {})
-                if isinstance(job_loc, list):
-                    loc_parts = []
-                    for loc in job_loc:
-                        if isinstance(loc, dict):
-                            addr = loc.get("address", {})
-                            s = ", ".join(p for p in [addr.get("addressLocality",""),
-                                                       addr.get("addressRegion",""),
-                                                       addr.get("addressCountry","")] if p)
-                            if s: loc_parts.append(s)
-                    location = "; ".join(loc_parts)
-                elif isinstance(job_loc, dict):
-                    addr = job_loc.get("address", {})
-                    location = ", ".join(p for p in [addr.get("addressLocality",""),
-                                                      addr.get("addressRegion",""),
-                                                      addr.get("addressCountry","")] if p)
-                else:
-                    location = ""
-                sal_m = re.search(
-                    r'\$[\d,]+\s*(?:USD)?\s*(?:[-–]|to)\s*\$[\d,]+\s*(?:USD)?',
-                    desc, re.IGNORECASE,
-                )
-                salary = sal_m.group(0) if sal_m else ""
-                lines  = []
-                title  = d.get("title", "")
-                if title:    lines.append(f"Title: {title}")
-                if location: lines.append(f"Location: {location}")
-                if salary:   lines.append(f"Salary: {salary}")
-                lines.append("")
-                lines.append(desc[:6000])
+            parsed = _parse_jsonld_jobposting(r.text)
+            text = _format_jd_text(parsed, desc_limit=6000)
+            if text:
+                _stash_jsonld_date(url, parsed)
                 logging.info(f"[Google JD] JSON-LD fetched: {url}")
-                return "\n".join(lines)
+                return text
     except Exception as e:
         logging.debug(f"[Google JD] requests failed: {e}")
 
@@ -1232,7 +1325,7 @@ def _scrape_google_jd(url: str, fc_key: str = "") -> str:
 
 
 # ── Microsoft Careers JD scraper (Firecrawl only_main_content) ────────────────
-def _scrape_microsoft_jd(url: str, fc_key: str = "") -> str:
+def _scrape_microsoft_jd(url: str) -> str:
     """
     Microsoft careers (jobs.careers.microsoft.com / careers.microsoft.com) are
     JS SPAs whose server-rendered HTML is mostly navbar / theme JSON. Crawl4AI
@@ -1246,11 +1339,9 @@ def _scrape_microsoft_jd(url: str, fc_key: str = "") -> str:
     will usually return "" — that's fine, the generic browser scraper picks
     up downstream).
     """
-    if fc_key:
+    if _FC_POOL is not None and not _FC_POOL.exhausted:
         try:
-            from firecrawl import FirecrawlApp
-            app = FirecrawlApp(api_key=fc_key)
-            result = app.scrape(url, formats=["markdown"], only_main_content=True)
+            result = _FC_POOL.scrape(url, formats=["markdown"], only_main_content=True)
             md = getattr(result, "markdown", None) or (
                 result.get("markdown", "") if isinstance(result, dict) else "")
             if md and len(md) > 200:
@@ -1270,30 +1361,12 @@ def _scrape_microsoft_jd(url: str, fc_key: str = "") -> str:
     try:
         r = requests.get(url, timeout=15, headers=_headers)
         if r.status_code == 200:
-            blocks = re.findall(
-                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-                r.text, re.DOTALL | re.IGNORECASE,
-            )
-            for block in blocks:
-                try:
-                    d = json.loads(block)
-                except Exception:
-                    continue
-                if d.get("@type") != "JobPosting":
-                    continue
-                desc = d.get("description", "")
-                if not desc:
-                    continue
-                desc = re.sub(r"<[^>]+>", " ", desc)
-                desc = re.sub(r"&[a-z]+;|&#\d+;", " ", desc)
-                desc = re.sub(r"\s+", " ", desc).strip()
-                title = d.get("title", "")
-                lines = []
-                if title: lines.append(f"Title: {title}")
-                lines.append("")
-                lines.append(desc[:6000])
+            parsed = _parse_jsonld_jobposting(r.text)
+            text = _format_jd_text(parsed, desc_limit=6000)
+            if text:
+                _stash_jsonld_date(url, parsed)
                 logging.info(f"[Microsoft JD] JSON-LD fetched: {url}")
-                return "\n".join(lines)
+                return text
     except Exception as e:
         logging.debug(f"[Microsoft JD] requests failed: {e}")
 
@@ -1316,89 +1389,18 @@ def _scrape_workday_jd(url: str) -> str:
         })
         if r.status_code != 200:
             return ""
-        html = r.text
-        # Extract JSON-LD block
-        blocks = re.findall(
-            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, re.DOTALL | re.IGNORECASE,
-        )
-        # BUG-53: moved out of loop — pure utility, no closure over loop vars
-        def _fmt_addr(addr: dict) -> str:
-            parts = [
-                addr.get("addressLocality", ""),
-                addr.get("addressRegion", ""),
-                addr.get("addressCountry", ""),
-            ]
-            return ", ".join(p for p in parts if p)
-
-        for block in blocks:
-            try:
-                d = json.loads(block)
-            except Exception:
-                continue
-            desc = d.get("description", "")
-            if not desc:
-                continue
-            # Fix common Mojibake (UTF-8 bytes stored as Latin-1 JSON escapes)
-            try:
-                desc = desc.encode("latin-1").decode("utf-8")
-            except Exception:
-                pass
-            # Strip HTML tags
-            desc = re.sub(r"<[^>]+>", " ", desc)
-            desc = re.sub(r"&[a-z]+;|&#\d+;", " ", desc)
-            desc = re.sub(r"\s+", " ", desc).strip()
-            # Build context string for extract_jd
-            title    = d.get("title", "")
-            job_loc_raw = d.get("jobLocation", {})
-
-            if isinstance(job_loc_raw, list):
-                loc_parts = []
-                for _loc in job_loc_raw:
-                    if isinstance(_loc, dict):
-                        loc_str = _fmt_addr(_loc.get("address", {}))
-                        if loc_str:
-                            loc_parts.append(loc_str)
-                location = "; ".join(loc_parts)
-            elif isinstance(job_loc_raw, dict):
-                location = _fmt_addr(job_loc_raw.get("address", {}))
-            else:
-                location = ""
-            # Salary: prefer baseSalary JSON-LD field, fall back to regex in desc
-            salary_text = ""
-            base_sal = d.get("baseSalary", {})
-            if isinstance(base_sal, dict):
-                val = base_sal.get("value", {})
-                if isinstance(val, dict):
-                    min_v = val.get("minValue", "")
-                    max_v = val.get("maxValue", "")
-                    currency = base_sal.get("currency", "USD")
-                    if min_v and max_v:
-                        try:
-                            salary_text = f"${int(float(min_v)):,} - ${int(float(max_v)):,} {currency}"
-                        except Exception:
-                            salary_text = f"{min_v} - {max_v} {currency}"
-            if not salary_text:
-                sal_m = re.search(
-                    r'\$[\d,]+\s*(?:USD)?\s*(?:[-–]|to)\s*\$[\d,]+\s*(?:USD)?',
-                    desc, re.IGNORECASE,
-                )
-                if sal_m:
-                    salary_text = sal_m.group(0)
-            lines = []
-            if title:    lines.append(f"Title: {title}")
-            if location: lines.append(f"Location: {location}")
-            if salary_text: lines.append(f"Salary: {salary_text}")
-            lines.append("")
-            lines.append(desc[:4000])
-            return "\n".join(lines)
+        parsed = _parse_jsonld_jobposting(r.text)
+        text = _format_jd_text(parsed, desc_limit=4000)
+        if text:
+            _stash_jsonld_date(url, parsed)
+            return text
     except Exception as e:
         logging.error(f"[Workday scrape] {e}")
     return ""
 
 
 # ── Tesla JD scraper (Firecrawl → CUA API → __NEXT_DATA__ → JSON-LD → browser) ─
-def _scrape_tesla_jd(url: str, fc_key: str = "") -> str:
+def _scrape_tesla_jd(url: str) -> str:
     """
     Tesla career pages are Next.js apps — direct HTTP is blocked by Akamai (403).
     Tries (in order):
@@ -1409,11 +1411,9 @@ def _scrape_tesla_jd(url: str, fc_key: str = "") -> str:
     Remaining fallback to browser is handled by the caller.
     """
     # ── 0. Firecrawl (primary — bypasses Akamai 403 bot protection) ──────────
-    if fc_key:
+    if _FC_POOL is not None and not _FC_POOL.exhausted:
         try:
-            from firecrawl import FirecrawlApp
-            app = FirecrawlApp(api_key=fc_key)
-            result = app.scrape(url=url, formats=["markdown"])
+            result = _FC_POOL.scrape(url=url, formats=["markdown"])
             md = getattr(result, "markdown", None) or ""
             if md and len(md) > 200:
                 logging.info(f"[Tesla Firecrawl] Fetched: {url}")
@@ -1523,65 +1523,11 @@ def _scrape_tesla_jd(url: str, fc_key: str = "") -> str:
                 logging.error(f"[Tesla NEXT_DATA] {e}")
 
         # ── 3. JSON-LD fallback (with location + salary) ──────────────────────
-        blocks = re.findall(
-            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, re.DOTALL | re.IGNORECASE,
-        )
-        for block in blocks:
-            try:
-                d = json.loads(block)
-            except Exception:
-                continue
-            desc = d.get("description", "")
-            if not desc:
-                continue
-            try:
-                desc = desc.encode("latin-1").decode("utf-8")
-            except Exception:
-                pass
-            title = d.get("title", "")
-            # Location from JSON-LD
-            job_loc = d.get("jobLocation", {})
-            if isinstance(job_loc, dict):
-                addr = job_loc.get("address", {})
-                parts = [addr.get("addressLocality", ""), addr.get("addressRegion", "")]
-                location = ", ".join(p for p in parts if p)
-            elif isinstance(job_loc, list):
-                loc_parts = []
-                for _loc in job_loc:
-                    if isinstance(_loc, dict):
-                        addr = _loc.get("address", {})
-                        parts = [addr.get("addressLocality", ""), addr.get("addressRegion", "")]
-                        s = ", ".join(p for p in parts if p)
-                        if s:
-                            loc_parts.append(s)
-                location = "; ".join(loc_parts)
-            else:
-                location = ""
-            # Salary from JSON-LD or regex
-            salary_text = ""
-            base_sal = d.get("baseSalary", {})
-            if isinstance(base_sal, dict):
-                val = base_sal.get("value", {})
-                if isinstance(val, dict):
-                    min_v = val.get("minValue", "")
-                    max_v = val.get("maxValue", "")
-                    currency = base_sal.get("currency", "USD")
-                    if min_v and max_v:
-                        try:
-                            salary_text = f"${int(float(min_v)):,} - ${int(float(max_v)):,} {currency}"
-                        except Exception:
-                            salary_text = f"{min_v} - {max_v} {currency}"
-            if not salary_text:
-                sal_m = re.search(
-                    r'\$[\d,]+\s*(?:USD)?\s*(?:[-–]|to)\s*\$[\d,]+\s*(?:USD)?',
-                    desc, re.IGNORECASE,
-                )
-                if sal_m:
-                    salary_text = sal_m.group(0)
-            text = _build_tesla_text(title, location, salary_text, desc)
-            if text:
-                return text
+        parsed = _parse_jsonld_jobposting(html)
+        text = _format_jd_text(parsed, desc_limit=6000)
+        if text:
+            _stash_jsonld_date(url, parsed)
+            return text
     except Exception as e:
         logging.error(f"[Tesla scrape] {e}")
     return ""
@@ -1747,9 +1693,12 @@ def extract_jd(markdown: str, company: str = "", track: str = "") -> str:
         " Extract the salary or compensation range if mentioned anywhere in the posting "
         "(look for '$', 'USD', 'per year', 'annually', 'base pay', 'compensation', "
         "'salary range'). If no salary is present, leave the field empty — do not fabricate."
-        " Extract ALL US locations for this specific job posting (including 'Remote' if"
-        " applicable). If the role is available at multiple US locations, join them with"
-        " '; ' (e.g. 'Santa Clara, CA; Austin, TX; Remote'). Ignore sidebar navigation,"
+        " Extract ALL locations for this specific job posting verbatim as written —"
+        " city, state/region, and country when shown, including 'Remote' if applicable."
+        " Do not omit or filter out non-US locations. If the role is available at"
+        " multiple locations, join them with '; '"
+        " (e.g. 'Santa Clara, CA; Austin, TX; Bangalore, India; Remote')."
+        " Ignore sidebar navigation,"
         " job lists, related job suggestions, and 'Other open roles' sections."
         " For 'requirements': extract must-have qualifications regardless of the section heading."
         " Companies use many different labels — treat ALL of the following as requirements:"
@@ -1843,15 +1792,15 @@ def extract_jd(markdown: str, company: str = "", track: str = "") -> str:
 
 # ── JD scraper function registry (for routing table lookup) ──────────────────
 _JD_FN_REGISTRY = {
-    "_scrape_google_jd":         lambda url, **kw: _scrape_google_jd(url, fc_key=kw.get("fc_key", "")),
-    "_scrape_microsoft_jd":      lambda url, **kw: _scrape_microsoft_jd(url, fc_key=kw.get("fc_key", "")),
+    "_scrape_google_jd":         lambda url, **kw: _scrape_google_jd(url),
+    "_scrape_microsoft_jd":      lambda url, **kw: _scrape_microsoft_jd(url),
     "_scrape_workday_jd":        lambda url, **kw: _scrape_workday_jd(url),
-    "_scrape_tesla_jd":          lambda url, **kw: _scrape_tesla_jd(url, fc_key=kw.get("fc_key", "")),
+    "_scrape_tesla_jd":          lambda url, **kw: _scrape_tesla_jd(url),
     "_scrape_greenhouse_api_jd": None,  # special: needs (board, jid), handled separately
 }
 
 # ── Shared scraper routing & JD processing pipeline ──────────────────────────
-async def _route_scraper(url: str, fc_key: str, crawler, list_meta: dict | None = None) -> tuple[str, str]:
+async def _route_scraper(url: str, crawler, list_meta: dict | None = None) -> tuple[str, str]:
     """Route URL to the appropriate scraper.  Returns (markdown, label).
 
     list_meta (PRJ-004): per-URL metadata from the list-API phase — carries
@@ -1884,7 +1833,7 @@ async def _route_scraper(url: str, fc_key: str, crawler, list_meta: dict | None 
         if jd_fn_name and jd_fn_name in _JD_FN_REGISTRY:
             jd_fn = _JD_FN_REGISTRY[jd_fn_name]
             if jd_fn is not None:
-                markdown = jd_fn(url, fc_key=fc_key)
+                markdown = jd_fn(url)
                 if not markdown:
                     logging.warning(f"[{platform.title()}] Static methods failed, falling back to browser: {url}")
                     markdown = await scrape_jd(url, crawler)
@@ -1994,11 +1943,94 @@ def _backfill_posted_date(company: str, title: str) -> str:
     return ""
 
 
+def _fetch_jsonld_posted_date(url: str) -> str:
+    """BUG-67: last-chance deterministic date recovery — one plain GET for the
+    page's JSON-LD `datePosted`. No API quota; '' on any failure. Sync call on
+    the staging path, same as the Tavily backfill it precedes."""
+    try:
+        r = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        if r.status_code == 200:
+            return _parse_jsonld_jobposting(r.text)["date_posted"]
+    except Exception as e:
+        logging.debug(f"[JSON-LD date] fetch failed for {url}: {e}")
+    return ""
+
+
+def _gate_and_finalize(parsed: dict, track: str, url: str,
+                       posted_date: str = "") -> dict | None:
+    """PRJ-004 write-time gates + record finalization (REQ-004-08/09/10/11).
+
+    Returns the finalized record, or None when a gate skips the row. Runs on
+    EVERY staging path — discovery (all scraper labels) and the incomplete-row
+    retry alike (BUG-66: the geo/domain/YoE/work-auth gates previously only
+    covered the generic-crawler path)."""
+    # ── Gate 0 (REQ-004-12, BUG-66): geo — unconditional on all paths.
+    # Blank/unrecognized locations classify as "Unknown" and are kept for
+    # review (they surface via Data Quality="partial"); only rows whose
+    # location confirmably matches no target region are dropped.
+    loc = parsed.get("location", "")
+    if classify_region(loc) == "Other":
+        print(f"      🌍 [GeoFilter] Skipped out-of-region ({loc}): {url}")
+        return None
+    # ── Gate 1 (REQ-004-09): domain. Vertical companies can't hit "None"
+    # because the classifier output is deterministically overridden.
+    forced = _vertical_domain(track) if track else None
+    if forced:
+        parsed["job_domain"] = forced
+    domain = parsed.get("job_domain") or "None"
+    if domain not in JOB_DOMAIN_VALUES:
+        print(f"      🚫 [DomainGate] No track match (domain={domain!r}): {url}")
+        return None
+    # ── Gate 2 (REQ-004-08): YoE — skip iff stated min ≤3 or ≥12
+    # ("10+ years" keeps, "12+ years" skips). Unstated → keep + flag.
+    min_yoe = parsed.get("min_yoe")
+    if isinstance(min_yoe, int):
+        if min_yoe <= 3 or min_yoe >= 12:
+            print(f"      🚫 [YoEGate] stated min {min_yoe} yrs (skip rule: ≤3 or ≥12): {url}")
+            return None
+        parsed["yoe_flag"] = ""
+    else:
+        title = parsed.get("job_title", "") or ""
+        parsed["yoe_flag"] = ("auto-qualified (title)" if _SENIOR_TITLE_RE.search(title)
+                              else "manual review — YoE unstated")
+    # ── Gate 3 (REQ-004-11): work authorization (global, all buckets).
+    work_auth = parsed.get("work_auth", "none_stated")
+    if work_auth in ("citizenship_required", "clearance_required"):
+        print(f"      🚫 [WorkAuthGate] {work_auth}: {url}")
+        return None
+    # PRJ-004 REQ-004-10 / BUG-67: posted date is never LLM-extracted. Chain:
+    # ATS list metadata → JSON-LD date stashed during the scrape → one plain
+    # GET for the page's JSON-LD → Tavily backfill → keep + flag. Never a
+    # drop condition (design.md §2.2.3 F3).
+    if posted_date:
+        parsed["posted_date"] = posted_date
+    if not parsed.get("posted_date"):
+        if url in _JSONLD_DATE_BY_URL:
+            parsed["posted_date"] = _JSONLD_DATE_BY_URL[url]
+        else:
+            parsed["posted_date"] = _fetch_jsonld_posted_date(url)
+    if not parsed.get("posted_date"):
+        backfilled = _backfill_posted_date(parsed.get("company", ""),
+                                           parsed.get("job_title", ""))
+        if backfilled:
+            parsed["posted_date"] = backfilled
+    if not parsed.get("posted_date"):
+        parsed["date_flag"] = "manual review — unknown posted date"
+    # REQ-060: assess JD field completeness and inject into record
+    parsed["data_quality"] = _assess_jd_quality(parsed)
+    return parsed
+
+
 async def _process_scraped_jd(
     url: str, markdown: str, company: str, track: str,
     stale_set: set, known_url_meta: dict,
     pending: list, timestamp_only: list,
-    label: str, check_us_location: bool = False,
+    label: str,
     posted_date: str = "",
 ) -> None:
     """Common pipeline: hash → stale check → cache → extract → gates → stage.
@@ -2020,63 +2052,30 @@ async def _process_scraped_jd(
     except Exception:
         parsed = {}
     if not parsed.get("company"):
-        logging.warning(f"[Extract] Gemini returned empty data for {url}, skipping")
+        # BUG-62: stage an audit row instead of skipping silently. The
+        # non-JSON sentinel fails json.loads inside batch_upsert_jd_records,
+        # which writes the existing _JD_ERROR_ROW (company="JSON ERROR",
+        # data_quality="failed") — sheet-visible, excluded from matching, and
+        # still retried next run via the same URL-keyed row (bounded growth).
+        logging.warning(f"[Extract] Gemini returned empty data for {url} — "
+                        f"staging JSON-ERROR audit row")
+        pending.append((url, "EXTRACTION EMPTY — NOT JSON", hash_val))
         return
-    if check_us_location:
-        loc = parsed.get("location", "")
-        if loc and classify_region(loc) == "Other":
-            print(f"      🌍 [GeoFilter] Skipped out-of-region ({loc}): {url}")
-            return
-    # ── Gate 1 (REQ-004-09): domain. Vertical companies can't hit "None"
-    # because the classifier output is deterministically overridden.
-    forced = _vertical_domain(track) if track else None
-    if forced:
-        parsed["job_domain"] = forced
-    domain = parsed.get("job_domain") or "None"
-    if domain not in JOB_DOMAIN_VALUES:
-        print(f"      🚫 [DomainGate] No track match (domain={domain!r}): {url}")
+    parsed = _gate_and_finalize(parsed, track, url, posted_date=posted_date)
+    if parsed is None:
         return
-    # ── Gate 2 (REQ-004-08): YoE — skip iff stated min ≤3 or ≥12
-    # ("10+ years" keeps, "12+ years" skips). Unstated → keep + flag.
-    min_yoe = parsed.get("min_yoe")
-    if isinstance(min_yoe, int):
-        if min_yoe <= 3 or min_yoe >= 12:
-            print(f"      🚫 [YoEGate] stated min {min_yoe} yrs (skip rule: ≤3 or ≥12): {url}")
-            return
-        parsed["yoe_flag"] = ""
-    else:
-        title = parsed.get("job_title", "") or ""
-        parsed["yoe_flag"] = ("auto-qualified (title)" if _SENIOR_TITLE_RE.search(title)
-                              else "manual review — YoE unstated")
-    # ── Gate 3 (REQ-004-11): work authorization (global, all buckets).
-    work_auth = parsed.get("work_auth", "none_stated")
-    if work_auth in ("citizenship_required", "clearance_required"):
-        print(f"      🚫 [WorkAuthGate] {work_auth}: {url}")
-        return
-    # PRJ-004 REQ-004-10: posted date comes from ATS list metadata, not the LLM.
-    if posted_date:
-        parsed["posted_date"] = posted_date
-    if not parsed.get("posted_date"):
-        backfilled = _backfill_posted_date(parsed.get("company", ""),
-                                           parsed.get("job_title", ""))
-        if backfilled:
-            parsed["posted_date"] = backfilled
-    if not parsed.get("posted_date"):
-        parsed["date_flag"] = "manual review — unknown posted date"
-    # REQ-060: assess JD field completeness and inject into record
-    parsed["data_quality"] = _assess_jd_quality(parsed)
     jd_json = json.dumps(parsed)
     _save_structured_jd_md(url, parsed)
     pending.append((url, jd_json, hash_val))
     known_url_meta[url] = {"hash": hash_val, "age_days": 0, "title": ""}
     suffix = f" ({label})" if label != "generic" else ""
-    print(f"      ✅ Staged{suffix} [{domain}]: {url}")
+    print(f"      ✅ Staged{suffix} [{parsed.get('job_domain')}]: {url}")
 
 
 # ── Per-company async pipeline ────────────────────────────────────────────────
 async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
-                           fc_key: str,
-                           excel_lock: asyncio.Lock, crawler) -> None:
+                           excel_lock: asyncio.Lock, crawler,
+                           triaged_set: set | None = None) -> None:
     if len(row) < 4: return
     name       = str(row[0]).strip() if row[0] else ""
     track      = str(row[1]).strip() if len(row) > 1 and row[1] else ""
@@ -2093,7 +2092,7 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
         print("    ⏳ Path B rate-limit delay (15s)...")
         await asyncio.sleep(15)
 
-    raw = await discover_jobs(career_url, fc_key, crawler)
+    raw = await discover_jobs(career_url, crawler)
     if not raw:
         print("    No TPM jobs found.")
         return
@@ -2122,6 +2121,15 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
 
     to_process = [u for u in urls if u not in fresh_set]
 
+    # BUG-65: user-triaged URLs (JD_ToApply / Skipped JD tabs) are final —
+    # never re-scrape or re-add them to JD_Tracker.
+    if triaged_set:
+        before_triage = len(to_process)
+        to_process = [u for u in to_process if u not in triaged_set]
+        if before_triage - len(to_process):
+            print(f"    🗂️  Triage gate: skipped {before_triage - len(to_process)} "
+                  f"user-triaged posting(s).")
+
     to_process, aged_skipped = _apply_prescrape_freshness_gate(
         to_process, list_meta, known_url_meta)
     if aged_skipped:
@@ -2147,7 +2155,7 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
                 return
             seen_urls.add(url)
             print(f"      🕷️  {url}")
-            markdown, label = await _route_scraper(url, fc_key, crawler, list_meta)
+            markdown, label = await _route_scraper(url, crawler, list_meta)
         if not markdown:
             tag = "Scrape" if label == "generic" else label
             logging.warning(f"[{tag}] Empty {'markdown' if label == 'generic' else 'JD'} for {url}")
@@ -2157,7 +2165,6 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
             url, markdown, name, track,
             stale_set, known_url_meta,
             pending, timestamp_only, label,
-            check_us_location=(label == "generic"),
             posted_date=(list_meta.get(url) or {}).get("posted_date", ""),
         )
 
@@ -2215,17 +2222,18 @@ async def main():
 
 
 async def _main_inner(summary: RunSummary):
-    global _KEY_POOL
+    global _KEY_POOL, _FC_POOL
     gemini_keys = [k for k in [
         os.getenv("GEMINI_API_KEY"),
         os.getenv("GEMINI_API_KEY_2"),
     ] if k]
-    fc_key = os.getenv("FIRECRAWL_API_KEY")
     if not gemini_keys:
         print("❌ Missing env var: GEMINI_API_KEY")
         summary.note("Missing GEMINI_API_KEY")
         return
-    if not fc_key:
+    # BUG-68: key pool with 402/429 rotation + one loud exhaustion warning.
+    _FC_POOL = build_pool_from_env()
+    if _FC_POOL is None:
         print("❌ Missing env var: FIRECRAWL_API_KEY")
         summary.note("Missing FIRECRAWL_API_KEY")
         return
@@ -2237,14 +2245,15 @@ async def _main_inner(summary: RunSummary):
     # Degrades gracefully: without the key the keep+flag path still satisfies
     # the requirement.
     global _TAVILY_CLIENT
-    tavily_key = os.getenv("TAVILY_API_KEY")
-    if tavily_key:
-        try:
-            from tavily import TavilyClient
-            _TAVILY_CLIENT = TavilyClient(api_key=tavily_key)
+    try:
+        # Aliased: plain build_pool_from_env is the FIRECRAWL pool builder in
+        # this function's scope (imported above) — shadowing it breaks _FC_POOL.
+        from shared.tavily_pool import build_pool_from_env as _build_tavily_pool
+        _TAVILY_CLIENT = _build_tavily_pool()  # BUG-70: key rotation; None = off
+        if _TAVILY_CLIENT is not None:
             logging.info("[Tavily] posting-date backfill enabled.")
-        except Exception as e:
-            logging.warning(f"[Tavily] backfill unavailable: {e}")
+    except Exception as e:
+        logging.warning(f"[Tavily] backfill unavailable: {e}")
 
     class _SuppressPageEvalFilter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
@@ -2255,9 +2264,14 @@ async def _main_inner(summary: RunSummary):
     print("JOB AGENT")
     print("="*60 + "\n")
 
+    _JSONLD_DATE_BY_URL.clear()  # BUG-67: per-run scrape-date side-channel
     xlsx_path      = get_or_create_excel()
     companies      = get_company_rows(xlsx_path)
     known_url_meta = get_jd_url_meta(xlsx_path)
+    triaged_set    = get_triaged_jd_urls(xlsx_path)
+    if triaged_set:
+        print(f"🗂️  {len(triaged_set)} user-triaged JD URL(s) permanently excluded "
+              f"(JD_ToApply / Skipped JD).")
     lock           = asyncio.Lock()
 
     if not companies:
@@ -2292,7 +2306,8 @@ async def _main_inner(summary: RunSummary):
                 chunk = rows[i:i+batch]
                 print(f"  Batch {i//batch+1}: {[r[0] for r in chunk]}")
                 batch_results = await asyncio.gather(*[
-                    process_company(r, known_url_meta, xlsx_path, fc_key, lock, crawler)
+                    process_company(r, known_url_meta, xlsx_path, lock, crawler,
+                                    triaged_set=triaged_set)
                     for r in chunk
                 ], return_exceptions=True)
                 print(f"  ✅ Batch {i//batch+1} complete.")
@@ -2305,6 +2320,9 @@ async def _main_inner(summary: RunSummary):
 
         # ── Phase: Retry incomplete JD records ─────────────────────────────────
         incomplete = get_incomplete_jd_rows(xlsx_path)
+        # BUG-65: belt-and-braces — a triaged URL that also (still) sits in
+        # JD_Tracker must not be re-extracted/overwritten.
+        incomplete = [r for r in incomplete if r["url"] not in triaged_set]
         if incomplete:
             print(f"\n{'='*60}")
             print(f"🔄 Retrying {len(incomplete)} incomplete JD records...")
@@ -2325,7 +2343,7 @@ async def _main_inner(summary: RunSummary):
                 track        = company_track_map.get(company_name.lower(), "")
                 print(f"  🔄 {url}")
 
-                markdown, _ = await _route_scraper(url, fc_key, crawler)
+                markdown, _ = await _route_scraper(url, crawler)
                 if not markdown:
                     logging.warning(f"[Retry] Empty markdown for {url}")
                     return
@@ -2340,11 +2358,6 @@ async def _main_inner(summary: RunSummary):
                 if not parsed.get("company"):
                     logging.warning(f"[Retry] Gemini returned empty data for {url}, skipping")
                     return
-                # PRJ-004: vertical-track override applies on retry too, so the
-                # refreshed row keeps a valid Job Domain (G2).
-                forced = _vertical_domain(track) if track else None
-                if forced:
-                    parsed["job_domain"] = forced
                 # Verify the previously-missing key fields are now populated.
                 # If Gemini still returns empty lists, writing "None" would keep the record
                 # in _JD_MISSING and cause an infinite retry loop on every run.
@@ -2357,8 +2370,15 @@ async def _main_inner(summary: RunSummary):
                         and not extracted_resp):
                     logging.warning(f"[Retry] Extraction still incomplete for {url}, skipping overwrite")
                     return
-                # REQ-060: assess JD field completeness and inject into record
-                parsed["data_quality"] = _assess_jd_quality(parsed)
+                # BUG-67: preserve the row's existing Posted Date — the retry
+                # rewrite previously wiped it (the LLM never returns one).
+                parsed["posted_date"] = rec.get("posted_date", "")
+                # BUG-66: retries pass the same write-time gates as discovery
+                # (geo / domain / YoE / work-auth) — this path previously
+                # bypassed all of them.
+                parsed = _gate_and_finalize(parsed, track, url)
+                if parsed is None:
+                    return
                 jd_json = json.dumps(parsed)
                 _save_structured_jd_md(url, parsed)
                 async with retry_lock:

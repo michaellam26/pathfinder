@@ -300,7 +300,8 @@ class TestJobAgentMain(unittest.IsolatedAsyncioTestCase):
         """BRD §8 scenario 2: Job Agent writes JDs to JD_Tracker and updates company counts."""
         mock_excel.return_value = self.temp_xlsx
 
-        async def fake_process_company(row, known, xlsx_path, fc_key, lock, crawler):
+        async def fake_process_company(row, known, xlsx_path, lock, crawler,
+                                       triaged_set=None):
             name = str(row[0]).strip()
             jd_json = _make_jd_json(title=f"AI TPM at {name}", company=name)
             url = f"https://boards.greenhouse.io/testco/jobs/123"

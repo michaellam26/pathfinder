@@ -25,10 +25,12 @@ from google import genai
 import agents.job_agent as ja
 from shared.excel_store import (
     EXCEL_PATH, get_or_create_excel, get_company_rows, get_jd_url_meta,
+    get_triaged_jd_urls,
 )
+from shared.firecrawl_pool import build_pool_from_env
 from shared.gemini_pool import _GeminiKeyPoolBase
 
-TARGETS = {"microsoft", "hugging face", "intel"}
+TARGETS = {"zebra technologies", "oracle", "microsoft"}
 
 
 async def _run() -> None:
@@ -38,11 +40,12 @@ async def _run() -> None:
 
     gemini_keys = [k for k in [os.getenv("GEMINI_API_KEY"),
                                os.getenv("GEMINI_API_KEY_2")] if k]
-    fc_key = os.getenv("FIRECRAWL_API_KEY")
-    if not gemini_keys or not fc_key:
+    fc_pool = build_pool_from_env()
+    if not gemini_keys or fc_pool is None:
         sys.exit("Missing GEMINI_API_KEY or FIRECRAWL_API_KEY")
 
     ja._KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
+    ja._FC_POOL = fc_pool
 
     xlsx_path = get_or_create_excel()
     all_companies = get_company_rows(xlsx_path)
@@ -53,6 +56,7 @@ async def _run() -> None:
         print(f"  ⚠️  Missing from company list: {missing}")
 
     known_url_meta = get_jd_url_meta(xlsx_path)
+    triaged_set = get_triaged_jd_urls(xlsx_path)
     lock = asyncio.Lock()
 
     from crawl4ai import AsyncWebCrawler, BrowserConfig
@@ -61,7 +65,8 @@ async def _run() -> None:
         for r in rows:
             try:
                 await ja.process_company(r, known_url_meta, xlsx_path,
-                                         fc_key, lock, crawler)
+                                         lock, crawler,
+                                         triaged_set=triaged_set)
             except Exception as exc:
                 logging.exception(f"[subset-run] {r[0]}: {exc}")
 

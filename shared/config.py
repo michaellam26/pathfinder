@@ -5,6 +5,11 @@ MODEL = "gemini-3.1-flash-lite"
 
 AUTO_ARCHIVE_THRESHOLD = 3  # consecutive no-TPM runs before auto-archiving a company
 
+# PRJ-004 6-track taxonomy, in canonical display/sort order. Single source of
+# truth shared by company_agent (quotas/schemas) and excel_store (Company_List
+# sort) — defined here to avoid a circular import between those two modules.
+TRACK_ORDER = ("AI-native", "Mid-large Tech", "Robotics", "Fintech", "Space", "Defense")
+
 # Computed independently to avoid importing from shared.excel_store (which itself
 # imports config). Resolves to <repo root>/jd_cache.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

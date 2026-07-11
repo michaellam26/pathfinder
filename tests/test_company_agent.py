@@ -807,13 +807,11 @@ class TestBug44TavilyQuotaDetection(unittest.TestCase):
         """When Tavily raises a 402 quota error, discover_ai_companies should stop querying."""
         from agents.company_agent import discover_ai_companies, TAVILY_QUERIES
 
-        mock_client_cls = MagicMock()
         mock_client = MagicMock()
         # First call raises 402
         mock_client.search.side_effect = Exception("HTTP 402 Payment Required - quota exhausted")
 
-        with patch("tavily.TavilyClient", return_value=mock_client):
-            result = discover_ai_companies("fake-key", {"ExistingCo"}, {"AI-native": 5})
+        result = discover_ai_companies(mock_client, {"ExistingCo"}, {"AI-native": 5})
 
         # Should have called search only once (broke on quota error)
         self.assertEqual(mock_client.search.call_count, 1)
@@ -821,14 +819,15 @@ class TestBug44TavilyQuotaDetection(unittest.TestCase):
 
     @patch("agents.company_agent._KEY_POOL")
     def test_tavily_quota_429_breaks_loop(self, mock_pool):
-        """429 rate limit should also break."""
+        """429 rate limit should also break — including the TavilyKeyPool's
+        normalized all-keys-exhausted message (BUG-70)."""
         from agents.company_agent import discover_ai_companies
 
         mock_client = MagicMock()
-        mock_client.search.side_effect = Exception("429 Too Many Requests")
+        mock_client.search.side_effect = Exception(
+            "429 Tavily quota exhausted on all 2 API key(s)")
 
-        with patch("tavily.TavilyClient", return_value=mock_client):
-            result = discover_ai_companies("fake-key", set(), {"AI-native": 3})
+        result = discover_ai_companies(mock_client, set(), {"AI-native": 3})
 
         self.assertEqual(mock_client.search.call_count, 1)
 
@@ -841,8 +840,7 @@ class TestBug44TavilyQuotaDetection(unittest.TestCase):
         # All queries raise generic network error
         mock_client.search.side_effect = Exception("Connection timeout")
 
-        with patch("tavily.TavilyClient", return_value=mock_client):
-            result = discover_ai_companies("fake-key", set(), {"AI-native": 3})
+        result = discover_ai_companies(mock_client, set(), {"AI-native": 3})
 
         # Should have tried all queries, not just one
         self.assertEqual(mock_client.search.call_count, len(TAVILY_QUERIES))
@@ -886,9 +884,8 @@ class TestBug49DiscoverCompaniesSetMutation(unittest.TestCase):
         original_names = {"ExistingCo", "OtherCo"}
         original_copy = set(original_names)
 
-        with patch("tavily.TavilyClient", return_value=mock_client), \
-             patch("agents.company_agent.find_career_url", return_value="https://newai.co/careers"):
-            discover_ai_companies("fake-key", original_names, {"AI-native": 5})
+        with patch("agents.company_agent.find_career_url", return_value="https://newai.co/careers"):
+            discover_ai_companies(mock_client, original_names, {"AI-native": 5})
 
         # The original set must NOT have been modified
         self.assertEqual(original_names, original_copy)
@@ -907,9 +904,8 @@ class TestBug49DiscoverCompaniesSetMutation(unittest.TestCase):
                  '{"company_name": "DupCo", "track": "AI-native", "business_focus": "y"}]}'
         )
 
-        with patch("tavily.TavilyClient", return_value=mock_client), \
-             patch("agents.company_agent.find_career_url", return_value="https://dupco.com/careers"):
-            results = discover_ai_companies("fake-key", set(), {"AI-native": 5})
+        with patch("agents.company_agent.find_career_url", return_value="https://dupco.com/careers"):
+            results = discover_ai_companies(mock_client, set(), {"AI-native": 5})
 
         # Only one DupCo should be in results (dedup within batch)
         names = [c.get("company_name") for c in results]
@@ -980,7 +976,8 @@ class TestPhase15ManualBackfill(unittest.TestCase):
     @patch("agents.company_agent.find_career_url")
     def test_blank_url_skipped_when_tavily_disabled(self, mock_find):
         # No Tavily client → backfill cannot proceed; row stays blank.
-        with patch.dict(os.environ, {"TAVILY_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "",
+                                     "TAVILY_API_KEY_2": ""}, clear=False):
             company_agent_mod.run_phase_1_5(self.path, tavily_client=None)
 
         import openpyxl
@@ -1252,6 +1249,329 @@ class TestUpdateCompanyTrack(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.remove(path)
+
+
+# ── BUG-69: Business Focus re-enrich ────────────────────────────────────────
+class TestReenrichBusinessFocus(unittest.TestCase):
+    """BUG-69: blank/N-A Business Focus rows are filled via Tavily context +
+    one batched Gemini call; quota errors abort gracefully; hallucinated
+    names are never written."""
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.append(["FullCo", "AI-native", "Already has a focus.",
+                   "https://f.co", None, None, None, None, None])
+        ws.append(["BlankCo", "AI-native", None,
+                   "https://b.co", None, None, None, None, None])
+        ws.append(["NaCo", "Fintech", "N/A",
+                   "https://n.co", None, None, None, None, None])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _focus_by_name(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_List"]
+        out = {r[0]: r[2] for r in ws.iter_rows(min_row=2, values_only=True) if r[0]}
+        wb.close()
+        return out
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_fills_only_incomplete_rows(self, mock_pool):
+        tavily = MagicMock()
+        tavily.search.return_value = {"results": [
+            {"title": "About", "content": "They build things."}]}
+        mock_pool.generate_content.return_value = MagicMock(
+            text='{"focuses": ['
+                 '{"company_name": "BlankCo", "business_focus": "Builds B."},'
+                 '{"company_name": "NaCo", "business_focus": "Builds N."}]}')
+        with patch("agents.company_agent.time.sleep"):
+            counts = company_agent_mod.run_reenrich_business_focus(
+                self.path, tavily_client=tavily)
+        self.assertEqual(counts, {"filled": 2, "failed": 0, "skipped": 0})
+        focus = self._focus_by_name()
+        self.assertEqual(focus["FullCo"], "Already has a focus.")
+        self.assertEqual(focus["BlankCo"], "Builds B.")
+        self.assertEqual(focus["NaCo"], "Builds N.")
+        # only the 2 incomplete rows hit Tavily
+        self.assertEqual(tavily.search.call_count, 2)
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_tavily_quota_aborts_but_keeps_earlier_context(self, mock_pool):
+        tavily = MagicMock()
+        tavily.search.side_effect = [
+            {"results": [{"title": "About", "content": "ctx"}]},
+            Exception("402 Payment Required - quota exhausted"),
+        ]
+        mock_pool.generate_content.return_value = MagicMock(
+            text='{"focuses": [{"company_name": "BlankCo", '
+                 '"business_focus": "Builds B."}]}')
+        with patch("agents.company_agent.time.sleep"):
+            counts = company_agent_mod.run_reenrich_business_focus(
+                self.path, tavily_client=tavily)
+        # BlankCo (searched before the quota error) is still filled;
+        # NaCo is skipped for this run.
+        self.assertEqual(counts, {"filled": 1, "failed": 0, "skipped": 1})
+        focus = self._focus_by_name()
+        self.assertEqual(focus["BlankCo"], "Builds B.")
+        self.assertIn(str(focus["NaCo"]), ("N/A",))
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_hallucinated_name_not_written_and_counted_failed(self, mock_pool):
+        tavily = MagicMock()
+        tavily.search.return_value = {"results": []}
+        mock_pool.generate_content.return_value = MagicMock(
+            text='{"focuses": [{"company_name": "MadeUpCo", '
+                 '"business_focus": "Fabricated."}]}')
+        with patch("agents.company_agent.time.sleep"):
+            counts = company_agent_mod.run_reenrich_business_focus(
+                self.path, tavily_client=tavily)
+        self.assertEqual(counts["filled"], 0)
+        self.assertEqual(counts["failed"], 2)
+        focus = self._focus_by_name()
+        self.assertIsNone(focus["BlankCo"])
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_no_tavily_client_skips_all(self, mock_pool):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TAVILY_API_KEY", None)
+            os.environ.pop("TAVILY_API_KEY_2", None)
+            counts = company_agent_mod.run_reenrich_business_focus(self.path)
+        self.assertEqual(counts, {"filled": 0, "failed": 0, "skipped": 2})
+        mock_pool.generate_content.assert_not_called()
+
+    def test_raises_when_key_pool_none(self):
+        original = company_agent_mod._KEY_POOL
+        try:
+            company_agent_mod._KEY_POOL = None
+            with self.assertRaises(RuntimeError) as ctx:
+                company_agent_mod.run_reenrich_business_focus(self.path)
+            self.assertIn("_KEY_POOL not initialized", str(ctx.exception))
+        finally:
+            company_agent_mod._KEY_POOL = original
+
+    def test_main_wires_reenrich_after_phase_1_5(self):
+        import inspect
+        source = inspect.getsource(company_agent_mod.main)
+        self.assertIn("run_reenrich_business_focus", source)
+        self.assertLess(source.index("run_phase_1_5"),
+                        source.index("run_reenrich_business_focus"))
+
+
+# ── Discovery loop (loop-to-500) ─────────────────────────────────────────────
+class TestRunDiscoveryLoop(unittest.TestCase):
+    """run_discovery_loop iterates BATCH_SIZE batches until quota is filled,
+    a batch yields nothing new, or the iteration cap is reached. The dedup
+    exclusion set is re-read from the sheet between iterations."""
+
+    SMALL_QUOTAS = {"AI-native": 4, "Mid-large Tech": 0, "Robotics": 0,
+                    "Fintech": 0, "Space": 0, "Defense": 0}
+
+    def setUp(self):
+        import tempfile
+        from shared.excel_store import get_or_create_excel
+        from shared.run_summary import RunSummary
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        self.summary = RunSummary(agent="company")
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    @staticmethod
+    def _batch(names):
+        return [{"company_name": n, "track": "AI-native",
+                 "business_focus": f"{n} focus.", "career_url": f"https://{n}.co"}
+                for n in names]
+
+    def test_loops_until_quota_filled(self):
+        with patch.object(company_agent_mod, "TRACK_QUOTAS", self.SMALL_QUOTAS), \
+             patch.object(company_agent_mod, "MAX_TOTAL", 4), \
+             patch.object(company_agent_mod, "BATCH_SIZE", 2), \
+             patch.object(company_agent_mod, "discover_ai_companies") as mock_disc:
+            mock_disc.side_effect = [self._batch(["CoA", "CoB"]),
+                                     self._batch(["CoC", "CoD"])]
+            added = company_agent_mod.run_discovery_loop(
+                self.path, "tavily-key", self.summary)
+        from shared.excel_store import count_company_rows
+        self.assertEqual(added, 4)
+        self.assertEqual(count_company_rows(self.path), 4)
+        self.assertEqual(mock_disc.call_count, 2)
+        self.assertEqual(self.summary.succeeded, 4)
+        self.assertTrue(any("all buckets at quota" in n.lower()
+                            for n in self.summary.notes))
+
+    def test_stops_on_zero_yield_batch(self):
+        with patch.object(company_agent_mod, "TRACK_QUOTAS", self.SMALL_QUOTAS), \
+             patch.object(company_agent_mod, "MAX_TOTAL", 4), \
+             patch.object(company_agent_mod, "BATCH_SIZE", 2), \
+             patch.object(company_agent_mod, "discover_ai_companies") as mock_disc:
+            mock_disc.return_value = []
+            added = company_agent_mod.run_discovery_loop(
+                self.path, "tavily-key", self.summary)
+        self.assertEqual(added, 0)
+        self.assertEqual(mock_disc.call_count, 1)
+        self.assertEqual(self.summary.failed, 2)
+        self.assertTrue(any("zero-yield" in n for n in self.summary.notes))
+
+    def test_dedup_set_refreshed_between_iterations(self):
+        with patch.object(company_agent_mod, "TRACK_QUOTAS", self.SMALL_QUOTAS), \
+             patch.object(company_agent_mod, "MAX_TOTAL", 4), \
+             patch.object(company_agent_mod, "BATCH_SIZE", 2), \
+             patch.object(company_agent_mod, "discover_ai_companies") as mock_disc:
+            mock_disc.side_effect = [self._batch(["CoA", "CoB"]),
+                                     self._batch(["CoC", "CoD"])]
+            company_agent_mod.run_discovery_loop(
+                self.path, "tavily-key", self.summary)
+        second_call_names = mock_disc.call_args_list[1][0][1]
+        self.assertIn("CoA", second_call_names)
+        self.assertIn("CoB", second_call_names)
+
+    def test_iteration_cap_stops_runaway(self):
+        quotas = dict(self.SMALL_QUOTAS, **{"AI-native": 100})
+        with patch.object(company_agent_mod, "TRACK_QUOTAS", quotas), \
+             patch.object(company_agent_mod, "MAX_TOTAL", 3), \
+             patch.object(company_agent_mod, "BATCH_SIZE", 1), \
+             patch.object(company_agent_mod, "discover_ai_companies") as mock_disc:
+            counter = iter(range(1000))
+            mock_disc.side_effect = lambda *a, **k: self._batch(
+                [f"Co{next(counter)}"])
+            added = company_agent_mod.run_discovery_loop(
+                self.path, "tavily-key", self.summary)
+        # MAX_TOTAL // BATCH_SIZE = 3 iterations, then the cap fires.
+        self.assertEqual(mock_disc.call_count, 3)
+        self.assertEqual(added, 3)
+        self.assertTrue(any("iteration cap" in n for n in self.summary.notes))
+
+    def test_main_wires_discovery_loop(self):
+        import inspect
+        source = inspect.getsource(company_agent_mod.main)
+        self.assertIn("run_discovery_loop", source)
+        self.assertLess(source.index("run_discovery_loop"),
+                        source.index("run_phase_1_5"))
+
+
+# ── Blank-Track enrichment ───────────────────────────────────────────────────
+class TestRunEnrichMissingTracks(unittest.TestCase):
+    """run_enrich_missing_tracks fills only blank/N-A Track cells: confident
+    classifications are written, unconfident/missing ones stay blank for the
+    next run, custom values are never touched, and defense legacy primes are
+    deterministically forced to Mid-large Tech."""
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.append(["FilledCo", "AI-native", "Has a track.",
+                   "https://f.co", None, None, None, None, None])
+        ws.append(["BlankCo", None, "Builds robots.",
+                   "https://b.co", None, None, None, None, None])
+        ws.append(["NaCo", "N/A", "Payments infra.",
+                   "https://n.co", None, None, None, None, None])
+        ws.append(["CustomCo", "UNMIGRATED — manual review", "Thin.",
+                   "https://c.co", None, None, None, None, None])
+        ws.append(["Boeing", None, "Aerospace prime.",
+                   "https://boeing.co", None, None, None, None, None])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _track_by_name(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_List"]
+        out = {r[0]: r[1] for r in ws.iter_rows(min_row=2, values_only=True) if r[0]}
+        wb.close()
+        return out
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_fills_blank_tracks_only(self, mock_pool):
+        mock_pool.generate_content.return_value = MagicMock(
+            text='{"classifications": ['
+                 '{"company_name": "BlankCo", "track": "Robotics",'
+                 ' "rationale": "robots", "confident": true},'
+                 '{"company_name": "NaCo", "track": "Fintech",'
+                 ' "rationale": "payments", "confident": true},'
+                 '{"company_name": "Boeing", "track": "Defense",'
+                 ' "rationale": "aerospace", "confident": true}]}')
+        with patch("agents.company_agent.time.sleep"):
+            counts = company_agent_mod.run_enrich_missing_tracks(self.path)
+        self.assertEqual(counts, {"filled": 3, "failed": 0})
+        tracks = self._track_by_name()
+        self.assertEqual(tracks["BlankCo"], "Robotics")
+        self.assertEqual(tracks["NaCo"], "Fintech")
+        # Deterministic prime forcing overrides the LLM's Defense answer.
+        self.assertEqual(tracks["Boeing"], "Mid-large Tech")
+        # Existing and custom values untouched.
+        self.assertEqual(tracks["FilledCo"], "AI-native")
+        self.assertEqual(tracks["CustomCo"], "UNMIGRATED — manual review")
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_unconfident_and_missing_stay_blank(self, mock_pool):
+        mock_pool.generate_content.return_value = MagicMock(
+            text='{"classifications": ['
+                 '{"company_name": "BlankCo", "track": "Robotics",'
+                 ' "rationale": "guess", "confident": false}]}')
+        with patch("agents.company_agent.time.sleep"):
+            counts = company_agent_mod.run_enrich_missing_tracks(self.path)
+        # BlankCo unconfident, NaCo + Boeing missing from the response.
+        self.assertEqual(counts["filled"], 0)
+        self.assertEqual(counts["failed"], 3)
+        tracks = self._track_by_name()
+        self.assertIsNone(tracks["BlankCo"])
+        self.assertEqual(tracks["NaCo"], "N/A")
+
+    @patch("agents.company_agent._KEY_POOL")
+    def test_gemini_failure_degrades_to_retry_next_run(self, mock_pool):
+        mock_pool.generate_content.side_effect = Exception("boom")
+        with patch("agents.company_agent.time.sleep"):
+            counts = company_agent_mod.run_enrich_missing_tracks(self.path)
+        self.assertEqual(counts, {"filled": 0, "failed": 3})
+        self.assertIsNone(self._track_by_name()["BlankCo"])
+
+    def test_raises_when_key_pool_none(self):
+        original = company_agent_mod._KEY_POOL
+        try:
+            company_agent_mod._KEY_POOL = None
+            with self.assertRaises(RuntimeError) as ctx:
+                company_agent_mod.run_enrich_missing_tracks(self.path)
+            self.assertIn("_KEY_POOL not initialized", str(ctx.exception))
+        finally:
+            company_agent_mod._KEY_POOL = original
+
+    def test_main_wires_track_enrich_then_sort_last(self):
+        import inspect
+        source = inspect.getsource(company_agent_mod.main)
+        self.assertIn("run_enrich_missing_tracks", source)
+        self.assertIn("sort_company_list_by_track", source)
+        self.assertLess(source.index("run_reenrich_business_focus"),
+                        source.index("run_enrich_missing_tracks"))
+        self.assertLess(source.index("run_enrich_missing_tracks"),
+                        source.index("sort_company_list_by_track"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

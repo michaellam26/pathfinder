@@ -38,7 +38,9 @@ from shared.excel_store import (
     get_scored_matches, get_tailored_match_pairs, batch_upsert_tailored_records,
     get_archived_companies, update_archive_status, unarchive_company,
     get_company_archive_info, count_valid_tpm_jobs_by_company,
-    classify_location, sort_jd_tracker_by_tier,
+    classify_location, sort_jd_tracker_by_tier, sort_company_list_by_track,
+    get_triaged_jd_urls, TRIAGE_SHEETS,
+    get_incomplete_company_rows, update_company_business_focus,
     COMPANY_HEADERS, JD_HEADERS, MATCH_HEADERS, TAILORED_HEADERS, _JD_COL,
 )
 import openpyxl
@@ -96,6 +98,43 @@ class TestGetOrCreateExcel(unittest.TestCase):
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
         for h in ["Resume ID", "JD URL", "Score", "Resume Hash", "Stage"]:
             self.assertIn(h, headers)
+
+    def test_creates_triage_sheets(self):
+        """BUG-65: fresh workbooks include the user triage tabs with JD headers."""
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        for sheet in TRIAGE_SHEETS:
+            self.assertIn(sheet, wb.sheetnames, f"Missing triage sheet: {sheet}")
+            ws = wb[sheet]
+            headers = [ws.cell(1, c).value for c in range(1, len(JD_HEADERS) + 1)]
+            self.assertEqual(headers, JD_HEADERS)
+        wb.close()
+
+    def test_migration_adds_missing_triage_sheets(self):
+        """BUG-65: existing workbooks gain missing triage tabs on next open."""
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        for sheet in TRIAGE_SHEETS:
+            del wb[sheet]
+        wb.save(self.path)
+        wb.close()
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        for sheet in TRIAGE_SHEETS:
+            self.assertIn(sheet, wb.sheetnames)
+        wb.close()
+
+    def test_existing_triage_rows_untouched(self):
+        """BUG-65: user data in triage tabs survives get_or_create_excel."""
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        wb["Skipped JD"].append(["https://x.co/jd/1", "TPM", "XCo"])
+        wb.save(self.path)
+        wb.close()
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        self.assertEqual(wb["Skipped JD"].cell(2, 1).value, "https://x.co/jd/1")
+        wb.close()
 
     def test_bug06_move_fails_raises_runtimeerror_not_recursion(self):
         """BUG-06 regression: if shutil.move fails during corrupt-file recovery,
@@ -561,6 +600,20 @@ class TestGetIncompleteJdRows(unittest.TestCase):
         incomplete = get_incomplete_jd_rows(self.path)
         urls = [r["url"] for r in incomplete]
         self.assertNotIn("https://jd.com/1", urls)
+
+    def test_incomplete_rows_carry_date_fields(self):
+        """BUG-67: retry records include the row's Posted Date + Date Flag so
+        the retry rewrite can preserve them."""
+        jd_json = json.dumps({
+            "job_title": "TPM", "company": "DateCo", "location": "N/A",
+            "requirements": [], "key_responsibilities": [],
+            "posted_date": "2026-07-01",
+        })
+        upsert_jd_record(self.path, "https://jd.com/dated", jd_json, "h")
+        incomplete = get_incomplete_jd_rows(self.path)
+        rec = next(r for r in incomplete if r["url"] == "https://jd.com/dated")
+        self.assertEqual(rec["posted_date"], "2026-07-01")
+        self.assertIn("date_flag", rec)
 
     def test_missing_location_returned(self):
         jd_json = json.dumps({
@@ -2906,6 +2959,171 @@ class TestFreshnessTierXorDateFlag(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.remove(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestGetIncompleteCompanyRows(unittest.TestCase):
+    """BUG-69: detect Company_List rows with blank/N-A Business Focus."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+        upsert_companies(self.path, [
+            {"company_name": "FullCo", "ai_domain": "AI-native",
+             "business_focus": "Builds AI tools.", "career_url": "https://f.co"},
+            {"company_name": "BlankCo", "ai_domain": "AI-native",
+             "business_focus": "", "career_url": "https://b.co"},
+            {"company_name": "NaCo", "ai_domain": "Fintech",
+             "business_focus": "N/A", "career_url": "https://n.co"},
+        ])
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_blank_and_na_rows_returned_with_row_numbers(self):
+        rows = get_incomplete_company_rows(self.path)
+        by_name = {r["name"]: r for r in rows}
+        self.assertNotIn("FullCo", by_name)
+        self.assertIn("BlankCo", by_name)
+        self.assertIn("NaCo", by_name)
+        # excel_row aligns with the sheet (row 2 = FullCo, 3 = BlankCo, 4 = NaCo)
+        self.assertEqual(by_name["BlankCo"]["excel_row"], 3)
+        self.assertEqual(by_name["NaCo"]["excel_row"], 4)
+        self.assertEqual(by_name["BlankCo"]["career_url"], "https://b.co")
+
+    def test_all_complete_returns_empty(self):
+        update_company_business_focus(self.path, 3, "Fills a gap.")
+        update_company_business_focus(self.path, 4, "Also filled.")
+        self.assertEqual(get_incomplete_company_rows(self.path), [])
+
+
+class TestUpdateCompanyBusinessFocus(unittest.TestCase):
+    """BUG-69: write Business Focus in place + refresh Updated At."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+        upsert_companies(self.path, [
+            {"company_name": "FocusCo", "ai_domain": "AI-native",
+             "business_focus": "", "career_url": "https://f.co"},
+        ])
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_updates_focus_and_timestamp(self):
+        update_company_business_focus(self.path, 2, "Builds robots for ports.")
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        self.assertEqual(ws.cell(2, 3).value, "Builds robots for ports.")
+        self.assertTrue(ws.cell(2, 5).value)  # Updated At refreshed
+        wb.close()
+        self.assertEqual(get_incomplete_company_rows(self.path), [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestGetTriagedJdUrls(unittest.TestCase):
+    """BUG-65: URLs in user triage tabs are collected for permanent exclusion."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _append(self, sheet: str, url):
+        wb = openpyxl.load_workbook(self.path)
+        wb[sheet].append([url])
+        wb.save(self.path)
+        wb.close()
+
+    def test_union_across_both_tabs(self):
+        self._append("JD_ToApply", "https://a.co/jd/1")
+        self._append("Skipped JD", "https://b.co/jd/2")
+        self.assertEqual(get_triaged_jd_urls(self.path),
+                         {"https://a.co/jd/1", "https://b.co/jd/2"})
+
+    def test_empty_tabs_return_empty_set(self):
+        self.assertEqual(get_triaged_jd_urls(self.path), set())
+
+    def test_missing_tabs_tolerated(self):
+        wb = openpyxl.load_workbook(self.path)
+        for sheet in TRIAGE_SHEETS:
+            del wb[sheet]
+        wb.save(self.path)
+        wb.close()
+        self.assertEqual(get_triaged_jd_urls(self.path), set())
+
+    def test_blank_and_whitespace_urls_skipped(self):
+        self._append("JD_ToApply", "  ")
+        self._append("Skipped JD", None)
+        self._append("Skipped JD", "https://c.co/jd/3")
+        self.assertEqual(get_triaged_jd_urls(self.path), {"https://c.co/jd/3"})
+
+    def test_url_whitespace_stripped(self):
+        self._append("JD_ToApply", "  https://d.co/jd/4 ")
+        self.assertEqual(get_triaged_jd_urls(self.path), {"https://d.co/jd/4"})
+
+
+class TestSortCompanyListByTrack(unittest.TestCase):
+    """sort_company_list_by_track orders rows by canonical TRACK_ORDER then
+    name; blank/custom Track values sink to the bottom; all 9 columns travel
+    with their row; count-preserving and idempotent."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        # Deliberately out of order; counters (cols 6–9) distinct per row.
+        ws.append(["Zeta", "Fintech", "f", "https://z.co", "2026-01-01", 5, 3, 1, "No"])
+        ws.append(["CustomCo", "SomethingElse", "c", "https://c.co", "2026-01-01", 9, 9, 9, "No"])
+        ws.append(["Beta", "AI-native", "b", "https://b.co", "2026-01-01", 2, 1, 0, "No"])
+        ws.append(["BlankCo", None, "n", "https://n.co", "2026-01-01", 7, 7, 7, "Yes"])
+        ws.append(["alpha", "AI-native", "a", "https://a.co", "2026-01-01", 1, 0, 0, "No"])
+        ws.append(["Delta", "Defense", "d", "https://d.co", "2026-01-01", 4, 2, 0, "No"])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _rows(self):
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_List"]
+        rows = [list(r) for r in ws.iter_rows(min_row=2, values_only=True)
+                if any(v not in (None, "") for v in r)]
+        wb.close()
+        return rows
+
+    def test_sorts_by_track_order_then_name(self):
+        n = sort_company_list_by_track(self.path)
+        self.assertEqual(n, 6)
+        names = [r[0] for r in self._rows()]
+        # AI-native (alpha, Beta — case-insensitive), Fintech, Defense,
+        # then unknown tracks last (BlankCo, CustomCo by name).
+        self.assertEqual(names, ["alpha", "Beta", "Zeta", "Delta",
+                                 "BlankCo", "CustomCo"])
+
+    def test_all_columns_travel_with_row(self):
+        sort_company_list_by_track(self.path)
+        rows = {r[0]: r for r in self._rows()}
+        self.assertEqual(rows["Zeta"][5:9], [5, 3, 1, "No"])
+        self.assertEqual(rows["BlankCo"][5:9], [7, 7, 7, "Yes"])
+        self.assertEqual(rows["BlankCo"][3], "https://n.co")
+
+    def test_count_preserved_and_idempotent(self):
+        n1 = sort_company_list_by_track(self.path)
+        first = self._rows()
+        n2 = sort_company_list_by_track(self.path)
+        self.assertEqual((n1, n2), (6, 6))
+        self.assertEqual(first, self._rows())
+        self.assertEqual(count_company_rows(self.path), 6)
 
 
 if __name__ == "__main__":

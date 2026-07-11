@@ -49,23 +49,38 @@ PathFinder is a multi-agent AI system for TPM job seekers, consisting of four in
 
 **Internal flow**:
 ```
-1. Read existing companies from Excel (Company_List + Company_Without_TPM) → build exclusion list
-2. Tavily batch search (7 queries covering 4 categories)
-3. Gemini LLM extracts company info (name, domain, business description), does not generate URLs
-4. Per-company multi-strategy Career URL finding:
-     ① KNOWN_CAREER_URLS hardcoded → ② Tavily ATS-targeted search
-     → ③ Tavily general search → ④ Greenhouse/Lever slug probing → ⑤ Homepage crawling
-5. Companies without a found URL are skipped (not written)
-6. Upsert company data to Company_List
-7. Phase 1.5: Probe and upgrade non-ATS URLs → write back. Also detects
-     manually-inserted rows (Company Name + AI Domain present, Career URL
-     blank) and runs the full find_career_url pipeline to backfill the URL.
+1. Discovery loop (run_discovery_loop) — repeats until every track bucket is
+   at quota (500 total), a batch yields nothing new (Tavily quota exhausted /
+   query-pool convergence), or the MAX_TOTAL/BATCH_SIZE iteration cap fires.
+   Per iteration:
+     a. Re-read existing companies (Company_List + Company_Without_TPM) → exclusion list
+     b. compute_need_by_track → allocate_batch (≤ BATCH_SIZE across open buckets)
+     c. Tavily batch search (14 track-biased queries)
+     d. Gemini LLM extracts company info (name, track, business focus), does not generate URLs
+     e. Deterministic bucket rules (defense-prime exclusion, quota trim)
+     f. Per-company multi-strategy Career URL finding:
+          ① KNOWN_CAREER_URLS hardcoded → ② Tavily ATS-targeted search
+          → ③ Tavily general search → ④ Greenhouse/Lever/Ashby/Workable slug probing
+          → ⑤ Homepage crawling
+        Companies without a found URL are skipped (not written)
+     g. Upsert batch to Company_List
+2. Phase 1.5: Probe and upgrade non-ATS URLs → write back. Also detects
+     manually-inserted rows (Company Name present, Career URL blank) and
+     runs the full find_career_url pipeline to backfill the URL.
+3. Business Focus re-enrich (BUG-69): fill blank/N-A Business Focus cells.
+4. Track enrich (run_enrich_missing_tracks): fill blank Track cells via the
+     shared batched Gemini classifier; unconfident rows stay blank for retry;
+     custom values (incl. "UNMIGRATED — manual review") untouched.
+5. Sort Company_List by Track (sort_company_list_by_track, canonical
+     TRACK_ORDER; unknown tracks sink last). Always the final step — earlier
+     steps write by captured excel_row, which sorting invalidates.
 ```
 
 **Key constants**:
-- `MAX_TOTAL = 200` (max total companies)
-- `BATCH_SIZE = 50` (max new additions per run)
-- Search distribution: Large tech 50% / AI startups 25% / AI infrastructure 15% / Large model labs 10%
+- `MAX_TOTAL = 500` (sum of per-track quotas, `TRACK_QUOTAS`)
+- `BATCH_SIZE = 50` (new companies per discovery-loop iteration)
+- `TRACK_ORDER` (`shared/config.py`): canonical 6-bucket order shared by
+  company_agent and the excel_store sorter
 
 ---
 
@@ -216,6 +231,7 @@ Phase 3 — Assemble + write:
 | `JD_Tracker` | JD URL | JD URL, Job Title, Company, Location, Salary, Requirements, Additional Qualifications, Responsibilities, **Job Domain** (AI/Robotics/Fintech/Space/Defense — PRJ-004, replaces Is AI TPM), Updated At, MD Hash, Data Quality, **ATS Keywords** (8-15 per JD, extracted once at ingest — PRJ-002), **Sort Tier** (combined 1–6 freshness×region index, 9 = unknown/aged/other sink — PRJ-004, replaces Location Tier), **Posted Date, Freshness Tier, Min YoE, YoE Flag, Work-Auth Status, Date Flag** (PRJ-004) |
 | `Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Score, Strengths, Gaps, Reason, Updated At, Resume Hash, Stage, **ATS Coverage %, Recruiter Score, HM Score, ATS Missing** (PRJ-002) |
 | `Tailored_Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Job Title, Company, Original Score, Tailored Score, Score Delta, Tailored Resume Path, Optimization Summary, Updated At, Resume Hash, Regression, **Original ATS, Tailored ATS, ATS Delta, Original Recruiter, Tailored Recruiter, Recruiter Delta, Original HM, Tailored HM, HM Delta** (PRJ-002), **Last Written Hash** (sha256 of last-written .md — used by optimizer to detect user hand-edits) |
+| `JD_ToApply` / `Skipped JD` | JD URL | **User triage tabs (BUG-65, `TRIAGE_SHEETS`)** — same columns as JD_Tracker. User-owned: the user moves reviewed JD_Tracker rows here; `get_triaged_jd_urls()` feeds a permanent exclusion so these URLs are never re-scraped or re-added. Pipeline never writes/deletes rows here (auto-creates the empty tabs only). ⚠️ Renaming the tabs disables the exclusion. |
 
 ### Key Design
 
@@ -232,11 +248,11 @@ Phase 3 — Assemble + write:
 
 | Service | Purpose | Auth | Key Limitations |
 |---------|---------|------|-----------------|
-| Tavily API | AI company web search, Career URL search | `TAVILY_API_KEY` | Limited free quota |
+| Tavily API | AI company web search, Career URL search, posting-date backfill | `TAVILY_API_KEY` + optional `TAVILY_API_KEY_2` | Limited free quota. `shared/tavily_pool.py` (BUG-70) rotates keys on 402/429/"usage limit"; when all keys are exhausted it prints one visible warning and every call raises `TavilyQuotaExhausted` (message contains "429"/"quota" so BUG-44 call-site abort checks work unchanged — search has no free fallback). Non-quota errors re-raise to the call site. |
 | Google Gemini (`gemini-3.1-flash-lite`) | Company extraction, JD structuring, coarse screening, fine evaluation | `GEMINI_API_KEY` / `GEMINI_API_KEY_2` | Supports multi-key rotation; 13 RPM rate control |
 | Greenhouse Public API | ATS job listings | No auth required | Public endpoint |
 | Lever Public API | ATS job listings | No auth required | Public endpoint |
-| Firecrawl | Web crawling/Map | `FIRECRAWL_API_KEY` | Has quota, retry on 429 |
+| Firecrawl | Web crawling/Map | `FIRECRAWL_API_KEY` + optional `FIRECRAWL_API_KEY_2` | Credit quota. `shared/firecrawl_pool.py` (BUG-68) rotates keys on 402/429; when all keys are exhausted it prints one visible warning and all calls return None instantly (callers fall back to crawl4ai/requests). Non-quota errors re-raise to the call site. |
 | Ashby Public API | ATS job listings (added in REQ-058) | No auth required | Public endpoint: `https://api.ashbyhq.com/posting-api/job-board/{slug}` |
 | Crawl4AI + Playwright | JS-rendering crawler | None | Async only, requires local Chromium |
 
@@ -339,6 +355,7 @@ pathfinder/
 │   ├── __init__.py
 │   ├── excel_store.py         # Unified Excel persistence layer
 │   ├── gemini_pool.py         # Gemini API key rotation base class (client caching, round-robin, thread-safe)
+│   ├── firecrawl_pool.py      # Firecrawl key pool — 402/429 rotation + loud exhaustion warning (BUG-68)
 │   ├── rate_limiter.py        # Token-bucket async rate limiter
 │   ├── config.py              # Shared constants (MODEL, AUTO_ARCHIVE_THRESHOLD)
 │   ├── prompts.py             # System prompts (RECRUITER, HM, TAILOR)
@@ -418,5 +435,6 @@ pathfinder/
 | v1.4 | 2026-03-16 | Comprehensive code audit fixing 55 bugs (BUG-01~55); Job Agent enhancements: Ashby upgraded to API_ATS (REQ-058), soft 404 hardening + JD positive validation (REQ-059), JD field completeness grading (REQ-060), Workday URL format expansion (REQ-061); ATS declarative routing table refactoring (REQ-062); auto-archiving companies with no TPM positions (REQ-063); `shared/gemini_pool.py` refactored to unified base class (`_GeminiKeyPoolBase`) with client caching, round-robin rotation, thread safety; `shared/excel_store.py` added `_JD_COL` dynamic column mapping and 5 archive management functions; JD_Tracker schema added Requirements/Additional Qualifications/Data Quality columns; Company_List added No TPM Count/Auto Archived columns. Tests grew from ~120 to 485. | Comprehensive code quality and robustness improvement; ATS extensibility; data quality observability |
 | v1.5 | 2026-03-17 | Added Observability Agent (run reporting, quality drift detection, anomaly alerting) and Cost Agent (token usage estimation, quota monitoring, cost optimization recommendations). Custom Agents grew from 9 to 11. | Runtime quality monitoring and cost governance capabilities specific to AI projects, filling gaps in traditional SDLC for AI dimensions |
 | v1.6 | 2026-04-28 | **PRJ-002: 3-Dimension Scoring**. Restructured the resume-fit scoring pipeline from a single LLM-derived "fit score" into three parallel dimensions: ATS Coverage (deterministic, `shared/ats_matcher.py`), Recruiter Score (Gemini, was COARSE), HM Score (Gemini, was FINE). New `JobDetails.ats_keywords` field; `Match_Results` +4 cols; `Tailored_Match_Results` +9 cols (auto-migrated). Optimizer rescores all 3 dims; regression flag now means HM Delta < 0 only (was: legacy single-score delta). Tests 619 → 718 (+99 across 5 sequential PRs). Plus P0 follow-ups: P0-9 Stage 2 UNION selection, P0-10 single-JD rescore parity, P0-11 Gemini transient backoff retry, P0-12 persisted Regression column. | Existing single-score Score Delta conflated keyword gains with semantic strength; users had no signal on which one moved. Mapping each dimension to one real-world hiring filter (ATS keyword search → recruiter scan → HM deep eval) makes the system's output match the actual North American funnel. |
-| v1.7 (current) | 2026-05-20 | **PRJ-003 + operational hardening**. (a) PDF resume I/O: `shared/resume_io.py` centralizes `load_resume` across match + optimizer; supports `.md/.txt/.pdf` input via `pdfplumber` (deterministic, layout-aware, cached at `profile/.cache/`); every tailored `.md` also rendered as a sibling `.pdf` via WeasyPrint with ATS-safe CSS (`templates/resume.css`). (b) Discovery coverage: Workable as first-class ATS, LinkedIn/VC-portfolio URL unwrapper, Workday-via-Tavily fallback with strict subdomain-equality guard (26 cos recovered). (c) Manual-entry override: `run_phase_1_5` backfills Career URL on hand-inserted `Company_List` rows. (d) Tailored-resume user-edit protection via sha256 stored in `Tailored_Match_Results.Last Written Hash`. (e) `JD_Tracker` auto-sort by Location Tier (Greater Seattle / Remote / Other) with new `Location Tier` column. (f) launchd-based daily pipeline runner under `scripts/`. (g) Gemini model name → GA (`gemini-3.1-flash-lite`, drop `-preview`). Tests: 749 → 859 (+110). | PRJ-003 closes the resume-format gap (real submissions are PDFs, not Markdown). Manual-entry + URL unwrapper unblocks the user dropping in a target list without per-company ATS hunting. User-edit protection prevents the daily launchd runner from silently clobbering hand-polished resumes. Location-tier sort matches the user's actual review workflow. |
+| v1.7 | 2026-05-20 | **PRJ-003 + operational hardening**. (a) PDF resume I/O: `shared/resume_io.py` centralizes `load_resume` across match + optimizer; supports `.md/.txt/.pdf` input via `pdfplumber` (deterministic, layout-aware, cached at `profile/.cache/`); every tailored `.md` also rendered as a sibling `.pdf` via WeasyPrint with ATS-safe CSS (`templates/resume.css`). (b) Discovery coverage: Workable as first-class ATS, LinkedIn/VC-portfolio URL unwrapper, Workday-via-Tavily fallback with strict subdomain-equality guard (26 cos recovered). (c) Manual-entry override: `run_phase_1_5` backfills Career URL on hand-inserted `Company_List` rows. (d) Tailored-resume user-edit protection via sha256 stored in `Tailored_Match_Results.Last Written Hash`. (e) `JD_Tracker` auto-sort by Location Tier (Greater Seattle / Remote / Other) with new `Location Tier` column. (f) launchd-based daily pipeline runner under `scripts/`. (g) Gemini model name → GA (`gemini-3.1-flash-lite`, drop `-preview`). Tests: 749 → 859 (+110). | PRJ-003 closes the resume-format gap (real submissions are PDFs, not Markdown). Manual-entry + URL unwrapper unblocks the user dropping in a target list without per-company ATS hunting. User-edit protection prevents the daily launchd runner from silently clobbering hand-polished resumes. Location-tier sort matches the user's actual review workflow. |
+| v2.0 (current) | 2026-07-09 | **Excel-review follow-up batch** (BUG-62, BUG-65~69 + T16). Persistence: `TRIAGE_SHEETS` user triage tabs (`JD_ToApply`/`Skipped JD`) with permanent URL exclusion via `get_triaged_jd_urls`; `get_incomplete_company_rows`/`update_company_business_focus`. job_agent: write-time gates factored into `_gate_and_finalize` and applied on every staging path (custom scrapers + retry — closes the India/Europe geo leak); extraction prompt captures ALL locations verbatim; shared `_parse_jsonld_jobposting` consolidates 4 JSON-LD blocks and adds `datePosted` recovery (list-meta → scrape stash → plain-GET → Tavily → keep+flag); retry preserves Posted Date; Google Careers discovery adapter `_fetch_google_jobs` (server-rendered `AF_initDataCallback` payload — design.md's v3 API is dead; prefetched JD text, zero Firecrawl); empty-company extractions write JSON-ERROR audit rows (BUG-62). New `shared/firecrawl_pool.py` replaces per-call-site `FirecrawlApp` construction (`fc_key` threading removed). company_agent: `run_reenrich_business_focus` self-heal step after Phase 1.5. Dead `_is_us*`/pycountry code removed — `classify_region` is the sole live geo filter. | User's post-launch manual review: triage work must be final (not undone by the next run); India/Europe rows and blank posted dates were data-quality bugs; Firecrawl credits ran out invisibly; Google (a target company) was undiscoverable. |
 | v1.9 | 2026-07-07 | **PRJ-004: Multi-Track Expansion**. Company universe: 6 AI buckets/200 cap → 6-track taxonomy at 500 (AI-native/Mid-large Tech/Robotics/Fintech/Space/Defense, per-bucket quotas + grandfathering, `--migrate-tracks` one-time re-bucketing). Job filtering: AI-purity layer → 5-track domain classifier with big-tech sub-org anchors; new write-time gates (YoE [stated min ≤3/≥12 skip], global work-auth screen, ≤14-day pre-scrape freshness on parseable dates); geo tightened to Seattle/CA/TX/US-Remote. JD_Tracker: Job Domain + 6 new columns, combined 1–6 Sort Tier recomputed at each sort. Scrapers: Workday pagination (uncapped), Firecrawl map uncapped, Amazon.jobs adapter with prefetched JD text (zero crawler fallback), list_meta generalizes workday_meta. Match layer: 5 per-track Recruiter/HM prompt pairs + tailor emphasis, routing by Job Domain in both match_agent and resume_optimizer, per-track context caches, REQ-052 byte identity preserved per track. Ops: launchd failure markers, RunSummary token-usage notes. Tests 859 → 945. | User's updated thesis: six tracks with 10-year runway; winning play is early companies + early divisions of incumbents. Freshness is first-class (≤15-day postings only); seniority judged by JD content (YoE) not title; ITAR/clearance screen for a green-card holder. |

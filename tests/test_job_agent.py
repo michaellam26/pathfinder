@@ -109,42 +109,17 @@ import agents.job_agent as job_agent_mod
 job_agent_mod._RETRY_BASE_SLEEP_SECS = 0
 
 
+class _FakeFcPool:
+    """BUG-68 test double for shared.firecrawl_pool.FirecrawlKeyPool —
+    captures scrape/map kwargs like the old FirecrawlApp patches did."""
+
+    def __init__(self, scrape_return=None, map_return=None, exhausted=False):
+        self.exhausted = exhausted
+        self.scrape = MagicMock(return_value=scrape_return)
+        self.map = MagicMock(return_value=map_return)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-class TestPycountryFallback(unittest.TestCase):
-    """BUG-13: pycountry ImportError must not prevent module load."""
-
-    def test_fallback_covers_all_50_states_plus_dc(self):
-        from agents.job_agent import _US_STATES_FALLBACK
-        self.assertEqual(len(_US_STATES_FALLBACK), 51)  # 50 states + DC
-
-    def test_fallback_includes_ambiguous_state_codes(self):
-        """Codes that look like common words (in/or/de/me/ok) must be present."""
-        from agents.job_agent import _US_STATES_FALLBACK
-        codes = {code for _, code in _US_STATES_FALLBACK}
-        for code in ("in", "or", "de", "me", "ok"):
-            self.assertIn(code, codes, f"Fallback missing state code '{code}'")
-
-    def test_module_loads_when_pycountry_raises_import_error(self):
-        """Simulate pycountry absent: _build_us_index should raise, fallback kicks in."""
-        import agents.job_agent as mod
-        original_names = mod._US_STATE_NAMES
-        original_codes = mod._US_STATE_CODES
-        try:
-            with patch("agents.job_agent._build_us_index", side_effect=ImportError("no pycountry")):
-                # Manually trigger the same logic as module init
-                try:
-                    mod._build_us_index()
-                    self.fail("Expected ImportError")
-                except ImportError:
-                    fallback_names = {name for name, _ in mod._US_STATES_FALLBACK}
-                    fallback_codes = {code for _, code in mod._US_STATES_FALLBACK}
-                self.assertIn("california", fallback_names)
-                self.assertIn("ca", fallback_codes)
-        finally:
-            mod._US_STATE_NAMES = original_names
-            mod._US_STATE_CODES = original_codes
-
-
 class TestCachePath(unittest.TestCase):
 
     def test_returns_string_path(self):
@@ -454,25 +429,24 @@ class TestMicrosoftJdScraper(unittest.TestCase):
         self.assertEqual(result[0], "microsoft")
 
     def test_scrape_microsoft_jd_uses_firecrawl_with_only_main_content(self):
-        # Firecrawl FirecrawlApp.scrape must be called with only_main_content=True
-        # so the sidebar/nav is stripped (the audit's actual root cause).
+        # Pool scrape must be called with only_main_content=True so the
+        # sidebar/nav is stripped (the audit's actual root cause).
         from agents.job_agent import _scrape_microsoft_jd
-        fake_app = MagicMock()
-        fake_app.scrape.return_value = MagicMock(markdown="x" * 500)
-        with patch("firecrawl.FirecrawlApp", return_value=fake_app):
-            result = _scrape_microsoft_jd("https://jobs.careers.microsoft.com/global/en/job/1",
-                                          fc_key="fc-key")
+        pool = _FakeFcPool(scrape_return=MagicMock(markdown="x" * 500))
+        with patch("agents.job_agent._FC_POOL", pool):
+            result = _scrape_microsoft_jd("https://jobs.careers.microsoft.com/global/en/job/1")
         self.assertTrue(len(result) > 200)
-        scrape_kwargs = fake_app.scrape.call_args.kwargs
+        scrape_kwargs = pool.scrape.call_args.kwargs
         self.assertTrue(scrape_kwargs.get("only_main_content"))
 
-    def test_scrape_microsoft_jd_returns_empty_without_fc_key(self):
-        # No fc_key + Microsoft pages have no JSON-LD → returns "".
+    def test_scrape_microsoft_jd_returns_empty_without_pool(self):
+        # No Firecrawl pool + Microsoft pages have no JSON-LD → returns "".
         # Generic browser scraper picks up downstream.
         from agents.job_agent import _scrape_microsoft_jd
-        with patch("agents.job_agent.requests.get") as mock_get:
+        with patch("agents.job_agent._FC_POOL", None), \
+             patch("agents.job_agent.requests.get") as mock_get:
             mock_get.return_value = MagicMock(status_code=200, text="<html>no json-ld</html>")
-            self.assertEqual(_scrape_microsoft_jd("https://jobs.careers.microsoft.com/x", ""), "")
+            self.assertEqual(_scrape_microsoft_jd("https://jobs.careers.microsoft.com/x"), "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,65 +512,6 @@ class TestPydanticSchemas(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class TestIsUsSegment(unittest.TestCase):
-    """Tests for _is_us_segment — especially BUG-03 false positives."""
-
-    def setUp(self):
-        from agents.job_agent import _is_us_segment
-        self._fn = _is_us_segment
-
-    # ── Should be identified as US ────────────────────────────────────────────
-    def test_full_state_name(self):
-        self.assertTrue(self._fn("California"))
-
-    def test_city_comma_state_code(self):
-        # "Seattle, WA" — canonical City, ST format
-        self.assertTrue(self._fn("Seattle, CA"))
-
-    def test_standalone_state_code(self):
-        # segment is only the 2-letter code
-        self.assertTrue(self._fn("ca"))
-
-    def test_explicit_us(self):
-        self.assertTrue(self._fn("US"))
-
-    def test_explicit_usa(self):
-        self.assertTrue(self._fn("USA"))
-
-    def test_remote(self):
-        self.assertTrue(self._fn("Remote"))
-
-    def test_us_metro_area(self):
-        self.assertTrue(self._fn("San Francisco"))
-
-    # ── BUG-03: common words that happen to be state codes ────────────────────
-    def test_preposition_in_not_us(self):
-        # "in" = Indiana code; must NOT match "Senior Engineer in London"
-        self.assertFalse(self._fn("Senior Engineer in London"))
-
-    def test_conjunction_or_not_us(self):
-        # "or" = Oregon code; must NOT match "Full-time or Contract"
-        self.assertFalse(self._fn("Full-time or Contract"))
-
-    def test_de_not_us(self):
-        # "de" = Delaware code; must NOT match "Berlin de"
-        self.assertFalse(self._fn("Berlin de"))
-
-    def test_me_not_us(self):
-        # "me" = Maine code; must NOT match ordinary "me" usage
-        self.assertFalse(self._fn("Contact me for details"))
-
-    def test_ok_not_us(self):
-        # "ok" = Oklahoma code; must NOT match "ok to discuss"
-        self.assertFalse(self._fn("ok to discuss"))
-
-    def test_non_us_city(self):
-        self.assertFalse(self._fn("London"))
-
-    def test_non_us_country(self):
-        self.assertFalse(self._fn("Germany"))
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 class TestScrapeTeslaJdUsesFormats(unittest.TestCase):
     """BUG-15: _scrape_tesla_jd must pass formats=["markdown"] to Firecrawl v2 scrape()."""
@@ -604,100 +519,83 @@ class TestScrapeTeslaJdUsesFormats(unittest.TestCase):
     def test_scrape_call_includes_formats_markdown(self):
         from agents.job_agent import _scrape_tesla_jd
 
-        captured = {}
+        m = MagicMock()
+        m.markdown = "# Job\nSome content here that is long enough to pass this test." + "x" * 200
+        pool = _FakeFcPool(scrape_return=m)
+        with patch("agents.job_agent._FC_POOL", pool):
+            _scrape_tesla_jd("https://www.tesla.com/careers/search/job/fake-123")
 
-        class FakeFirecrawlApp:
-            def __init__(self, api_key):
-                pass
-            def scrape(self, url, **kwargs):
-                captured["kwargs"] = kwargs
-                m = MagicMock()
-                m.markdown = "# Job\nSome content here that is long enough to pass."
-                return m
-
-        with patch("firecrawl.FirecrawlApp", FakeFirecrawlApp):
-            _scrape_tesla_jd("https://www.tesla.com/careers/search/job/fake-123", fc_key="test-key")
-
-        self.assertIn("formats", captured.get("kwargs", {}),
+        kwargs = pool.scrape.call_args.kwargs
+        self.assertIn("formats", kwargs,
                       "scrape() must be called with formats= argument")
-        self.assertIn("markdown", captured["kwargs"]["formats"],
+        self.assertIn("markdown", kwargs["formats"],
                       "formats must include 'markdown'")
 
 
 class TestBug32TeslaFirecrawlImport(unittest.TestCase):
-    """BUG-32: _scrape_tesla_jd must import FirecrawlApp, not Firecrawl."""
+    """BUG-32/BUG-68: Tesla scrape goes through the Firecrawl key pool, whose
+    client construction uses FirecrawlApp (not the bare 'Firecrawl' class)."""
 
-    def test_imports_firecrawl_app_not_firecrawl(self):
-        """Verify _scrape_tesla_jd uses FirecrawlApp (correct class name)."""
+    def test_pool_imports_firecrawl_app_not_firecrawl(self):
         import inspect
-        from agents.job_agent import _scrape_tesla_jd
-        source = inspect.getsource(_scrape_tesla_jd)
+        from shared.firecrawl_pool import FirecrawlKeyPool
+        source = inspect.getsource(FirecrawlKeyPool._get_client)
         self.assertIn("FirecrawlApp", source,
-                      "_scrape_tesla_jd must import FirecrawlApp")
+                      "FirecrawlKeyPool must import FirecrawlApp")
         self.assertNotIn("import Firecrawl\n", source,
-                         "_scrape_tesla_jd must not import bare 'Firecrawl'")
+                         "FirecrawlKeyPool must not import bare 'Firecrawl'")
 
-    def test_firecrawl_app_called_successfully(self):
-        """Verify FirecrawlApp can be instantiated and scrape called."""
+    def test_pool_scrape_called_successfully(self):
         from agents.job_agent import _scrape_tesla_jd
-
-        class FakeFirecrawlApp:
-            def __init__(self, api_key):
-                self.api_key = api_key
-            def scrape(self, url, **kwargs):
-                m = MagicMock()
-                m.markdown = "# Tesla Job\n" + "x" * 300
-                return m
-
-        with patch("firecrawl.FirecrawlApp", FakeFirecrawlApp):
-            result = _scrape_tesla_jd("https://www.tesla.com/careers/search/job/test-32", fc_key="key-32")
-
+        m = MagicMock()
+        m.markdown = "# Tesla Job\n" + "x" * 300
+        pool = _FakeFcPool(scrape_return=m)
+        with patch("agents.job_agent._FC_POOL", pool):
+            result = _scrape_tesla_jd("https://www.tesla.com/careers/search/job/test-32")
         self.assertIsNotNone(result)
         self.assertIn("Tesla Job", result)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 class TestFirecrawlMapRetryLogic(unittest.TestCase):
-    """BUG-17: transient network errors must be retried, not immediately abandoned."""
+    """BUG-17/BUG-68: non-quota transient errors are retried (3 attempts);
+    quota errors are the pool's job and end the loop immediately."""
 
     def test_network_error_retries_not_immediate_empty(self):
-        """Non-429 errors should be retried (up to 3 attempts) not immediately return []."""
+        """Non-quota errors should be retried (up to 3 attempts) not immediately return []."""
         from agents.job_agent import _firecrawl_map
 
-        call_count = [0]
-
-        class FakeFirecrawlApp:
-            def __init__(self, api_key):
-                pass
-            def map(self, **kwargs):
-                call_count[0] += 1
-                raise ConnectionError("Network timeout")
-
-        with patch("firecrawl.FirecrawlApp", FakeFirecrawlApp), \
+        pool = _FakeFcPool()
+        pool.map = MagicMock(side_effect=ConnectionError("Network timeout"))
+        with patch("agents.job_agent._FC_POOL", pool), \
              patch("agents.job_agent.time.sleep"):
-            result = _firecrawl_map("https://company.com/jobs", "fc-key")
+            result = _firecrawl_map("https://company.com/jobs")
 
         self.assertEqual(result, [])
-        self.assertEqual(call_count[0], 3, "Should have attempted 3 times before giving up")
+        self.assertEqual(pool.map.call_count, 3,
+                         "Should have attempted 3 times before giving up")
 
-    def test_rate_limit_uses_long_sleep(self):
-        """429 rate-limit errors should sleep longer than generic network errors."""
+    def test_pool_exhaustion_returns_empty_without_retries(self):
+        """BUG-68: once the pool reports quota exhaustion (None), no retry
+        delays are burned — the map gives up immediately."""
         from agents.job_agent import _firecrawl_map
 
+        pool = _FakeFcPool(map_return=None)  # pool signals exhausted mid-call
         sleep_calls = []
+        with patch("agents.job_agent._FC_POOL", pool), \
+             patch("agents.job_agent.time.sleep",
+                   side_effect=lambda s: sleep_calls.append(s)):
+            result = _firecrawl_map("https://company.com/jobs")
+        self.assertEqual(result, [])
+        self.assertEqual(pool.map.call_count, 1)
+        self.assertEqual(sleep_calls, [])
 
-        class FakeFirecrawlApp:
-            def __init__(self, api_key):
-                pass
-            def map(self, **kwargs):
-                raise Exception("Rate limit exceeded 429")
-
-        with patch("firecrawl.FirecrawlApp", FakeFirecrawlApp), \
-             patch("agents.job_agent.time.sleep", side_effect=lambda s: sleep_calls.append(s)):
-            _firecrawl_map("https://company.com/jobs", "fc-key")
-
-        self.assertTrue(all(s >= 30 for s in sleep_calls),
-                        f"429 sleep must be >= 30s, got {sleep_calls}")
+    def test_exhausted_pool_short_circuits(self):
+        from agents.job_agent import _firecrawl_map
+        pool = _FakeFcPool(exhausted=True)
+        with patch("agents.job_agent._FC_POOL", pool):
+            self.assertEqual(_firecrawl_map("https://company.com/jobs"), [])
+        pool.map.assert_not_called()
 
 
 class TestBug37FirecrawlMapNotBlocking(unittest.TestCase):
@@ -724,18 +622,14 @@ class TestBug43GoogleJdScrapeParams(unittest.TestCase):
 
     def test_scrape_google_jd_includes_formats(self):
         from agents.job_agent import _scrape_google_jd
-        captured = {}
-        class FakeApp:
-            def __init__(self, api_key): pass
-            def scrape(self, url, **kwargs):
-                captured.update(kwargs)
-                m = MagicMock()
-                m.markdown = "# Google Job\n" + "x" * 300
-                return m
-        with patch("firecrawl.FirecrawlApp", FakeApp):
-            _scrape_google_jd("https://www.google.com/about/careers/job/123", fc_key="k")
-        self.assertIn("formats", captured)
-        self.assertIn("markdown", captured["formats"])
+        m = MagicMock()
+        m.markdown = "# Google Job\n" + "x" * 300
+        pool = _FakeFcPool(scrape_return=m)
+        with patch("agents.job_agent._FC_POOL", pool):
+            _scrape_google_jd("https://www.google.com/about/careers/job/123")
+        kwargs = pool.scrape.call_args.kwargs
+        self.assertIn("formats", kwargs)
+        self.assertIn("markdown", kwargs["formats"])
 
 
 class TestBug42QuotaExhaustionWarning(unittest.TestCase):
@@ -824,7 +718,7 @@ class TestDiscoverJobsWorkdayFallback(unittest.IsolatedAsyncioTestCase):
              patch("agents.job_agent._tpm_filter", side_effect=lambda lst: crawled_tpm if lst == [] else []), \
              patch("agents.job_agent._crawl_page", new=AsyncMock(return_value=[])):
             # _tpm_filter returns [] for API jobs → should fall back to _crawl_page
-            result = await discover_jobs(workday_url, "fc-key", MagicMock())
+            result = await discover_jobs(workday_url, MagicMock())
         # After fallback, _tpm_filter([]) via crawl path is called; result comes from crawler path
         # The key assertion: _crawl_page was called (not skipped)
         # Since _tpm_filter is side-effected to return [] for non-empty lists,
@@ -842,7 +736,7 @@ class TestDiscoverJobsWorkdayFallback(unittest.IsolatedAsyncioTestCase):
         with patch("agents.job_agent._fetch_workday_jobs", return_value=[tpm_job]), \
              patch("agents.job_agent._tpm_filter", return_value=[tpm_job]), \
              patch("agents.job_agent._crawl_page", crawl_mock):
-            result = await discover_jobs(workday_url, "fc-key", MagicMock())
+            result = await discover_jobs(workday_url, MagicMock())
 
         self.assertEqual(result, [tpm_job])
         crawl_mock.assert_not_called()
@@ -877,10 +771,11 @@ class TestProcessCompanyNoDuplicateFetch(unittest.IsolatedAsyncioTestCase):
              patch("agents.job_agent._save_md_to_cache"), \
              patch("agents.job_agent._GEMINI_LIMITER", mock_limiter), \
              patch("agents.job_agent.extract_jd", return_value=self.GOOD_JD_JSON), \
+             patch("agents.job_agent._fetch_jsonld_posted_date", return_value=""), \
              patch("agents.job_agent.batch_upsert_jd_records", return_value=1) as mock_upsert, \
              patch("agents.job_agent.batch_update_jd_timestamps", return_value=0):
             await process_company(
-                self.ROW, {}, "/fake/path.xlsx", "fc-key",
+                self.ROW, {}, "/fake/path.xlsx",
                 asyncio.Lock(), MagicMock(),
             )
             return mock_upsert
@@ -1096,7 +991,7 @@ class TestDiscoverJobsAshbyRouting(unittest.IsolatedAsyncioTestCase):
         ]
         with patch("agents.job_agent._fetch_ashby_jobs", return_value=ashby_jobs) as mock_ashby, \
              patch("agents.job_agent._fetch_ats_jobs") as mock_ats:
-            result = await discover_jobs(ashby_url, "fc-key", MagicMock())
+            result = await discover_jobs(ashby_url, MagicMock())
         mock_ashby.assert_called_once_with(ashby_url)
         mock_ats.assert_not_called()
         self.assertEqual(len(result), 1)
@@ -1109,7 +1004,7 @@ class TestDiscoverJobsAshbyRouting(unittest.IsolatedAsyncioTestCase):
              "title": "TPM", "location": "US"},
         ]) as mock_ats, \
              patch("agents.job_agent._fetch_ashby_jobs") as mock_ashby:
-            await discover_jobs(gh_url, "fc-key", MagicMock())
+            await discover_jobs(gh_url, MagicMock())
         mock_ats.assert_called_once()
         mock_ashby.assert_not_called()
 
@@ -1118,7 +1013,7 @@ class TestDiscoverJobsAshbyRouting(unittest.IsolatedAsyncioTestCase):
         ashby_url = "https://jobs.ashbyhq.com/someco"
         with patch("agents.job_agent._fetch_ashby_jobs", return_value=[]), \
              patch("agents.job_agent._crawl_page", new=AsyncMock(return_value=[])) as mock_crawl:
-            result = await discover_jobs(ashby_url, "fc-key", MagicMock())
+            result = await discover_jobs(ashby_url, MagicMock())
         # When API returns empty, should fall through to crawler path
         self.assertIsInstance(result, list)
 
@@ -1142,7 +1037,7 @@ class TestWorkableAtsConfig(unittest.TestCase):
 
 
 class TestFormatWorkableLocation(unittest.TestCase):
-    """A′ — Workable's multi-field location collapses into _is_us-compatible string."""
+    """A′ — Workable's multi-field location collapses into a classify_region-compatible string."""
 
     def test_telecommuting_emits_remote(self):
         loc = _format_workable_location({"telecommuting": True, "city": "", "country": ""})
@@ -1164,7 +1059,7 @@ class TestFormatWorkableLocation(unittest.TestCase):
                 {"city": "Austin", "region": "Texas",         "country": "United States"},
             ],
         })
-        self.assertIn(";", loc)  # multi-location separator for _is_us
+        self.assertIn(";", loc)  # multi-location separator for classify_region
         self.assertIn("Austin", loc)
         self.assertIn("Paris", loc)
 
@@ -1271,7 +1166,7 @@ class TestDiscoverJobsWorkableRouting(unittest.IsolatedAsyncioTestCase):
         with patch("agents.job_agent._fetch_workable_jobs", return_value=jobs) as mw, \
              patch("agents.job_agent._fetch_ats_jobs") as ma, \
              patch("agents.job_agent._fetch_ashby_jobs") as mash:
-            result = await discover_jobs(url, "fc-key", MagicMock())
+            result = await discover_jobs(url, MagicMock())
         mw.assert_called_once_with(url)
         ma.assert_not_called()
         mash.assert_not_called()
@@ -1999,9 +1894,12 @@ class TestBug53FmtAddrOutsideLoop(unittest.TestCase):
     """BUG-53: _fmt_addr must be defined outside the for-block loop to avoid re-creation per iteration."""
 
     def test_fmt_addr_not_inside_loop_body(self):
-        """_fmt_addr should be defined before the loop, not inside 'for block in blocks:'."""
+        """_fmt_addr should be defined before the loop, not inside 'for block in blocks:'.
+        The JSON-LD parsing (incl. _fmt_addr) now lives in the shared
+        _parse_jsonld_jobposting helper (BUG-67 consolidation)."""
         import inspect
-        source = inspect.getsource(_scrape_workday_jd)
+        from agents.job_agent import _parse_jsonld_jobposting
+        source = inspect.getsource(_parse_jsonld_jobposting)
         # Find where _fmt_addr is defined and where the for loop starts
         lines = source.split("\n")
         fmt_addr_line = None
@@ -2142,6 +2040,84 @@ class TestRetryOneSkipsIncompleteExtraction(unittest.IsolatedAsyncioTestCase):
             job_agent_mod._GEMINI_LIMITER = original_limiter
 
 
+class TestRetryOneGates(unittest.IsolatedAsyncioTestCase):
+    """BUG-66: the incomplete-row retry path must run the same write-time
+    gates as discovery (geo / domain / YoE / work-auth) — it previously
+    bypassed all of them."""
+
+    def setUp(self):
+        self.temp_xlsx = tempfile.mktemp(suffix=".xlsx")
+        from shared.excel_store import (get_or_create_excel, upsert_companies,
+                                        batch_upsert_jd_records)
+        get_or_create_excel(self.temp_xlsx)
+        upsert_companies(self.temp_xlsx, [{
+            "company_name": "RetryTestCo",
+            "ai_domain": "AI-native",
+            "business_focus": "Testing",
+            "career_url": "https://boards.greenhouse.io/retrytestco",
+        }])
+        incomplete_jd = json.dumps({
+            "job_title": "TPM", "company": "RetryTestCo", "location": "N/A",
+            "requirements": [], "key_responsibilities": [],
+        })
+        batch_upsert_jd_records(
+            self.temp_xlsx,
+            [("https://example.com/retry-job", incomplete_jd, "oldhash")])
+
+    def tearDown(self):
+        if os.path.exists(self.temp_xlsx):
+            os.unlink(self.temp_xlsx)
+
+    async def _run_main_with_extraction(self, extracted: dict):
+        mock_limiter = MagicMock()
+        mock_limiter.acquire = AsyncMock()
+        original_limiter = job_agent_mod._GEMINI_LIMITER
+        job_agent_mod._GEMINI_LIMITER = mock_limiter
+        try:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "fake",
+                                         "FIRECRAWL_API_KEY": "fake"}), \
+                 patch("agents.job_agent.get_or_create_excel",
+                       return_value=self.temp_xlsx), \
+                 patch("agents.job_agent.process_company",
+                       new=AsyncMock(return_value=None)), \
+                 patch("agents.job_agent._route_scraper",
+                       new=AsyncMock(return_value=("# md", None))), \
+                 patch("agents.job_agent.extract_jd",
+                       return_value=json.dumps(extracted)), \
+                 patch("agents.job_agent._save_md_to_cache"), \
+                 patch("agents.job_agent._save_structured_jd_md"), \
+                 patch("agents.job_agent._fetch_jsonld_posted_date",
+                       return_value=""), \
+                 patch("agents.job_agent.batch_upsert_jd_records") as mock_upsert:
+                await job_agent_mod.main()
+                return mock_upsert
+        finally:
+            job_agent_mod._GEMINI_LIMITER = original_limiter
+
+    COMPLETE = {
+        "job_title": "Senior TPM", "company": "RetryTestCo",
+        "salary_range": "", "requirements": ["x"],
+        "additional_qualifications": [], "key_responsibilities": ["y"],
+        "job_domain": "AI", "min_yoe": 5, "work_auth": "none_stated",
+    }
+
+    async def test_out_of_region_retry_not_staged(self):
+        mock_upsert = await self._run_main_with_extraction(
+            {**self.COMPLETE, "location": "Bangalore, India"})
+        mock_upsert.assert_not_called()
+
+    async def test_work_auth_gated_retry_not_staged(self):
+        mock_upsert = await self._run_main_with_extraction(
+            {**self.COMPLETE, "location": "Seattle, WA",
+             "work_auth": "clearance_required"})
+        mock_upsert.assert_not_called()
+
+    async def test_in_region_retry_staged(self):
+        mock_upsert = await self._run_main_with_extraction(
+            {**self.COMPLETE, "location": "Seattle, WA"})
+        mock_upsert.assert_called_once()
+
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PRJ-004 T8 — Workday pagination + Firecrawl uncap (REQ-004-13, G6a)
@@ -2235,19 +2211,22 @@ class TestParseWorkdayPostedOn(unittest.TestCase):
         self.assertEqual(self._p(None), "")
         self.assertEqual(self._p("Posted recently"), "")
 
+    def test_just_posted_variants(self):
+        # BUG-67: "Just Posted" strings previously fell to "" (unknown date).
+        self.assertEqual(self._p("Just Posted"), "2026-07-07")
+        self.assertEqual(self._p("Posted Just Now"), "2026-07-07")
+
 
 class TestFirecrawlMapUncapped(unittest.TestCase):
     """REQ-004-13: the Firecrawl map call must not pass a result limit."""
 
     def test_map_called_without_limit(self):
         from agents.job_agent import _firecrawl_map
-        fake_app = MagicMock()
-        fake_app.map.return_value = {"links": []}
-        # FirecrawlApp is imported inside the function - patch at the source.
-        with patch("firecrawl.FirecrawlApp", return_value=fake_app):
-            _firecrawl_map("https://example.com/careers", "fc-key")
-        self.assertTrue(fake_app.map.called)
-        self.assertNotIn("limit", fake_app.map.call_args.kwargs,
+        pool = _FakeFcPool(map_return={"links": []})
+        with patch("agents.job_agent._FC_POOL", pool):
+            _firecrawl_map("https://example.com/careers")
+        self.assertTrue(pool.map.called)
+        self.assertNotIn("limit", pool.map.call_args.kwargs,
                          "Firecrawl map must not cap results (REQ-004-13)")
 
 
@@ -2268,18 +2247,18 @@ class TestWriteTimeGates(unittest.IsolatedAsyncioTestCase):
     }
 
     async def _run(self, overrides: dict, track="AI-native", posted_date="",
-                   check_us_location=False):
+                   label="generic"):
         import json as _json
         from agents.job_agent import _process_scraped_jd
         parsed = {**self.BASE, **overrides}
         pending, ts_only = [], []
         with patch("agents.job_agent.extract_jd", return_value=_json.dumps(parsed)), \
              patch("agents.job_agent._save_md_to_cache"), \
-             patch("agents.job_agent._save_structured_jd_md"):
+             patch("agents.job_agent._save_structured_jd_md"), \
+             patch("agents.job_agent._fetch_jsonld_posted_date", return_value=""):
             await _process_scraped_jd(
                 "https://x.co/jd", "# markdown", "TestCo", track,
-                set(), {}, pending, ts_only, "generic",
-                check_us_location=check_us_location,
+                set(), {}, pending, ts_only, label,
                 posted_date=posted_date,
             )
         return pending
@@ -2345,10 +2324,32 @@ class TestWriteTimeGates(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unknown posted date", row["date_flag"])
 
     async def test_out_of_region_generic_jd_skipped(self):
-        # check_us_location=True mirrors the generic-crawl path in fetch_one.
-        pending = await self._run({"location": "New York, NY"},
-                                  check_us_location=True)
+        pending = await self._run({"location": "New York, NY"})
         self.assertEqual(pending, [])
+
+    # ── BUG-66: geo gate is unconditional — every scraper label, every path ──
+    async def test_out_of_region_skipped_on_custom_labels(self):
+        for label in ("Microsoft", "Tesla", "Google", "Workday", "prefetched"):
+            pending = await self._run({"location": "Bangalore, India"},
+                                      label=label)
+            self.assertEqual(pending, [], f"label={label}")
+
+    async def test_foreign_remote_skipped(self):
+        pending = await self._run({"location": "Remote, Canada"})
+        self.assertEqual(pending, [])
+
+    async def test_blank_location_kept_not_dropped(self):
+        """Unknown location → keep (surfaces via Data Quality, not a drop)."""
+        import json as _json
+        pending = await self._run({"location": ""})
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(_json.loads(pending[0][1])["data_quality"], "partial")
+
+    async def test_mixed_locations_best_region_kept(self):
+        """Any qualifying segment keeps the row (best-region precedence)."""
+        pending = await self._run(
+            {"location": "Bangalore, India; Austin, TX"}, label="Microsoft")
+        self.assertEqual(len(pending), 1)
 
 
 class TestParseIsoDate(unittest.TestCase):
@@ -2503,7 +2504,7 @@ class TestRouteScraperPrefetch(unittest.IsolatedAsyncioTestCase):
             "_prefetched_md": "# Sr TPM\nJD body", "_platform": "Amazon"}}
         with patch("agents.job_agent.scrape_jd") as mock_crawl:
             md, label = await _route_scraper(
-                "https://www.amazon.jobs/en/jobs/1/tpm", "fc", MagicMock(),
+                "https://www.amazon.jobs/en/jobs/1/tpm", MagicMock(),
                 list_meta)
         self.assertEqual(md, "# Sr TPM\nJD body")
         self.assertEqual(label, "Amazon")
@@ -2515,7 +2516,7 @@ class TestRouteScraperPrefetch(unittest.IsolatedAsyncioTestCase):
         with patch("agents.job_agent._scrape_workday_jd",
                    return_value="# WD JD") as mock_wd:
             md, label = await _route_scraper(
-                "https://co.myworkdayjobs.com/x/job/1", "fc", MagicMock(),
+                "https://co.myworkdayjobs.com/x/job/1", MagicMock(),
                 list_meta)
         self.assertEqual((md, label), ("# WD JD", "Workday"))
         mock_wd.assert_called_once()
@@ -2632,6 +2633,14 @@ class TestExtractJdPromptAnchors(unittest.TestCase):
         self.assertIn('set job_domain to "Space"', instr)
         self.assertIn("SECURITY:", instr)
 
+    def test_location_extracted_verbatim_not_us_only(self):
+        """BUG-66: the prompt must not tell the LLM to pre-filter to US
+        locations — that blinds the deterministic geo gate."""
+        instr = self._sys_instr("Mid-large Tech")
+        self.assertIn("Extract ALL locations", instr)
+        self.assertIn("verbatim", instr)
+        self.assertNotIn("ALL US locations", instr)
+
 
 class TestLlmFilterJobsRuleSelection(unittest.TestCase):
     """P1 gap: vertical fast-path vs mid-large 5-track rule (REQ-004-09)."""
@@ -2667,6 +2676,369 @@ class TestLlmFilterJobsRuleSelection(unittest.TestCase):
         self.assertIn("five tracks", instr)
         self.assertIn("Project Kuiper", instr)
         self.assertIn("SECURITY:", instr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestTriagedUrlExclusion(unittest.IsolatedAsyncioTestCase):
+    """BUG-65: URLs the user triaged into JD_ToApply / Skipped JD must never be
+    re-scraped or re-added to JD_Tracker by process_company."""
+
+    TRIAGED_URL = "https://testco.greenhouse.io/jobs/tpm/11111"
+    NEW_URL     = "https://testco.greenhouse.io/jobs/tpm/22222"
+    ROW = ["TestCo", "AI-native", "", "https://testco.greenhouse.io"]
+
+    async def _run(self, triaged_set):
+        from agents.job_agent import process_company
+
+        raw_listings = [
+            {"url": self.TRIAGED_URL, "title": "Technical Program Manager"},
+            {"url": self.NEW_URL,     "title": "Technical Program Manager"},
+        ]
+        route_mock = AsyncMock(return_value=("", "generic"))
+        with patch("agents.job_agent.discover_jobs", new=AsyncMock(return_value=raw_listings)), \
+             patch("agents.job_agent._route_scraper", new=route_mock):
+            await process_company(
+                self.ROW, {}, "/fake/path.xlsx",
+                asyncio.Lock(), MagicMock(), triaged_set=triaged_set,
+            )
+        return route_mock
+
+    async def test_triaged_url_not_scraped(self):
+        route_mock = await self._run({self.TRIAGED_URL})
+        scraped = [c.args[0] for c in route_mock.await_args_list]
+        self.assertNotIn(self.TRIAGED_URL, scraped)
+        self.assertIn(self.NEW_URL, scraped)
+
+    async def test_none_triaged_set_scrapes_all(self):
+        route_mock = await self._run(None)
+        scraped = [c.args[0] for c in route_mock.await_args_list]
+        self.assertIn(self.TRIAGED_URL, scraped)
+        self.assertIn(self.NEW_URL, scraped)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestParseJsonldJobposting(unittest.TestCase):
+    """BUG-67: shared JSON-LD JobPosting parser (incl. the previously-ignored
+    datePosted field)."""
+
+    @staticmethod
+    def _html(payload: dict) -> str:
+        return ('<html><script type="application/ld+json">'
+                + json.dumps(payload) + "</script></html>")
+
+    BASE = {
+        "@type": "JobPosting", "title": "Technical Program Manager",
+        "description": "<p>Own the roadmap &amp; delivery.</p>",
+        "datePosted": "2026-07-01T08:00:00Z",
+        "jobLocation": {"address": {"addressLocality": "Lincolnshire",
+                                    "addressRegion": "IL",
+                                    "addressCountry": "US"}},
+    }
+
+    def _parse(self, payload):
+        from agents.job_agent import _parse_jsonld_jobposting
+        return _parse_jsonld_jobposting(self._html(payload))
+
+    def test_full_posting_parsed(self):
+        p = self._parse(self.BASE)
+        self.assertEqual(p["title"], "Technical Program Manager")
+        self.assertEqual(p["location"], "Lincolnshire, IL, US")
+        self.assertEqual(p["date_posted"], "2026-07-01")
+        self.assertIn("Own the roadmap", p["description"])
+        self.assertNotIn("<p>", p["description"])
+
+    def test_date_posted_plain_iso(self):
+        p = self._parse({**self.BASE, "datePosted": "2026-06-25"})
+        self.assertEqual(p["date_posted"], "2026-06-25")
+
+    def test_missing_date_posted_is_blank(self):
+        payload = {k: v for k, v in self.BASE.items() if k != "datePosted"}
+        self.assertEqual(self._parse(payload)["date_posted"], "")
+
+    def test_location_list(self):
+        p = self._parse({**self.BASE, "jobLocation": [
+            {"address": {"addressLocality": "Nashville", "addressRegion": "TN"}},
+            {"address": {"addressLocality": "Austin", "addressRegion": "TX"}},
+        ]})
+        self.assertEqual(p["location"], "Nashville, TN; Austin, TX")
+
+    def test_missing_type_accepted_when_description_present(self):
+        # Some Workday tenants omit @type.
+        payload = {k: v for k, v in self.BASE.items() if k != "@type"}
+        self.assertEqual(self._parse(payload)["date_posted"], "2026-07-01")
+
+    def test_non_jobposting_type_rejected(self):
+        p = self._parse({**self.BASE, "@type": "Organization"})
+        self.assertEqual(p["description"], "")
+
+    def test_base_salary_formatted(self):
+        p = self._parse({**self.BASE, "baseSalary": {
+            "currency": "USD",
+            "value": {"minValue": 150000, "maxValue": 200000}}})
+        self.assertEqual(p["salary"], "$150,000 - $200,000 USD")
+
+    def test_no_jsonld_returns_empty(self):
+        from agents.job_agent import _parse_jsonld_jobposting
+        p = _parse_jsonld_jobposting("<html><body>nothing here</body></html>")
+        self.assertEqual(p["description"], "")
+        self.assertEqual(p["date_posted"], "")
+
+
+class TestPostedDateFallbackChain(unittest.TestCase):
+    """BUG-67: date chain in _gate_and_finalize — list-meta → scrape-time
+    JSON-LD stash → JSON-LD fetch → Tavily backfill → keep + flag."""
+
+    BASE = {
+        "job_title": "Senior TPM", "company": "TestCo",
+        "location": "Seattle, WA", "salary_range": "",
+        "requirements": ["x"], "additional_qualifications": [],
+        "key_responsibilities": ["y"], "job_domain": "AI",
+        "min_yoe": 5, "work_auth": "none_stated",
+    }
+    URL = "https://x.example/jd/1"
+
+    def setUp(self):
+        job_agent_mod._JSONLD_DATE_BY_URL.clear()
+
+    tearDown = setUp
+
+    def _finalize(self, posted_date="", fetch_return=""):
+        with patch("agents.job_agent._fetch_jsonld_posted_date",
+                   return_value=fetch_return) as mock_fetch, \
+             patch("agents.job_agent._backfill_posted_date",
+                   return_value="") as mock_backfill:
+            out = job_agent_mod._gate_and_finalize(
+                dict(self.BASE), "AI-native", self.URL, posted_date=posted_date)
+        return out, mock_fetch, mock_backfill
+
+    def test_list_meta_date_wins_no_fetch(self):
+        out, mock_fetch, _ = self._finalize(posted_date="2026-07-08")
+        self.assertEqual(out["posted_date"], "2026-07-08")
+        mock_fetch.assert_not_called()
+
+    def test_stashed_scrape_date_used(self):
+        job_agent_mod._JSONLD_DATE_BY_URL[self.URL] = "2026-07-02"
+        out, mock_fetch, _ = self._finalize()
+        self.assertEqual(out["posted_date"], "2026-07-02")
+        mock_fetch.assert_not_called()
+
+    def test_stashed_negative_prevents_refetch(self):
+        # "" stash = page's JSON-LD already examined, don't fetch again.
+        job_agent_mod._JSONLD_DATE_BY_URL[self.URL] = ""
+        out, mock_fetch, mock_backfill = self._finalize()
+        mock_fetch.assert_not_called()
+        mock_backfill.assert_called_once()
+        self.assertIn("unknown posted date", out["date_flag"])
+
+    def test_unstashed_url_triggers_fetch(self):
+        out, mock_fetch, _ = self._finalize(fetch_return="2026-07-03")
+        mock_fetch.assert_called_once_with(self.URL)
+        self.assertEqual(out["posted_date"], "2026-07-03")
+        self.assertNotIn("date_flag", out)
+
+    def test_all_sources_empty_keeps_row_with_flag(self):
+        out, _, _ = self._finalize()
+        self.assertIsNotNone(out)  # unknown date is never a drop condition
+        self.assertIn("unknown posted date", out["date_flag"])
+
+
+class TestRetryOnePreservesPostedDate(unittest.IsolatedAsyncioTestCase):
+    """BUG-67: the incomplete-row retry previously wiped Posted Date on
+    rewrite (the LLM never returns one). It must carry the sheet value."""
+
+    EXISTING_DATE = "2026-07-01"
+
+    def setUp(self):
+        self.temp_xlsx = tempfile.mktemp(suffix=".xlsx")
+        from shared.excel_store import (get_or_create_excel, upsert_companies,
+                                        batch_upsert_jd_records)
+        get_or_create_excel(self.temp_xlsx)
+        upsert_companies(self.temp_xlsx, [{
+            "company_name": "RetryTestCo", "ai_domain": "AI-native",
+            "business_focus": "Testing",
+            "career_url": "https://boards.greenhouse.io/retrytestco",
+        }])
+        incomplete_jd = json.dumps({
+            "job_title": "TPM", "company": "RetryTestCo", "location": "N/A",
+            "requirements": [], "key_responsibilities": [],
+            "posted_date": self.EXISTING_DATE,
+        })
+        batch_upsert_jd_records(
+            self.temp_xlsx,
+            [("https://example.com/retry-job", incomplete_jd, "oldhash")])
+
+    def tearDown(self):
+        if os.path.exists(self.temp_xlsx):
+            os.unlink(self.temp_xlsx)
+
+    async def test_retry_keeps_existing_posted_date(self):
+        complete = {
+            "job_title": "Senior TPM", "company": "RetryTestCo",
+            "location": "Seattle, WA", "salary_range": "",
+            "requirements": ["x"], "additional_qualifications": [],
+            "key_responsibilities": ["y"], "job_domain": "AI",
+            "min_yoe": 5, "work_auth": "none_stated",
+        }
+        mock_limiter = MagicMock()
+        mock_limiter.acquire = AsyncMock()
+        original_limiter = job_agent_mod._GEMINI_LIMITER
+        job_agent_mod._GEMINI_LIMITER = mock_limiter
+        try:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "fake",
+                                         "FIRECRAWL_API_KEY": "fake"}), \
+                 patch("agents.job_agent.get_or_create_excel",
+                       return_value=self.temp_xlsx), \
+                 patch("agents.job_agent.process_company",
+                       new=AsyncMock(return_value=None)), \
+                 patch("agents.job_agent._route_scraper",
+                       new=AsyncMock(return_value=("# md", None))), \
+                 patch("agents.job_agent.extract_jd",
+                       return_value=json.dumps(complete)), \
+                 patch("agents.job_agent._save_md_to_cache"), \
+                 patch("agents.job_agent._save_structured_jd_md"), \
+                 patch("agents.job_agent._fetch_jsonld_posted_date",
+                       return_value="") as mock_fetch, \
+                 patch("agents.job_agent.batch_upsert_jd_records") as mock_upsert:
+                await job_agent_mod.main()
+                mock_upsert.assert_called_once()
+                records = mock_upsert.call_args[0][1]
+                staged = json.loads(records[0][1])
+                self.assertEqual(staged["posted_date"], self.EXISTING_DATE)
+                mock_fetch.assert_not_called()  # date known → no extra GET
+        finally:
+            job_agent_mod._GEMINI_LIMITER = original_limiter
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchGoogleJobs(unittest.TestCase):
+    """T16 / REQ-004-18: Google Careers discovery via the server-rendered
+    AF_initDataCallback payload (design.md v3 API endpoint is dead)."""
+
+    @staticmethod
+    def _job(job_id, title, locations, epoch=1782202073):
+        j = [None] * 21
+        j[0] = job_id
+        j[1] = title
+        j[3] = [None, "<ul><li>Run programs.</li></ul>"]
+        j[4] = [None, "<h3>Minimum qualifications:</h3><ul><li>BS degree</li></ul>"]
+        j[9] = [[loc, [loc], loc.split(",")[0], None, "WA", "US"]
+                for loc in locations]
+        j[12] = [epoch, 0]
+        j[19] = [None, "<ul><li>MS degree</li></ul>"]
+        return j
+
+    @classmethod
+    def _page_html(cls, jobs) -> str:
+        payload = json.dumps([jobs, None, None, None])
+        return ("<html><script>AF_initDataCallback({key: 'ds:1', hash: '2', "
+                f"data:{payload}, sideChannel: {{}}}});</script></html>")
+
+    def _fetch(self, pages):
+        """pages: list of HTML strings returned per successive GET."""
+        from agents.job_agent import _fetch_google_jobs
+        responses = [MagicMock(status_code=200, text=h) for h in pages]
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=responses) as mock_http:
+            result = _fetch_google_jobs("https://www.google.com/about/careers/applications/")
+        return result, mock_http
+
+    def test_jobs_parsed_with_url_title_location_date(self):
+        jobs = [self._job("111", "Technical Program Manager, AI Infrastructure",
+                          ["Kirkland, WA, USA", "Austin, TX, USA"])]
+        # page 2 repeats page 1 (Google clamps page=N to the last page)
+        result, _ = self._fetch([self._page_html(jobs)] * 2)
+        self.assertEqual(len(result), 1)
+        job = result[0]
+        self.assertIn("jobs/results/111-technical-program-manager", job["url"])
+        self.assertEqual(job["title"], "Technical Program Manager, AI Infrastructure")
+        self.assertEqual(job["location"], "Kirkland, WA, USA; Austin, TX, USA")
+        from datetime import datetime as _dt
+        self.assertEqual(job["posted_date"],
+                         _dt.fromtimestamp(1782202073).strftime("%Y-%m-%d"))
+        self.assertEqual(job["_platform"], "Google")
+        md = job["_prefetched_md"]
+        self.assertIn("Minimum Qualifications", md)
+        self.assertIn("BS degree", md)
+        self.assertNotIn("<ul>", md)
+
+    def test_pagination_stops_on_repeated_page(self):
+        page1 = self._page_html([self._job("1", "TPM One", ["Seattle, WA, USA"]),
+                                 self._job("2", "TPM Two", ["Austin, TX, USA"])])
+        # identical second page → no new ids → stop (2 GETs total)
+        result, mock_http = self._fetch([page1, page1])
+        self.assertEqual(len(result), 2)
+        self.assertEqual(mock_http.call_count, 2)
+
+    def test_malformed_job_skipped_others_kept(self):
+        good = self._job("10", "TPM Good", ["Seattle, WA, USA"])
+        bad = ["11", None]  # too short, blank title
+        result, _ = self._fetch([self._page_html([bad, good])] * 2)
+        self.assertEqual([j["title"] for j in result], ["TPM Good"])
+
+    def test_payload_unusable_falls_back_to_hrefs(self):
+        html = ('<html><a href="/about/careers/applications/jobs/results/'
+                '987654-senior-tpm">Senior TPM</a></html>')
+        result, _ = self._fetch([html])
+        self.assertEqual(len(result), 1)
+        self.assertIn("jobs/results/987654-senior-tpm", result[0]["url"])
+
+    def test_http_failure_returns_empty(self):
+        from agents.job_agent import _fetch_google_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   return_value=None):
+            self.assertEqual(
+                _fetch_google_jobs("https://www.google.com/about/careers/applications/"),
+                [])
+
+    def test_google_routing_is_discoverable(self):
+        cfg = ATS_PLATFORMS["google"]
+        self.assertEqual(cfg["strategy"], "json_api")
+        self.assertEqual(cfg["list_fn"], "_fetch_google_jobs")
+        self.assertIn("google.com/about/careers", cfg["domains"])
+
+
+class TestBug62EmptyExtractionAuditRow(unittest.IsolatedAsyncioTestCase):
+    """BUG-62: an extraction that returns no company must stage a sheet-visible
+    JSON-ERROR audit row instead of vanishing (and being retried invisibly)."""
+
+    async def _stage_with_extraction(self, extraction: str) -> list:
+        from agents.job_agent import _process_scraped_jd
+        pending, ts_only = [], []
+        with patch("agents.job_agent.extract_jd", return_value=extraction), \
+             patch("agents.job_agent._save_md_to_cache"), \
+             patch("agents.job_agent._save_structured_jd_md"), \
+             patch("agents.job_agent._fetch_jsonld_posted_date", return_value=""):
+            await _process_scraped_jd(
+                "https://x.co/jd-empty", "# markdown", "TestCo", "AI-native",
+                set(), {}, pending, ts_only, "generic")
+        return pending
+
+    async def test_empty_company_stages_sentinel(self):
+        pending = await self._stage_with_extraction("{}")
+        self.assertEqual(len(pending), 1)
+        url, sentinel, _ = pending[0]
+        self.assertEqual(url, "https://x.co/jd-empty")
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(sentinel)  # must trip the _JD_ERROR_ROW path
+
+    async def test_sentinel_round_trips_to_json_error_row(self):
+        from shared.excel_store import (get_or_create_excel,
+                                        batch_upsert_jd_records, _JD_COL)
+        pending = await self._stage_with_extraction("{}")
+        path = tempfile.mktemp(suffix=".xlsx")
+        try:
+            get_or_create_excel(path)
+            written = batch_upsert_jd_records(path, pending)
+            self.assertEqual(written, 1)
+            import openpyxl
+            wb = openpyxl.load_workbook(path)
+            ws = wb["JD_Tracker"]
+            self.assertEqual(ws.cell(2, _JD_COL["Company"]).value, "JSON ERROR")
+            self.assertEqual(ws.cell(2, _JD_COL["Data Quality"]).value, "failed")
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
 
 
 if __name__ == "__main__":

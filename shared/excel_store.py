@@ -10,6 +10,8 @@ import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
+from shared.config import TRACK_ORDER
+
 # ── Path ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXCEL_PATH   = os.path.join(PROJECT_ROOT, "pathfinder_dashboard.xlsx")
@@ -57,6 +59,11 @@ TAILORED_HEADERS = ["Resume ID", "JD URL", "Job Title", "Company", "Original Sco
 # BUG-52: pre-computed 1-based column indices for JD_Tracker lookups
 _JD_COL = {h: i + 1 for i, h in enumerate(JD_HEADERS)}
 
+# BUG-65: user-owned triage tabs. Rows the user moves here out of JD_Tracker
+# are final decisions — their URLs are permanently excluded from re-scraping
+# and re-insertion. Same 20-col JD_HEADERS schema as JD_Tracker.
+TRIAGE_SHEETS = ("JD_ToApply", "Skipped JD")
+
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
@@ -85,11 +92,12 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     changed = True
                     import logging as _log
                     _log.info(f"[Excel] Migrated sheet: '{old_name}' → '{new_name}'.")
-            for name, headers in [("Company_List",         COMPANY_HEADERS),
+            for name, headers in ([("Company_List",         COMPANY_HEADERS),
                                    ("Company_Without_TPM",  WITHOUT_TPM_HEADERS),
                                    ("JD_Tracker",              JD_HEADERS),
                                    ("Match_Results",           MATCH_HEADERS),
-                                   ("Tailored_Match_Results",  TAILORED_HEADERS)]:
+                                   ("Tailored_Match_Results",  TAILORED_HEADERS)]
+                                  + [(t, JD_HEADERS) for t in TRIAGE_SHEETS]):
                 if name not in wb.sheetnames:
                     wb.create_sheet(name).append(headers)
                     changed = True
@@ -250,6 +258,8 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
         wb.create_sheet("JD_Tracker").append(JD_HEADERS)
         wb.create_sheet("Match_Results").append(MATCH_HEADERS)
         wb.create_sheet("Tailored_Match_Results").append(TAILORED_HEADERS)
+        for name in TRIAGE_SHEETS:
+            wb.create_sheet(name).append(JD_HEADERS)
         wb.save(xlsx_path)
         wb.close()
     return xlsx_path
@@ -355,6 +365,44 @@ def update_company_career_url(xlsx_path: str, excel_row: int, new_url: str):
         wb.close()
 
 
+def get_incomplete_company_rows(xlsx_path: str = EXCEL_PATH) -> list:
+    """BUG-69: return Company_List rows whose Business Focus is blank/N/A.
+
+    Mirrors get_incomplete_jd_rows — these rows previously never self-healed
+    (unlike blank Career URLs, which run_phase_1_5 backfills every run).
+    Consumed by company_agent.run_reenrich_business_focus.
+    Returns [{"excel_row", "name", "career_url"}].
+    """
+    wb = load_workbook(xlsx_path, read_only=True)
+    try:
+        ws = wb["Company_List"]
+        out = []
+        for r in range(2, ws.max_row + 1):
+            name = str(ws.cell(r, 1).value or "").strip()
+            if not name:
+                continue
+            focus = str(ws.cell(r, 3).value or "").strip()
+            if focus.lower() in ("", "n/a", "none"):
+                out.append({"excel_row": r, "name": name,
+                            "career_url": str(ws.cell(r, 4).value or "").strip()})
+        return out
+    finally:
+        wb.close()
+
+
+def update_company_business_focus(xlsx_path: str, excel_row: int, focus: str):
+    """BUG-69: write Business Focus (col 3) + refresh Updated At (col 5).
+    excel_row is the actual 1-based Excel row number (2 = first data row)."""
+    wb = load_workbook(xlsx_path)
+    try:
+        ws = wb["Company_List"]
+        ws.cell(excel_row, 3, focus)
+        ws.cell(excel_row, 5, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        wb.save(xlsx_path)
+    finally:
+        wb.close()
+
+
 def update_company_track(xlsx_path: str, excel_row: int, track: str):
     """PRJ-004 REQ-004-06: write the Track column (col 2) for one row in place.
     excel_row is the actual 1-based Excel row number (2 = first data row)."""
@@ -363,6 +411,48 @@ def update_company_track(xlsx_path: str, excel_row: int, track: str):
         ws = wb["Company_List"]
         ws.cell(excel_row, 2, track)
         wb.save(xlsx_path)
+    finally:
+        wb.close()
+
+
+def sort_company_list_by_track(xlsx_path: str = EXCEL_PATH) -> int:
+    """Sort Company_List rows by Track (canonical TRACK_ORDER position),
+    then company name (case-insensitive). Blank/custom Track values sink to
+    the bottom — never dropped, visible for manual review.
+
+    Count-preserving in-place rewrite (sort_jd_tracker_by_tier pattern): all
+    columns travel with their row, rows are never deleted/inserted. Must run
+    only after every excel_row-keyed write of the run has completed — sorting
+    invalidates previously captured row numbers. Returns the number of data
+    rows sorted. Idempotent — safe to re-run.
+    """
+    track_rank = {t: i for i, t in enumerate(TRACK_ORDER)}
+    wb = load_workbook(xlsx_path)
+    try:
+        ws     = wb["Company_List"]
+        n_cols = ws.max_column
+        rows = []
+        for r in range(2, ws.max_row + 1):
+            row_vals = [ws.cell(r, c).value for c in range(1, n_cols + 1)]
+            if not any(v not in (None, "") for v in row_vals):
+                continue
+            name  = str(row_vals[0] or "")
+            track = str(row_vals[1] or "").strip()
+            rows.append((track_rank.get(track, len(TRACK_ORDER)),
+                         name.strip().lower(), row_vals))
+
+        rows.sort(key=lambda x: (x[0], x[1]))
+
+        max_row_before = ws.max_row
+        for r in range(2, max_row_before + 1):
+            for c in range(1, n_cols + 1):
+                ws.cell(r, c).value = None
+        for i, (_rank, _name, row_vals) in enumerate(rows):
+            for c in range(1, n_cols + 1):
+                ws.cell(2 + i, c).value = row_vals[c - 1]
+
+        wb.save(xlsx_path)
+        return len(rows)
     finally:
         wb.close()
 
@@ -440,6 +530,27 @@ def get_company_archive_info(xlsx_path: str = EXCEL_PATH) -> dict:
 
 
 # ── JD helpers ────────────────────────────────────────────────────────────────
+def get_triaged_jd_urls(xlsx_path: str = EXCEL_PATH) -> set:
+    """Return the set of JD URLs the user has triaged into TRIAGE_SHEETS
+    (BUG-65). These are final decisions: the pipeline must never re-scrape
+    them or re-add them to JD_Tracker. Missing tabs are tolerated."""
+    wb = load_workbook(xlsx_path, read_only=True)
+    try:
+        urls = set()
+        c_url = _JD_COL["JD URL"]
+        for name in TRIAGE_SHEETS:
+            if name not in wb.sheetnames:
+                continue
+            ws = wb[name]
+            for r in range(2, ws.max_row + 1):
+                url = str(ws.cell(r, c_url).value or "").strip()
+                if url:
+                    urls.add(url)
+        return urls
+    finally:
+        wb.close()
+
+
 def get_jd_urls(xlsx_path: str = EXCEL_PATH) -> list:
     """Return URLs that have been successfully extracted (company != N/A/empty).
     Incomplete records (failed Gemini extraction) are excluded so they get retried."""
@@ -692,6 +803,8 @@ def get_incomplete_jd_rows(xlsx_path: str = EXCEL_PATH) -> list:
         c_loc  = _JD_COL["Location"]
         c_req  = _JD_COL["Requirements"]
         c_resp = _JD_COL["Responsibilities"]
+        c_posted = _JD_COL["Posted Date"]
+        c_dflag  = _JD_COL["Date Flag"]
         out = []
         for r in range(2, ws.max_row + 1):
             url      = ws.cell(r, c_url).value
@@ -705,7 +818,14 @@ def get_incomplete_jd_rows(xlsx_path: str = EXCEL_PATH) -> list:
             if (location.lower() in _JD_MISSING
                     or req.lower() in _JD_MISSING
                     or resp.lower() in _JD_MISSING):
-                out.append({"url": url, "title": title, "company": company})
+                # BUG-67: carry the existing date fields so the retry path can
+                # preserve them instead of wiping the row's Posted Date.
+                posted_v = ws.cell(r, c_posted).value
+                if isinstance(posted_v, datetime):
+                    posted_v = posted_v.strftime("%Y-%m-%d")
+                out.append({"url": url, "title": title, "company": company,
+                            "posted_date": str(posted_v or "").strip(),
+                            "date_flag": str(ws.cell(r, c_dflag).value or "").strip()})
         return out
     finally:
         wb.close()
@@ -924,8 +1044,8 @@ def classify_region(location: str) -> str:
     Multi-location strings ('; '-separated) qualify if ANY segment qualifies;
     the best region wins (precedence Seattle > Remote > CA > TX) so the sort
     tier reflects the most desirable posting location. Blank / placeholder
-    locations return 'Unknown' — callers keep those rows (conservative,
-    consistent with the existing _is_us placeholder behavior in job_agent).
+    locations return 'Unknown' — callers keep those rows (conservative: only
+    confirmed out-of-region rows are dropped; see BUG-66).
     """
     if not location:
         return "Unknown"

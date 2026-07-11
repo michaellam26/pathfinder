@@ -3,10 +3,16 @@ Company Agent — runs the least frequently (one-time or as needed).
 
 Responsibilities:
   1. Read existing companies from Excel (avoid duplicates)
-  2. Discover up to 50 NEW North American AI companies via Tavily + Gemini
-     (capped at 200 total companies in the sheet)
+  2. Discover NEW companies via Tavily + Gemini in batches of 50, looping
+     until every track bucket reaches quota (500 total), a batch yields
+     nothing new (Tavily quota exhausted / query-pool convergence), or the
+     runaway iteration cap is hit
   3. Find real career URLs via multi-strategy lookup (NO Gemini URL guessing)
-  4. Phase 1.5: Validate & upgrade career URLs to ATS board URLs
+  4. Phase 1.5: Validate & upgrade career URLs to ATS board URLs; backfill
+     blank Career URLs on manually-inserted rows
+  5. Enrich incomplete rows: blank Business Focus (BUG-69) and blank Track
+     are filled every run, so manual name-only rows self-heal
+  6. Sort Company_List by Track (canonical 6-bucket order) as the last step
 
 URL discovery strategy (per company, in order):
   1. KNOWN_CAREER_URLS exact match
@@ -46,9 +52,12 @@ from shared.excel_store import (
     get_company_rows, get_company_rows_with_row_num, upsert_companies,
     update_company_career_url, update_company_track,
     get_company_names_without_tpm,
+    get_incomplete_company_rows, update_company_business_focus,
+    sort_company_list_by_track,
 )
 from shared.gemini_pool import _GeminiKeyPoolBase
-from shared.config import MODEL
+from shared.tavily_pool import build_pool_from_env as build_tavily_pool_from_env
+from shared.config import MODEL, TRACK_ORDER
 from shared.prompts import SECURITY_CLAUSE
 from shared.run_summary import RunSummary
 
@@ -62,9 +71,9 @@ _GeminiKeyPool = _GeminiKeyPoolBase  # alias for backward compat (tests)
 # quotas. Quotas constrain NEW discovery only — migrated survivors over quota
 # are grandfathered (D-12); a full bucket simply gets 0 new-discovery slots.
 MAX_TOTAL  = 500   # sum of TRACK_QUOTAS
-BATCH_SIZE = 50    # new companies to discover each run
+BATCH_SIZE = 50    # new companies to discover per loop iteration
 
-TRACK_VALUES = ("AI-native", "Mid-large Tech", "Robotics", "Fintech", "Space", "Defense")
+TRACK_VALUES = TRACK_ORDER  # canonical 6-bucket order lives in shared/config.py
 TRACK_QUOTAS = {"AI-native": 150, "Mid-large Tech": 150, "Robotics": 50,
                 "Fintech": 50, "Space": 50, "Defense": 50}
 VERTICAL_TRACKS = frozenset({"AI-native", "Robotics", "Fintech", "Space", "Defense"})
@@ -111,6 +120,23 @@ AICompanyInfo = CompanyInfo
 
 class CompanyInfoList(BaseModel):
     companies: list[CompanyInfo] = Field(description="A list of discovered companies.")
+
+
+class BusinessFocusItem(BaseModel):
+    """One row of the BUG-69 Business Focus re-enrich pass."""
+    company_name:   str = Field(description="Company name exactly as given in the input list.")
+    business_focus: str = Field(
+        description=(
+            "3-4 sentence description covering: (1) what the company builds or sells, "
+            "(2) who their primary customers are, (3) their key differentiator or "
+            "competitive edge, and (4) notable products, funding, or market traction. "
+            "Empty string if the search context is too thin to write one — do not guess."
+        )
+    )
+
+
+class BusinessFocusList(BaseModel):
+    focuses: list[BusinessFocusItem]
 
 
 class TrackClassification(BaseModel):
@@ -650,12 +676,15 @@ def _apply_bucket_rules(companies: list, need_by_track: dict) -> list:
     return out
 
 
-def discover_ai_companies(tavily_key: str, existing_names: set,
+def discover_ai_companies(tavily_client, existing_names: set,
                           need_by_track: dict) -> list:
     """
     Discover new companies not in `existing_names`, up to each track's open
     slots in `need_by_track` ({track: slots}). Returns a list of dicts with
     keys: company_name, track, business_focus, career_url.
+
+    `tavily_client` is any TavilyClient-like object with .search() — normally
+    a shared.tavily_pool.TavilyKeyPool (key rotation on quota errors).
 
     Flow:
       1. Tavily batch search → raw article/news results
@@ -665,13 +694,12 @@ def discover_ai_companies(tavily_key: str, existing_names: set,
     """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking discover_ai_companies()")
-    from tavily import TavilyClient
 
     need = sum(need_by_track.values())
     logging.info(f"Searching for {need} new companies across "
                  f"{sum(1 for v in need_by_track.values() if v)} open buckets "
                  f"(existing: {len(existing_names)})...")
-    client   = TavilyClient(api_key=tavily_key)
+    client   = tavily_client
     raw, seen_urls = [], set()
 
     # Step 1: Batch Tavily search for company discovery
@@ -885,17 +913,14 @@ def run_phase_1_5(xlsx_path: str, tavily_client=None):
 
     `tavily_client` enables the Workday-via-Tavily fallback (step 4 of
     `validate_and_upgrade_ats_url`). When None and TAVILY_API_KEY is set in
-    env, a client is created automatically.
+    env, a key pool is created automatically (BUG-70 rotation).
     """
     if tavily_client is None:
-        tavily_key = os.getenv("TAVILY_API_KEY")
-        if tavily_key:
-            try:
-                from tavily import TavilyClient
-                tavily_client = TavilyClient(api_key=tavily_key)
-            except Exception as e:
-                logging.warning(f"[Phase1.5] Tavily client init failed: {e}")
-                tavily_client = None
+        try:
+            tavily_client = build_tavily_pool_from_env()
+        except Exception as e:
+            logging.warning(f"[Phase1.5] Tavily pool init failed: {e}")
+            tavily_client = None
 
     print("\n" + "="*60)
     print("PHASE 1.5: ATS URL VALIDATION & UPGRADE")
@@ -956,12 +981,294 @@ def run_phase_1_5(xlsx_path: str, tavily_client=None):
     print("="*60 + "\n")
 
 
+def run_reenrich_business_focus(xlsx_path: str, tavily_client=None) -> dict:
+    """BUG-69: fill blank/N-A Business Focus cells on existing Company_List rows.
+
+    Blank focus rows arise when a manual insert or a mid-run Tavily/Gemini
+    failure left the cell empty; unlike blank Career URLs (backfilled every
+    run by run_phase_1_5) they previously never self-healed. Per incomplete
+    row: one Tavily search for context, then one batched Gemini call (the
+    migrate_tracks batch pattern) writes the 3-4 sentence focus back.
+
+    Returns {"filled": int, "failed": int, "skipped": int}.
+    """
+    if _KEY_POOL is None:
+        raise RuntimeError("_KEY_POOL not initialized — call main() first or "
+                           "set _KEY_POOL before invoking run_reenrich_business_focus()")
+    counts = {"filled": 0, "failed": 0, "skipped": 0}
+    rows = get_incomplete_company_rows(xlsx_path)
+    if not rows:
+        return counts
+
+    print("\n" + "="*60)
+    print(f"BUSINESS FOCUS RE-ENRICH (BUG-69): {len(rows)} blank row(s)")
+    print("="*60)
+
+    if tavily_client is None:
+        try:
+            tavily_client = build_tavily_pool_from_env()
+        except Exception as e:
+            logging.warning(f"[Reenrich] Tavily pool init failed: {e}")
+            tavily_client = None
+    if tavily_client is None:
+        print("  ⚠️  No Tavily client — Business Focus re-enrich skipped this run.")
+        counts["skipped"] = len(rows)
+        return counts
+
+    # Step 1: one Tavily search per blank row; quota error aborts the loop
+    # (BUG-44 pattern) but keeps whatever context was already gathered.
+    contexts = []  # (excel_row, name, search_context)
+    for rec in rows:
+        name = rec["name"]
+        try:
+            r = tavily_client.search(
+                query=f'"{name}" company products customers', max_results=3)
+            snippets = [f"{item.get('title', '')}: {item.get('content', '')}"
+                        for item in r.get("results", [])]
+            contexts.append((rec["excel_row"], name, " | ".join(snippets)[:1500]))
+            time.sleep(1)
+        except Exception as e:
+            err_str = str(e)
+            if "402" in err_str or "429" in err_str or "quota" in err_str.lower():
+                print(f"  ⚠️  Tavily API quota exhausted: {e} — "
+                      f"re-enrich continues next run.")
+                logging.error(f"[Reenrich] Tavily quota exhausted: {e}")
+                break
+            logging.warning(f"[Reenrich] Tavily search failed for {name}: {e}")
+    counts["skipped"] = len(rows) - len(contexts)
+    if not contexts:
+        return counts
+
+    # Step 2: batched Gemini extraction (migrate_tracks batch pattern).
+    system_instruction = (
+        "You write company profiles for a TPM job-search pipeline. For each "
+        "input company, use ONLY its search context to write business_focus: "
+        "3-4 sentences covering what the company builds, who their customers "
+        "are, their key competitive differentiator, and notable "
+        "products/funding/traction. Copy company_name verbatim. Return an "
+        "empty business_focus when the context is too thin — do not guess."
+        + SECURITY_CLAUSE  # Tavily snippets are untrusted third-party content
+    )
+    valid_names = {name for _, name, _ in contexts}
+    BATCH = 25
+    for b in range(0, len(contexts), BATCH):
+        chunk = contexts[b : b + BATCH]
+        payload = json.dumps([{"company_name": n, "search_context": ctx}
+                              for _, n, ctx in chunk])
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.1,
+            response_mime_type="application/json",
+            response_schema=BusinessFocusList,
+        )
+        try:
+            resp = _KEY_POOL.generate_content(
+                model=MODEL,
+                contents=("Write business_focus for these companies:\n"
+                          f"<scraped_content>\n{payload}\n</scraped_content>"),
+                config=config,
+            )
+            results = {f.get("company_name", "").strip(): f.get("business_focus", "")
+                       for f in json.loads(resp.text).get("focuses", [])
+                       if f.get("company_name", "").strip() in valid_names}
+        except Exception as e:
+            logging.error(f"[Reenrich] batch {b // BATCH + 1} failed: {e} — "
+                          "rows stay blank; re-run to retry.")
+            results = {}
+        for excel_row, name, _ctx in chunk:
+            focus = (results.get(name) or "").strip()
+            if focus:
+                update_company_business_focus(xlsx_path, excel_row, focus)
+                print(f"  ✅ {name}: focus filled.")
+                counts["filled"] += 1
+            else:
+                print(f"  ⚪ {name}: no usable focus (retried next run).")
+                counts["failed"] += 1
+        time.sleep(0.5)
+
+    print(f"\n  Filled={counts['filled']}  Failed={counts['failed']}  "
+          f"Skipped={counts['skipped']}")
+    print("="*60 + "\n")
+    return counts
+
+
+# ── Track classification (shared by --migrate-tracks and per-run enrich) ─────
+_TRACK_CLASSIFY_SYSTEM_INSTRUCTION = (
+    "You classify companies into exactly one of 6 track buckets for a "
+    "TPM job-search pipeline. Buckets:\n"
+    '  - "AI-native": AI labs / AI product startups / AI infra-compute, founded ~2000+\n'
+    '  - "Mid-large Tech": established mid-large tech companies (the only bucket '
+    "where legacy incumbents belong, e.g. Boeing, Visa, PayPal, Intuit)\n"
+    '  - "Robotics": robotics companies founded ~2000+\n'
+    '  - "Fintech": fintech companies founded ~2000+\n'
+    '  - "Space": space companies founded ~2000+\n'
+    '  - "Defense": venture-backed defense tech founded roughly 2010+. Palantir '
+    "belongs here (explicit exception). Legacy primes (Boeing, Lockheed Martin, "
+    "Raytheon/RTX, Northrop Grumman, General Dynamics, BAE, L3Harris) NEVER "
+    "belong here — classify them as Mid-large Tech.\n"
+    "Return one TrackClassification per input company, company_name copied "
+    "verbatim. Set confident=false when the business description is too thin "
+    "to decide — do not guess."
+    + SECURITY_CLAUSE  # P0-3: business_focus text originated from scraped web content
+)
+
+
+def _classify_tracks_batch(chunk: list[tuple[str, str]]) -> dict:
+    """One batched Gemini classification call for [(name, business_focus)].
+
+    Returns {company_name: classification dict}. Raises on API/parse failure —
+    callers decide how a failed batch degrades (rows stay pending, retried on
+    the next invocation).
+    """
+    payload = json.dumps([{"company_name": n, "business_focus": (f or "")[:600]}
+                          for n, f in chunk])
+    config = types.GenerateContentConfig(
+        system_instruction=_TRACK_CLASSIFY_SYSTEM_INSTRUCTION,
+        temperature=0.0,
+        response_mime_type="application/json",
+        response_schema=TrackClassificationList,
+    )
+    resp = _KEY_POOL.generate_content(
+        model=MODEL,
+        contents=("Classify these companies:\n"
+                  f"<scraped_content>\n{payload}\n</scraped_content>"),
+        config=config,
+    )
+    return {c.get("company_name", "").strip(): c
+            for c in json.loads(resp.text).get("classifications", [])}
+
+
+def run_enrich_missing_tracks(xlsx_path: str) -> dict:
+    """Fill blank Track cells on existing Company_List rows.
+
+    Manual name-only inserts have no Track; without one the job_agent falls
+    to the strict Mid-large-Tech classifier path with a warning. Only blank/
+    N-A cells are touched — custom values (including 'UNMIGRATED — manual
+    review') are user decisions / the --migrate-tracks CLI's domain.
+    Unconfident classifications stay blank and are retried next run; defense
+    legacy primes are deterministically forced to Mid-large Tech.
+
+    Runs after run_reenrich_business_focus so a freshly-filled Business Focus
+    feeds the classifier. Returns {"filled": int, "failed": int}.
+    """
+    if _KEY_POOL is None:
+        raise RuntimeError("_KEY_POOL not initialized — call main() first or "
+                           "set _KEY_POOL before invoking run_enrich_missing_tracks()")
+    counts = {"filled": 0, "failed": 0}
+    pending = []   # (excel_row, name, business_focus)
+    for excel_row, row in get_company_rows_with_row_num(xlsx_path):
+        name  = str(row[0]).strip() if row and row[0] else ""
+        track = str(row[1]).strip() if len(row) > 1 else ""
+        focus = str(row[2]).strip() if len(row) > 2 else ""
+        if not name or track.lower() not in ("", "n/a", "none"):
+            continue
+        pending.append((excel_row, name, focus))
+    if not pending:
+        return counts
+
+    print("\n" + "="*60)
+    print(f"TRACK ENRICH: {len(pending)} blank-Track row(s)")
+    print("="*60)
+
+    BATCH = 25
+    for b in range(0, len(pending), BATCH):
+        chunk = pending[b : b + BATCH]
+        try:
+            results = _classify_tracks_batch([(n, f) for _, n, f in chunk])
+        except Exception as e:
+            logging.error(f"[TrackEnrich] batch {b // BATCH + 1} failed: {e} — "
+                          "rows stay blank; re-run to retry.")
+            results = {}
+        for excel_row, name, _focus in chunk:
+            r = results.get(name)
+            if r is None:
+                print(f"  ⚪ {name}: no classification returned (retried next run).")
+                counts["failed"] += 1
+                continue
+            if _normalize_company_name(name) in DEFENSE_EXCLUDED_PRIMES:
+                # Deterministic: a prime can survive only in Mid-large Tech.
+                new_track = "Mid-large Tech"
+            elif not r.get("confident", False):
+                print(f"  ⚪ {name}: unconfident classification (retried next run).")
+                counts["failed"] += 1
+                continue
+            else:
+                new_track = r["track"]
+            update_company_track(xlsx_path, excel_row, new_track)
+            print(f"  ✅ {name}: Track → {new_track}")
+            counts["filled"] += 1
+        time.sleep(0.5)
+
+    print(f"\n  Filled={counts['filled']}  Failed={counts['failed']}")
+    print("="*60 + "\n")
+    return counts
+
+
+# ── Discovery loop ────────────────────────────────────────────────────────────
+def run_discovery_loop(xlsx_path: str, tavily_client, summary: RunSummary) -> int:
+    """Discover new companies in BATCH_SIZE batches until every bucket hits
+    quota (MAX_TOTAL total), a batch yields nothing new (Tavily quota
+    exhausted / query-pool convergence / Gemini failure — all retried next
+    run), or the MAX_TOTAL // BATCH_SIZE runaway cap is reached.
+
+    `tavily_client` is any TavilyClient-like object with .search() — normally
+    a shared.tavily_pool.TavilyKeyPool. The exclusion list is re-read from
+    the sheet each iteration so freshly upserted companies dedup against the
+    next batch. Returns total added.
+    """
+    total_added = 0
+    max_iters = MAX_TOTAL // BATCH_SIZE
+    iteration = 0
+    while True:
+        existing_rows     = get_company_rows(xlsx_path)
+        names_main        = {str(r[0]).strip() for r in existing_rows if r[0]}
+        names_without_tpm = get_company_names_without_tpm(xlsx_path)
+        existing_names    = names_main | names_without_tpm
+
+        need_by_track = compute_need_by_track(existing_rows)
+        total_open = sum(need_by_track.values())
+        if total_open <= 0:
+            print(f"✅ All buckets at quota ({MAX_TOTAL} companies).")
+            summary.note("Discovery stop: all buckets at quota.")
+            break
+        iteration += 1
+        if iteration > max_iters:
+            summary.note(f"Discovery stop: iteration cap ({max_iters}) reached "
+                         f"({total_open} slots still open).")
+            break
+
+        alloc = allocate_batch(need_by_track, BATCH_SIZE)
+        need  = sum(alloc.values())
+        open_desc = ", ".join(f"{t}: {n}" for t, n in alloc.items() if n)
+        print(f"🔍 Discovery batch {iteration}/{max_iters}: up to {need} new "
+              f"companies ({open_desc}; total open slots: {total_open})...")
+        summary.attempted += need
+
+        companies = discover_ai_companies(tavily_client, existing_names, alloc)
+        if not companies:
+            print("⚠️  Batch yielded no new companies — stopping discovery this run.")
+            summary.failed += need
+            summary.note(f"Discovery stop: zero-yield batch {iteration} "
+                         f"({total_open} slots still open).")
+            break
+
+        data = [c.model_dump() if hasattr(c, "model_dump") else dict(c)
+                for c in companies]
+        upsert_companies(xlsx_path, data)
+        total_added += len(data)
+        summary.succeeded += len(data)
+        summary.failed += max(0, need - len(data))
+        print(f"✅ Batch {iteration}: added {len(data)} companies. "
+              f"Total: {count_company_rows(xlsx_path)}")
+    return total_added
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     global _KEY_POOL
     summary = RunSummary(agent="company")
     try:
-        tavily_key  = os.getenv("TAVILY_API_KEY")
+        tavily_pool = build_tavily_pool_from_env()  # BUG-70: key rotation
         gemini_keys = [k for k in [
             os.getenv("GEMINI_API_KEY"),
             os.getenv("GEMINI_API_KEY_2"),
@@ -969,7 +1276,7 @@ def main():
         missing = []
         if not gemini_keys:
             missing.append("GEMINI_API_KEY")
-        if not tavily_key:
+        if tavily_pool is None:
             missing.append("TAVILY_API_KEY")
         if missing:
             print(f"❌ Missing env vars: {missing}")
@@ -986,50 +1293,36 @@ def main():
         xlsx_path = get_or_create_excel()
         print(f"📊 Dashboard: {xlsx_path}")
 
-        # ── Step 1: Read existing companies (both lists) ──────────────────────────
-        current_count     = count_company_rows(xlsx_path)
-        existing_rows     = get_company_rows(xlsx_path)
-        names_main        = {str(r[0]).strip() for r in existing_rows if r[0]}
-        names_without_tpm = get_company_names_without_tpm(xlsx_path)
-        existing_names    = names_main | names_without_tpm
+        # ── Step 1: Discovery loop to quota (PRJ-004 REQ-004-01 / D-12) ──────────
+        # Per iteration: recount per-bucket slots (a bucket at/over quota gets
+        # 0 slots and is never trimmed), allocate a BATCH_SIZE batch across
+        # open buckets, discover + upsert. Loops until quota / zero-yield /
+        # iteration cap — see run_discovery_loop.
+        current_count = count_company_rows(xlsx_path)
         print(f"📋 Existing companies in Company_List: {current_count}")
-        print(f"📋 Companies in Company_Without_TPM: {len(names_without_tpm)}")
-        print(f"📋 Total known companies (dedup exclusion list): {len(existing_names)}")
+        added = run_discovery_loop(xlsx_path, tavily_pool, summary)
+        print(f"📈 Discovery loop finished: {added} new companies this run.")
 
-        # ── Step 2: Per-bucket slot accounting (PRJ-004 REQ-004-01 / D-12) ────────
-        # Count existing rows per Track value; a bucket at/over quota (e.g.
-        # grandfathered migration survivors) gets 0 new-discovery slots and is
-        # never trimmed. The per-run total stays capped at BATCH_SIZE,
-        # allocated across open buckets proportionally to their open slots.
-        need_by_track = compute_need_by_track(existing_rows)
-        total_open = sum(need_by_track.values())
-        if total_open <= 0:
-            print(f"✅ All buckets at quota ({MAX_TOTAL} companies). Skipping discovery.")
-            summary.note(f"All buckets at quota; discovery skipped.")
-        else:
-            need_by_track = allocate_batch(need_by_track, BATCH_SIZE)
-            need = sum(need_by_track.values())
-            open_desc = ", ".join(f"{t}: {n}" for t, n in need_by_track.items() if n)
-            print(f"🔍 Will discover up to {need} new companies this run "
-                  f"({open_desc}; total open slots: {total_open})...")
-            summary.attempted = need
+        # ── Step 2: Phase 1.5 — upgrade ATS URLs + backfill blank Career URLs ────
+        # The one shared pool flows through every step so quota-exhaustion
+        # state carries over (an exhausted pool aborts instantly, no re-spin).
+        run_phase_1_5(xlsx_path, tavily_client=tavily_pool)
 
-            companies = discover_ai_companies(tavily_key, existing_names, need_by_track)
+        # ── Step 3: BUG-69 — re-enrich blank Business Focus cells ────────────────
+        # Runs after Phase 1.5 so freshly-backfilled manual rows get a focus
+        # in the same run.
+        run_reenrich_business_focus(xlsx_path, tavily_client=tavily_pool)
 
-            if companies:
-                data = [c.model_dump() if hasattr(c, "model_dump") else dict(c)
-                        for c in companies]
-                upsert_companies(xlsx_path, data)
-                new_count = count_company_rows(xlsx_path)
-                print(f"✅ Added {len(data)} companies. Total: {new_count}")
-                summary.succeeded = len(data)
-                summary.failed = max(0, need - len(data))
-            else:
-                print("⚠️  No new companies returned.")
-                summary.failed = need
+        # ── Step 4: fill blank Track cells ────────────────────────────────────────
+        # Runs after the focus re-enrich so the classifier sees a Business
+        # Focus for manual name-only rows.
+        run_enrich_missing_tracks(xlsx_path)
 
-        # ── Step 3: Phase 1.5 — upgrade ATS URLs ─────────────────────────────────
-        run_phase_1_5(xlsx_path)
+        # ── Step 5: sort Company_List by Track ───────────────────────────────────
+        # MUST stay last: earlier steps write by captured excel_row, which a
+        # sort invalidates.
+        n_sorted = sort_company_list_by_track(xlsx_path)
+        print(f"↕️  Company_List sorted by Track ({n_sorted} rows).")
 
         print("🎉 Company Agent complete.")
     except Exception as e:
@@ -1097,48 +1390,14 @@ def migrate_tracks(xlsx_path: str | None = None) -> dict:
     if not pending:
         return {"migrated": 0, "skipped": skipped, "flagged": 0}
 
-    system_instruction = (
-        "You classify companies into exactly one of 6 track buckets for a "
-        "TPM job-search pipeline. Buckets:\n"
-        '  - "AI-native": AI labs / AI product startups / AI infra-compute, founded ~2000+\n'
-        '  - "Mid-large Tech": established mid-large tech companies (the only bucket '
-        "where legacy incumbents belong, e.g. Boeing, Visa, PayPal, Intuit)\n"
-        '  - "Robotics": robotics companies founded ~2000+\n'
-        '  - "Fintech": fintech companies founded ~2000+\n'
-        '  - "Space": space companies founded ~2000+\n'
-        '  - "Defense": venture-backed defense tech founded roughly 2010+. Palantir '
-        "belongs here (explicit exception). Legacy primes (Boeing, Lockheed Martin, "
-        "Raytheon/RTX, Northrop Grumman, General Dynamics, BAE, L3Harris) NEVER "
-        "belong here — classify them as Mid-large Tech.\n"
-        "Return one TrackClassification per input company, company_name copied "
-        "verbatim. Set confident=false when the business description is too thin "
-        "to decide — do not guess."
-        + SECURITY_CLAUSE  # P0-3: business_focus text originated from scraped web content
-    )
-
     migrated, flagged = 0, 0
     audit: list[tuple] = []
     tally: dict = {}
     BATCH = 25
     for b in range(0, len(pending), BATCH):
         chunk = pending[b : b + BATCH]
-        payload = json.dumps([{"company_name": n, "business_focus": f[:600]}
-                              for _, n, _, f in chunk])
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=TrackClassificationList,
-        )
         try:
-            resp = _KEY_POOL.generate_content(
-                model=MODEL,
-                contents=("Classify these companies:\n"
-                          f"<scraped_content>\n{payload}\n</scraped_content>"),
-                config=config,
-            )
-            results = {c.get("company_name", "").strip(): c
-                       for c in json.loads(resp.text).get("classifications", [])}
+            results = _classify_tracks_batch([(n, f) for _, n, _, f in chunk])
         except Exception as e:
             logging.error(f"[Migrate] batch {b // BATCH + 1} failed: {e} — "
                           "rows left unmigrated; re-run to retry.")

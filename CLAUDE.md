@@ -16,6 +16,8 @@ API keys go in `.env` (already present but empty). Required keys:
 - `FIRECRAWL_API_KEY` — Firecrawl web scraping
 
 Optional: `GEMINI_API_KEY_2` — second Gemini key for key-pool rotation (all 4 agents consume it when set).
+Optional: `FIRECRAWL_API_KEY_2` — second Firecrawl key; `shared/firecrawl_pool.py` rotates to it on 402/429 (credits exhausted) and prints one loud warning when all keys are exhausted.
+Optional: `TAVILY_API_KEY_2` — second Tavily key; `shared/tavily_pool.py` rotates to it on 402/429/usage-limit errors and, once all keys are exhausted, prints one loud warning then raises `TavilyQuotaExhausted` (callers abort their Tavily-dependent loops and retry next run — there is no free fallback for search).
 
 Load env vars in scripts with `python-dotenv` (`from dotenv import load_dotenv; load_dotenv()`).
 
@@ -30,6 +32,8 @@ agents/              # 4 Runtime Agents (the product)
 shared/              # Shared utilities reused across agents
   excel_store.py     # Unified Excel persistence layer
   gemini_pool.py     # Gemini API key rotation + transient retry
+  firecrawl_pool.py  # Firecrawl key rotation on 402/429 + exhaustion warning (BUG-68)
+  tavily_pool.py     # Tavily key rotation on 402/429/usage-limit + exhaustion raise (BUG-70)
   rate_limiter.py    # Token-bucket rate limiter
   config.py          # Shared constants (MODEL, AUTO_ARCHIVE_THRESHOLD)
   prompts.py         # Shared LLM system prompts (RECRUITER, HM, TAILOR)
@@ -73,7 +77,18 @@ will enrich them on the next pipeline run:
   Tech / Robotics / Fintech / Space / Defense); unknown/custom values take
   the strict Mid-large-Tech per-JD classifier path with a logged warning.
 - **JD_Tracker** — insert a row with just `JD URL` + `Company`. The job_agent
-  picks it up via `get_incomplete_jd_rows` and runs full extraction.
+  picks it up via `get_incomplete_jd_rows` and runs full extraction. Note:
+  manually-inserted rows pass the same write-time gates as discovery
+  (geo/domain/YoE/work-auth, BUG-66) — a non-US JD URL will be skipped.
+
+### User triage tabs (BUG-65)
+
+`JD_ToApply` and `Skipped JD` are user-owned tabs (same columns as
+JD_Tracker). Moving a reviewed row out of JD_Tracker into either tab is a
+FINAL decision: those JD URLs are permanently excluded from re-scraping and
+re-insertion. The pipeline never writes to or deletes from these tabs (it
+only auto-creates them when missing). Do not rename them — the exclusion is
+keyed on the exact tab names (`TRIAGE_SHEETS` in `shared/excel_store.py`).
 
 ## Key Libraries Available (installed in venv)
 
@@ -88,7 +103,7 @@ will enrich them on the next pipeline run:
 | `aiohttp` / `httpx` | Async HTTP requests |
 | `beautifulsoup4` | HTML parsing |
 | `huggingface_hub` | HuggingFace model access |
-| `pycountry` | US state/country name lookup for job geo-filtering |
+| `pycountry` | Installed but unused since 2026-07-09 (BUG-66): the legacy `_is_us*` geo filter was removed — `shared/excel_store.py:classify_region` is the live geo filter |
 | `pydantic` | Structured output schemas for Gemini JSON response validation |
 | `requests` | HTTP requests for ATS API calls and JD scrape fallback |
 | `openpyxl` | Excel file read/write (core data store) |
