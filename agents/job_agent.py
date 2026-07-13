@@ -31,7 +31,7 @@ from google.genai import types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shared.excel_store import (
     EXCEL_PATH, PROJECT_ROOT, get_or_create_excel, get_company_rows,
-    get_jd_url_meta, get_triaged_jd_urls, batch_update_jd_timestamps,
+    get_jd_url_meta, get_triaged_jd_urls, canonical_jd_url, batch_update_jd_timestamps,
     get_jd_urls, upsert_jd_record, batch_upsert_jd_records,
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
     get_archived_companies, get_company_archive_info, update_archive_status,
@@ -591,12 +591,19 @@ def _fetch_workable_jobs(career_url: str) -> list:
         logging.error(f"[Workable API] parse error for {api_url}: {type(e).__name__}: {e}")
         return []
 
+# BUG-72: student roles are never in scope (user is a 10-yr professional).
+# Filtered by title pre-scrape (_tpm_filter) and at write time (_gate_and_finalize).
+_INTERN_TITLE_RE = re.compile(r"\bintern(ship)?s?\b|\bco-?op\b|\bnew\s+grad(uate)?\b", re.I)
+
 def _tpm_filter(links: list) -> list:
     filtered = []
     skipped  = 0
+    interns  = 0
     for lnk in links:
         if not any(kw in lnk.get("title","").lower() for kw in TPM_KW):
             continue
+        if _INTERN_TITLE_RE.search(lnk.get("title", "")):
+            interns += 1; continue
         # PRJ-004 REQ-004-12: tightened geo — keep only Seattle / CA / TX /
         # US-Remote. "Unknown" (blank/placeholder) keeps, conservative as
         # before; dropped rows are logged for early post-launch spot checks
@@ -609,6 +616,8 @@ def _tpm_filter(links: list) -> list:
         filtered.append(lnk)
     if skipped:
         print(f"    [GeoFilter] skipped {skipped} out-of-region jobs (kept: Seattle/CA/TX/US-Remote).")
+    if interns:
+        print(f"    [InternFilter] skipped {interns} intern/co-op/new-grad roles.")
     return filtered
 
 # Title keywords that flag clearly non-track TPM roles at mid-large-tech
@@ -1986,6 +1995,12 @@ def _gate_and_finalize(parsed: dict, track: str, url: str,
     if domain not in JOB_DOMAIN_VALUES:
         print(f"      🚫 [DomainGate] No track match (domain={domain!r}): {url}")
         return None
+    # ── Gate 1.5 (BUG-72): intern/co-op/new-grad titles — never in scope.
+    # Belt-and-braces behind _tpm_filter: covers the generic-crawler/LLM path
+    # and incomplete-row retries, where no title prefilter runs.
+    if _INTERN_TITLE_RE.search(parsed.get("job_title", "") or ""):
+        print(f"      🚫 [InternGate] student role: {url}")
+        return None
     # ── Gate 2 (REQ-004-08): YoE — skip iff stated min ≤3 or ≥12
     # ("10+ years" keeps, "12+ years" skips). Unstated → keep + flag.
     min_yoe = parsed.get("min_yoe")
@@ -2118,14 +2133,19 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
 
     fresh_set = {u for u, m in known_url_meta.items() if m["age_days"] < FRESH_DAYS}
     stale_set = {u for u, m in known_url_meta.items() if m["age_days"] >= FRESH_DAYS}
+    # BUG-71: all known/triaged membership tests run on canonical URLs so the
+    # same posting rediscovered under a different URL string still matches.
+    fresh_canon = {canonical_jd_url(u) for u in fresh_set}
+    stale_canon = {canonical_jd_url(u) for u in stale_set}
 
-    to_process = [u for u in urls if u not in fresh_set]
+    to_process = [u for u in urls if canonical_jd_url(u) not in fresh_canon]
 
     # BUG-65: user-triaged URLs (JD_ToApply / Skipped JD tabs) are final —
-    # never re-scrape or re-add them to JD_Tracker.
+    # never re-scrape or re-add them to JD_Tracker. triaged_set holds
+    # canonical URLs (BUG-71).
     if triaged_set:
         before_triage = len(to_process)
-        to_process = [u for u in to_process if u not in triaged_set]
+        to_process = [u for u in to_process if canonical_jd_url(u) not in triaged_set]
         if before_triage - len(to_process):
             print(f"    🗂️  Triage gate: skipped {before_triage - len(to_process)} "
                   f"user-triaged posting(s).")
@@ -2139,8 +2159,8 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
         print(f"    All {len(urls)} JDs fresh (< {FRESH_DAYS} days) or aged out. Skipping.")
         return
 
-    new_urls_list   = [u for u in to_process if u not in stale_set]
-    stale_urls_list = [u for u in to_process if u in stale_set]
+    new_urls_list   = [u for u in to_process if canonical_jd_url(u) not in stale_canon]
+    stale_urls_list = [u for u in to_process if canonical_jd_url(u) in stale_canon]
     print(f"    {len(new_urls_list)} new, {len(stale_urls_list)} stale JDs to process.")
 
     sem            = asyncio.Semaphore(3)
@@ -2151,9 +2171,10 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
     async def fetch_one(url: str) -> None:
         # ── Scrape phase: concurrency-limited by semaphore (I/O bound) ──
         async with sem:
-            if url in seen_urls:  # BUG-04: skip duplicate (atomic check+add, no await between)
+            canon = canonical_jd_url(url)  # BUG-71: dedupe on canonical form
+            if canon in seen_urls:  # BUG-04: skip duplicate (atomic check+add, no await between)
                 return
-            seen_urls.add(url)
+            seen_urls.add(canon)
             print(f"      🕷️  {url}")
             markdown, label = await _route_scraper(url, crawler, list_meta)
         if not markdown:
@@ -2321,8 +2342,8 @@ async def _main_inner(summary: RunSummary):
         # ── Phase: Retry incomplete JD records ─────────────────────────────────
         incomplete = get_incomplete_jd_rows(xlsx_path)
         # BUG-65: belt-and-braces — a triaged URL that also (still) sits in
-        # JD_Tracker must not be re-extracted/overwritten.
-        incomplete = [r for r in incomplete if r["url"] not in triaged_set]
+        # JD_Tracker must not be re-extracted/overwritten. Canonical match (BUG-71).
+        incomplete = [r for r in incomplete if canonical_jd_url(r["url"]) not in triaged_set]
         if incomplete:
             print(f"\n{'='*60}")
             print(f"🔄 Retrying {len(incomplete)} incomplete JD records...")

@@ -4,8 +4,10 @@ All functions load → modify → save on each call (safe for single-process use
 job_agent wraps writes in an asyncio.Lock to prevent concurrent corruption.
 """
 import os
+import re
 import json
 from datetime import datetime, date
+from urllib.parse import urlsplit, parse_qsl, urlencode
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -530,10 +532,64 @@ def get_company_archive_info(xlsx_path: str = EXCEL_PATH) -> dict:
 
 
 # ── JD helpers ────────────────────────────────────────────────────────────────
+# BUG-71: known tracking-only query params. Stripping these (plus sorting the
+# survivors) makes two scrapes of the same posting compare equal even when the
+# source page decorated the link differently between runs (observed: LinkedIn
+# pagenum/position/refid/trackingid). Job-identifying params like gh_jid are
+# NOT in this list — on embedded Greenhouse boards the query IS the job key.
+_TRACKING_PARAMS = frozenset([
+    "gclid", "fbclid", "gh_src", "src", "source", "lever-source",
+    "ref", "refid", "referrer", "trackingid", "tracking_id",
+    "pagenum", "position", "page", "origin",
+])
+_LINKEDIN_JOB_RE = re.compile(r"/jobs/view/(?:[^/]*?-)?(\d+)/?$")
+_TESLA_JOB_RE    = re.compile(r"/careers/search/job/(?:apply/)?(?:[a-z0-9-]*?-)?(\d+)/?$")
+
+
+def canonical_jd_url(url: str) -> str:
+    """BUG-71: reduce a JD URL to a canonical identity string so the same
+    posting discovered under cosmetically different URLs dedupes correctly.
+
+    Rules (conservative — false negatives are acceptable, false positives
+    would silently drop legitimate new jobs):
+      - case-normalize host, strip www., strip trailing slash;
+      - job-boards.greenhouse.io == boards.greenhouse.io (same board, two hosts);
+      - linkedin.com/jobs/view/<slug>-<id> → the numeric id (query dropped:
+        LinkedIn queries are pure tracking);
+      - tesla.com /job/apply/<id> and /job/<slug>-<id> → the numeric id;
+      - otherwise drop known tracking params, keep + sort the rest
+        (gh_jid-style job keys survive).
+    Comparison key only — never write it back to a sheet."""
+    s = urlsplit(str(url or "").strip())
+    host = s.netloc.lower().lstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "job-boards.greenhouse.io":
+        host = "boards.greenhouse.io"
+    path = s.path.rstrip("/")
+
+    if host.endswith("linkedin.com"):
+        m = _LINKEDIN_JOB_RE.search(path)
+        if m:
+            return f"linkedin.com/jobs/view/{m.group(1)}"
+    if host.endswith("tesla.com"):
+        m = _TESLA_JOB_RE.search(path.lower())
+        if m:
+            return f"tesla.com/careers/search/job/{m.group(1)}"
+
+    params = [(k, v) for k, v in parse_qsl(s.query, keep_blank_values=True)
+              if k.lower() not in _TRACKING_PARAMS
+              and not k.lower().startswith(("utm_", "campaign"))]
+    query = urlencode(sorted(params))
+    return f"{host}{path}" + (f"?{query}" if query else "")
+
+
 def get_triaged_jd_urls(xlsx_path: str = EXCEL_PATH) -> set:
-    """Return the set of JD URLs the user has triaged into TRIAGE_SHEETS
-    (BUG-65). These are final decisions: the pipeline must never re-scrape
-    them or re-add them to JD_Tracker. Missing tabs are tolerated."""
+    """Return the set of CANONICAL JD URLs (canonical_jd_url) the user has
+    triaged into TRIAGE_SHEETS (BUG-65). These are final decisions: the
+    pipeline must never re-scrape them or re-add them to JD_Tracker. Callers
+    must canonicalize before membership tests (BUG-71). Missing tabs are
+    tolerated."""
     wb = load_workbook(xlsx_path, read_only=True)
     try:
         urls = set()
@@ -545,7 +601,7 @@ def get_triaged_jd_urls(xlsx_path: str = EXCEL_PATH) -> set:
             for r in range(2, ws.max_row + 1):
                 url = str(ws.cell(r, c_url).value or "").strip()
                 if url:
-                    urls.add(url)
+                    urls.add(canonical_jd_url(url))
         return urls
     finally:
         wb.close()
@@ -765,7 +821,10 @@ def batch_upsert_jd_records(xlsx_path: str, records: list) -> int:
     wb  = load_workbook(xlsx_path)
     try:
         ws  = wb["JD_Tracker"]
-        idx = {ws.cell(r, 1).value: r for r in range(2, ws.max_row + 1) if ws.cell(r, 1).value}
+        # BUG-71: index by canonical URL so the same posting rediscovered under
+        # a cosmetically different URL updates its existing row (never a dup).
+        idx = {canonical_jd_url(ws.cell(r, 1).value): r
+               for r in range(2, ws.max_row + 1) if ws.cell(r, 1).value}
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for jd_url, jd_json, markdown_hash in records:
             try:
@@ -773,12 +832,13 @@ def batch_upsert_jd_records(xlsx_path: str, records: list) -> int:
                 row_data = _jd_row_data(jd_url, d, now, markdown_hash)
             except json.JSONDecodeError:
                 row_data = _JD_ERROR_ROW(jd_url, now, markdown_hash)
-            if jd_url in idx:
+            canon = canonical_jd_url(jd_url)
+            if canon in idx:
                 for col, val in enumerate(row_data, 1):
-                    ws.cell(idx[jd_url], col, val)
+                    ws.cell(idx[canon], col, val)
             else:
                 ws.append(row_data)
-                idx[jd_url] = ws.max_row
+                idx[canon] = ws.max_row
         wb.save(xlsx_path)
         return len(records)
     finally:

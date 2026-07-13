@@ -358,6 +358,18 @@ enrichable Company_List gap self-heals (plan:
 
 > **Code location**: `agents/company_agent.py` (`run_discovery_loop`, `run_enrich_missing_tracks`, `_classify_tracks_batch`, `_TRACK_CLASSIFY_SYSTEM_INSTRUCTION`), `shared/excel_store.py` (`sort_company_list_by_track`), `shared/config.py` (`TRACK_ORDER`), `shared/tavily_pool.py` (`TavilyKeyPool`, `TavilyQuotaExhausted`, `build_pool_from_env`), `agents/job_agent.py` (backfill client init).
 
+## 9.10 JD Dedup & Scope Hardening (2026-07-13)
+
+User review of the first post-launch JD batches: duplicate postings survived
+triage exclusion under URL variants, and internship roles reached JD_Tracker.
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-149 | Canonical JD URL dedup (BUG-71): every JD dedup membership test — triage exclusion (REQ-140), fresh/stale known-URL sets, in-run duplicate guard, incomplete-retry filter, and the `batch_upsert_jd_records` row index — compares `canonical_jd_url()` forms, never exact strings. Canonicalization: host case/www/trailing-slash normalization, `job-boards.greenhouse.io`≡`boards.greenhouse.io`, LinkedIn `/jobs/view/<slug>-<id>` → numeric id (query dropped), Tesla `/job/apply/<id>` ≡ `/job/<slug>-<id>`, otherwise known tracking params stripped (`utm_*`, `gh_src`, `refid`, `trackingid`, `pagenum`, `position`, …) with survivors sorted — job-key params like `gh_jid` always preserved. Conservative by design: a missed duplicate is acceptable, silently dropping a legitimate new job is not. Canonical forms are comparison keys only — never written to any sheet. | `[t]` |
+| REQ-150 | Intern scope filter (BUG-72): intern / co-op / new-grad titles (word-boundary regex; "Internal Tools" unaffected) are excluded on every path — pre-scrape in `_tpm_filter` (all ATS adapters, saves scrape+Gemini cost) and write-time Gate 1.5 in `_gate_and_finalize` (generic-crawler/LLM path + incomplete retries). Closes the REQ-004-08 gap where student JDs state no minimum YoE and fell into keep+flag. | `[t]` |
+
+> **Code location**: `shared/excel_store.py` (`canonical_jd_url`, `get_triaged_jd_urls`, `batch_upsert_jd_records`), `agents/job_agent.py` (`_INTERN_TITLE_RE`, `_tpm_filter`, `_gate_and_finalize`, `process_company`).
+
 ## 10. Technical Decision Record
 
 ### DEC-001: LLM Model Selection — Retain Gemini flash-lite (2026-03-16)
@@ -403,4 +415,5 @@ enrichable Company_List gap self-heals (plan:
 | v2.1 | 2026-05-20 | Added "9.6 Post-PRJ-003 Operational Hardening" section: REQ-130 (manual-entry Career URL backfill), REQ-131 (tailored-resume user-edit protection via Last Written Hash), REQ-132 (JD_Tracker auto-sort by Location Tier), REQ-133 (launchd daily pipeline runner), REQ-134 (Gemini model name → GA). REQ-030 updated to include `.pdf` cross-reference. Tests: 749 → 859 (+110, spanning Workable/Workday discovery work + the 5 features above). |
 | v2.2 | 2026-07-07 | Added "9.7 PRJ-004: Multi-Track Expansion": REQ-004-01~26 (six-track taxonomy, YoE/freshness/work-auth gates, schema renames, Amazon adapter, per-track match routing). REQ-130's `AI Domain` semantics superseded by `Track`; REQ-132's 3-tier location sort superseded by the combined 1–6 Sort Tier. Tests: 859 → 945 (+86). |
 | v2.3 | 2026-07-09 | Added "9.8 Post-Launch Excel-Review Follow-ups": REQ-140 (user triage tabs permanent exclusion), REQ-141 (geo gate on every staging path + verbatim location extraction), REQ-142 (posted-date recovery chain incl. JSON-LD `datePosted`), REQ-143 (Firecrawl key pool + 402 visibility), REQ-144 (Business Focus self-heal). REQ-004-18 (Google Careers adapter, T16) implemented with documented endpoint deviation. Tests: 945 → 995+. |
+| v2.5 | 2026-07-13 | Added "9.10 JD Dedup & Scope Hardening": REQ-149 (canonical JD URL comparison at every dedup layer, BUG-71 — extends REQ-140's exact-string exclusion), REQ-150 (intern/co-op/new-grad title filter pre-scrape + write-time, BUG-72). 3 duplicate rows removed from `Skipped JD` (backup kept). Tests: +18 (canonicalization, canonical upsert/triage matching, intern filter/gate). |
 | v2.4 | 2026-07-10 | Added "9.9 Company Agent Self-Heal & Full-Run Discovery": REQ-145 (discovery loop to 500 quota, supersedes single-batch REQ-004-01 behavior), REQ-146 (blank-Track enrichment via shared classifier), REQ-147 (Company_List Track sort as final step; `TRACK_ORDER` moved to `shared/config.py`), REQ-148 (Tavily key pool with usage-limit detection, BUG-70). Root cause of the 2026-07-09 zero-success run documented as Tavily plan-limit exhaustion (not code) — the "usage limit" error text additionally evaded all quota-abort checks, fixed by the pool. Tests: +27. |

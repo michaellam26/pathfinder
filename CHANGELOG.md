@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 2026-07-13
+
+### Job agent: canonical-URL dedup (BUG-71) + intern filter (BUG-72)
+
+User review of the first post-launch JD batches found duplicate postings
+surviving triage and internship roles in JD_Tracker.
+
+**Fixes**:
+- **Canonical JD URLs (`shared/excel_store.py:canonical_jd_url`)**: all JD
+  dedup layers (BUG-65 triage exclusion, fresh/stale sets, BUG-04 in-run
+  guard, upsert row index) now compare canonical URL forms instead of exact
+  strings, so the same posting rediscovered under tracking-param or
+  host/path variants (LinkedIn, Tesla, Greenhouse hosts) never re-scrapes or
+  duplicates. `get_triaged_jd_urls` now returns canonical URLs — callers
+  must canonicalize before membership tests. 3 pre-existing duplicate rows
+  removed from `Skipped JD` (backup: `pathfinder_dashboard.backup-20260713.xlsx`).
+- **Intern filter (`agents/job_agent.py`)**: intern / co-op / new-grad
+  titles are dropped pre-scrape in `_tpm_filter` and at write time in
+  `_gate_and_finalize` (Gate 1.5) — they previously slipped through the YoE
+  gate because student JDs state no minimum YoE.
+
 ## 2026-07-10
 
 ### Company agent: discover-to-500 loop, blank-Track enrichment, Track sort

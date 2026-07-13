@@ -2395,6 +2395,43 @@ class TestTpmFilterGeo(unittest.TestCase):
         self.assertEqual(kept, {"u1", "u3", "u4", "u5", "u6"})
 
 
+class TestInternFilter(unittest.TestCase):
+    """BUG-72: intern/co-op/new-grad roles are never in scope — dropped by
+    title pre-scrape (_tpm_filter) and at write time (_gate_and_finalize)."""
+
+    def test_tpm_filter_drops_student_titles(self):
+        from agents.job_agent import _tpm_filter
+        links = [
+            {"url": "u1", "title": "Internship, Technical Program Manager, Cell Manufacturing", "location": "Fremont, CA"},
+            {"url": "u2", "title": "Technical Program Manager Intern, Battery Engineering", "location": "Palo Alto, CA"},
+            {"url": "u3", "title": "Technical Program Manager Co-op", "location": "Austin, TX"},
+            {"url": "u4", "title": "New Grad Technical Program Manager", "location": "Seattle, WA"},
+            {"url": "u5", "title": "Senior Technical Program Manager", "location": "Seattle, WA"},
+            # "internal" must NOT trip the \bintern\b boundary
+            {"url": "u6", "title": "Technical Program Manager, Internal Tools", "location": "Austin, TX"},
+        ]
+        kept = {l["url"] for l in _tpm_filter(links)}
+        self.assertEqual(kept, {"u5", "u6"})
+
+    def test_gate_and_finalize_drops_intern_title(self):
+        from agents.job_agent import _gate_and_finalize
+        parsed = {"job_title": "Internship, Technical Program Manager, Optimus (Fall 2026)",
+                  "company": "Tesla", "location": "Palo Alto, CA",
+                  "job_domain": "Robotics", "min_yoe": None,
+                  "work_auth": "none_stated"}
+        self.assertIsNone(_gate_and_finalize(parsed, "Robotics", "https://x.co/jd/1",
+                                             posted_date="2026-07-01"))
+
+    def test_gate_and_finalize_keeps_internal_tools_title(self):
+        from agents.job_agent import _gate_and_finalize
+        parsed = {"job_title": "Senior TPM, Internal Developer Platform",
+                  "company": "Acme", "location": "Seattle, WA",
+                  "job_domain": "AI", "min_yoe": 6,
+                  "work_auth": "none_stated"}
+        self.assertIsNotNone(_gate_and_finalize(parsed, "AI-native", "https://x.co/jd/2",
+                                                posted_date="2026-07-01"))
+
+
 class TestBackfillPostedDate(unittest.TestCase):
     """REQ-004-10/19: Tavily-scoped LinkedIn search-signal backfill."""
 
@@ -2704,7 +2741,18 @@ class TestTriagedUrlExclusion(unittest.IsolatedAsyncioTestCase):
         return route_mock
 
     async def test_triaged_url_not_scraped(self):
-        route_mock = await self._run({self.TRIAGED_URL})
+        # BUG-71: triaged_set carries canonical URLs (get_triaged_jd_urls contract)
+        from shared.excel_store import canonical_jd_url
+        route_mock = await self._run({canonical_jd_url(self.TRIAGED_URL)})
+        scraped = [c.args[0] for c in route_mock.await_args_list]
+        self.assertNotIn(self.TRIAGED_URL, scraped)
+        self.assertIn(self.NEW_URL, scraped)
+
+    async def test_triaged_url_variant_not_scraped(self):
+        """BUG-71: a tracking-param variant of a triaged URL is also excluded."""
+        from shared.excel_store import canonical_jd_url
+        route_mock = await self._run(
+            {canonical_jd_url(self.TRIAGED_URL + "?gh_src=abc&utm_source=li")})
         scraped = [c.args[0] for c in route_mock.await_args_list]
         self.assertNotIn(self.TRIAGED_URL, scraped)
         self.assertIn(self.NEW_URL, scraped)

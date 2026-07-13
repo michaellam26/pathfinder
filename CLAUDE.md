@@ -89,6 +89,9 @@ FINAL decision: those JD URLs are permanently excluded from re-scraping and
 re-insertion. The pipeline never writes to or deletes from these tabs (it
 only auto-creates them when missing). Do not rename them — the exclusion is
 keyed on the exact tab names (`TRIAGE_SHEETS` in `shared/excel_store.py`).
+Exclusion matches on canonical URL form (BUG-71,
+`shared/excel_store.py:canonical_jd_url`), so tracking-param or host/path
+variants of a triaged posting are also excluded.
 
 ## Key Libraries Available (installed in venv)
 

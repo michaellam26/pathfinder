@@ -1,5 +1,11 @@
 # Task Tracker
 
+## Completed (2026-07-13): JD dedup + intern filter (BUG-71/72, user Excel review)
+- [x] Dedupe `Skipped JD`: removed 3 duplicate rows (Uber×2 LinkedIn tracking-param variants, Tesla×1 apply/slug variant); backup `pathfinder_dashboard.backup-20260713.xlsx`
+- [x] `shared/excel_store.py` — `canonical_jd_url()`; `get_triaged_jd_urls` returns canonical set; `batch_upsert_jd_records` indexes by canonical URL
+- [x] `agents/job_agent.py` — canonical comparison at triage/fresh/stale/seen/incomplete-retry layers; `_INTERN_TITLE_RE` in `_tpm_filter` + Gate 1.5 in `_gate_and_finalize`
+- [x] Tests: +18 (canonicalization, canonical upsert/triage, intern filter/gate); docs: BUGS BUG-71/72, CHANGELOG, REQUIREMENTS v2.5 (REQ-149/150), CLAUDE.md triage note
+
 ## Completed (2026-07-10): Company agent — discover-to-500 loop + self-heal + Track sort
 
 **Plan**: `.claude/plans/tingly-riding-meerkat.md` | **Trigger**: 2026-07-09 run attempted 50 / succeeded 0

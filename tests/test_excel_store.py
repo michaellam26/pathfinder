@@ -39,7 +39,7 @@ from shared.excel_store import (
     get_archived_companies, update_archive_status, unarchive_company,
     get_company_archive_info, count_valid_tpm_jobs_by_company,
     classify_location, sort_jd_tracker_by_tier, sort_company_list_by_track,
-    get_triaged_jd_urls, TRIAGE_SHEETS,
+    get_triaged_jd_urls, TRIAGE_SHEETS, canonical_jd_url,
     get_incomplete_company_rows, update_company_business_focus,
     COMPANY_HEADERS, JD_HEADERS, MATCH_HEADERS, TAILORED_HEADERS, _JD_COL,
 )
@@ -3045,7 +3045,7 @@ class TestGetTriagedJdUrls(unittest.TestCase):
         self._append("JD_ToApply", "https://a.co/jd/1")
         self._append("Skipped JD", "https://b.co/jd/2")
         self.assertEqual(get_triaged_jd_urls(self.path),
-                         {"https://a.co/jd/1", "https://b.co/jd/2"})
+                         {"a.co/jd/1", "b.co/jd/2"})
 
     def test_empty_tabs_return_empty_set(self):
         self.assertEqual(get_triaged_jd_urls(self.path), set())
@@ -3062,11 +3062,133 @@ class TestGetTriagedJdUrls(unittest.TestCase):
         self._append("JD_ToApply", "  ")
         self._append("Skipped JD", None)
         self._append("Skipped JD", "https://c.co/jd/3")
-        self.assertEqual(get_triaged_jd_urls(self.path), {"https://c.co/jd/3"})
+        self.assertEqual(get_triaged_jd_urls(self.path), {"c.co/jd/3"})
 
     def test_url_whitespace_stripped(self):
         self._append("JD_ToApply", "  https://d.co/jd/4 ")
-        self.assertEqual(get_triaged_jd_urls(self.path), {"https://d.co/jd/4"})
+        self.assertEqual(get_triaged_jd_urls(self.path), {"d.co/jd/4"})
+
+    def test_returns_canonical_urls(self):
+        """BUG-71: triaged set holds canonical forms — a tracking-param variant
+        of a triaged URL must hit the set after canonicalization."""
+        self._append("Skipped JD",
+                     "https://www.linkedin.com/jobs/view/pm-at-uber-4407580818"
+                     "?pagenum=0&position=40&refid=abc&trackingid=xyz")
+        triaged = get_triaged_jd_urls(self.path)
+        rediscovered = ("https://www.linkedin.com/jobs/view/pm-at-uber-4407580818"
+                        "?pagenum=2&position=2&refid=def&trackingid=uvw")
+        self.assertIn(canonical_jd_url(rediscovered), triaged)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestCanonicalJdUrl(unittest.TestCase):
+    """BUG-71: canonical_jd_url collapses cosmetic URL variants of the same
+    posting while keeping genuinely different postings distinct. Cases mirror
+    real duplicates observed in the 2026-07 triage tabs."""
+
+    def test_linkedin_tracking_params_collapse(self):
+        a = ("https://www.linkedin.com/jobs/view/program-manager-at-uber-4407580818"
+             "?pagenum=0&position=40&refid=Yl34&trackingid=0QcF")
+        b = ("https://www.linkedin.com/jobs/view/program-manager-at-uber-4407580818"
+             "?pagenum=2&position=2&refid=ef8p&trackingid=r5EE")
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(b))
+        self.assertEqual(canonical_jd_url(a), "linkedin.com/jobs/view/4407580818")
+
+    def test_linkedin_different_jobs_stay_distinct(self):
+        a = "https://www.linkedin.com/jobs/view/x-at-uber-4407580818"
+        b = "https://www.linkedin.com/jobs/view/x-at-uber-4407580819"
+        self.assertNotEqual(canonical_jd_url(a), canonical_jd_url(b))
+
+    def test_tesla_apply_and_slug_forms_collapse(self):
+        a = "https://www.tesla.com/careers/search/job/apply/275085"
+        b = ("https://www.tesla.com/careers/search/job/"
+             "technical-program-manager-integration-platforms-275085")
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(b))
+        self.assertEqual(canonical_jd_url(a), "tesla.com/careers/search/job/275085")
+
+    def test_tesla_different_ids_stay_distinct(self):
+        a = "https://www.tesla.com/careers/search/job/apply/275085"
+        b = "https://www.tesla.com/careers/search/job/apply/254809"
+        self.assertNotEqual(canonical_jd_url(a), canonical_jd_url(b))
+
+    def test_gh_jid_is_preserved_as_job_key(self):
+        """Embedded Greenhouse boards: the query IS the job identity."""
+        a = "https://www.pinterestcareers.com/jobs/?gh_jid=7494686"
+        b = "https://www.pinterestcareers.com/jobs/?gh_jid=7770927"
+        self.assertNotEqual(canonical_jd_url(a), canonical_jd_url(b))
+        self.assertIn("gh_jid=7494686", canonical_jd_url(a))
+
+    def test_gh_src_tracking_param_dropped(self):
+        a = "https://boards.greenhouse.io/acme/jobs/123?gh_jid=123&gh_src=abc123"
+        b = "https://boards.greenhouse.io/acme/jobs/123?gh_jid=123"
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(b))
+
+    def test_greenhouse_host_variants_collapse(self):
+        a = "https://boards.greenhouse.io/acme/jobs/123"
+        b = "https://job-boards.greenhouse.io/acme/jobs/123"
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(b))
+
+    def test_scheme_www_case_trailing_slash_normalized(self):
+        a = "https://WWW.Amazon.jobs/en/jobs/10457530/senior-tpm/"
+        b = "http://amazon.jobs/en/jobs/10457530/senior-tpm"
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(b))
+
+    def test_utm_params_dropped_and_order_insensitive(self):
+        a = "https://x.co/jobs/9?b=2&a=1&utm_source=li&utm_campaign=q3"
+        b = "https://x.co/jobs/9?a=1&b=2"
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(b))
+
+    def test_blank_and_none_safe(self):
+        self.assertEqual(canonical_jd_url(""), "")
+        self.assertEqual(canonical_jd_url(None), "")
+
+    def test_coreweave_bare_param_kept_deterministically(self):
+        a = "https://coreweave.com/careers/job?4690181006&board=coreweave&gh_jid=4690181006"
+        b = "https://coreweave.com/careers/job?4694176006&board=coreweave&gh_jid=4694176006"
+        self.assertNotEqual(canonical_jd_url(a), canonical_jd_url(b))
+        self.assertEqual(canonical_jd_url(a), canonical_jd_url(a))
+
+
+class TestBatchUpsertCanonicalMatch(unittest.TestCase):
+    """BUG-71: a posting rediscovered under a URL variant updates its existing
+    JD_Tracker row instead of appending a duplicate."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _jd_json(self, title):
+        return json.dumps({"job_title": title, "company": "Uber",
+                           "location": "Seattle, WA"})
+
+    def test_variant_url_updates_not_appends(self):
+        base = ("https://www.linkedin.com/jobs/view/pm-at-uber-4407580818"
+                "?pagenum=0&refid=a")
+        variant = ("https://www.linkedin.com/jobs/view/pm-at-uber-4407580818"
+                   "?pagenum=2&refid=b")
+        batch_upsert_jd_records(self.path, [(base, self._jd_json("PM v1"), "h1")])
+        batch_upsert_jd_records(self.path, [(variant, self._jd_json("PM v2"), "h2")])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        rows = [ws.cell(r, 2).value for r in range(2, ws.max_row + 1)
+                if ws.cell(r, 1).value]
+        wb.close()
+        self.assertEqual(rows, ["PM v2"])
+
+    def test_distinct_jobs_still_append(self):
+        a = "https://www.tesla.com/careers/search/job/apply/275085"
+        b = "https://www.tesla.com/careers/search/job/apply/254809"
+        batch_upsert_jd_records(self.path, [(a, self._jd_json("TPM A"), "h1"),
+                                            (b, self._jd_json("TPM B"), "h2")])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["JD_Tracker"]
+        n = sum(1 for r in range(2, ws.max_row + 1) if ws.cell(r, 1).value)
+        wb.close()
+        self.assertEqual(n, 2)
 
 
 class TestSortCompanyListByTrack(unittest.TestCase):
