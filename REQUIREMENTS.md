@@ -370,6 +370,19 @@ triage exclusion under URL variants, and internship roles reached JD_Tracker.
 
 > **Code location**: `shared/excel_store.py` (`canonical_jd_url`, `get_triaged_jd_urls`, `batch_upsert_jd_records`), `agents/job_agent.py` (`_INTERN_TITLE_RE`, `_tpm_filter`, `_gate_and_finalize`, `process_company`).
 
+## 9.11 Concurrent-Run Safety (2026-07-16)
+
+A manual job_agent run overlapped the still-running scheduled pipeline:
+duplicate scraping spend, an EOFError crash mid-read, and a silent
+last-writer-wins race on the workbook (BUG-73).
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-151 | Single-agent execution (BUG-73): at most one PathFinder agent process touches `pathfinder_dashboard.xlsx` at a time. Every agent entry point holds an exclusive `flock` (`shared/run_lock.py`, `logs/pathfinder.lock`) for its whole run. Default is fail-fast: a second launch aborts before any work or API spend, naming the holder (agent / pid / start time). `PATHFINDER_LOCK_WAIT=1` blocks until the lock frees instead — the scheduled pipeline (`run_pipeline_scheduled.sh`) exports it so phases queue rather than fail the daily run. Lock release is kernel-guaranteed on process exit (clean or crash); the lockfile's holder text is diagnostic only, never authoritative. | `[t]` |
+| REQ-152 | Crash-proof reads (BUG-73): every read-only workbook load goes through `load_workbook_readonly` — file bytes snapshotted to memory before parsing, so an external writer truncating the file mid-read (openpyxl `wb.save()` rewrites in place) can never kill a reader mid-stream. Catching a writer mid-save fails the zip open atomically and is retried (3 attempts, 0.5s apart) before raising. Defense-in-depth behind REQ-151 — also covers non-agent writers (e.g. Excel saving while the user has the dashboard open). | `[t]` |
+
+> **Code location**: `shared/run_lock.py`, `shared/excel_store.py` (`load_workbook_readonly`, `get_company_archive_info`), all four `agents/*` `__main__` blocks, `scripts/run_pipeline_scheduled.sh`.
+
 ## 10. Technical Decision Record
 
 ### DEC-001: LLM Model Selection — Retain Gemini flash-lite (2026-03-16)
@@ -417,3 +430,4 @@ triage exclusion under URL variants, and internship roles reached JD_Tracker.
 | v2.3 | 2026-07-09 | Added "9.8 Post-Launch Excel-Review Follow-ups": REQ-140 (user triage tabs permanent exclusion), REQ-141 (geo gate on every staging path + verbatim location extraction), REQ-142 (posted-date recovery chain incl. JSON-LD `datePosted`), REQ-143 (Firecrawl key pool + 402 visibility), REQ-144 (Business Focus self-heal). REQ-004-18 (Google Careers adapter, T16) implemented with documented endpoint deviation. Tests: 945 → 995+. |
 | v2.5 | 2026-07-13 | Added "9.10 JD Dedup & Scope Hardening": REQ-149 (canonical JD URL comparison at every dedup layer, BUG-71 — extends REQ-140's exact-string exclusion), REQ-150 (intern/co-op/new-grad title filter pre-scrape + write-time, BUG-72). 3 duplicate rows removed from `Skipped JD` (backup kept). Tests: +18 (canonicalization, canonical upsert/triage matching, intern filter/gate). |
 | v2.4 | 2026-07-10 | Added "9.9 Company Agent Self-Heal & Full-Run Discovery": REQ-145 (discovery loop to 500 quota, supersedes single-batch REQ-004-01 behavior), REQ-146 (blank-Track enrichment via shared classifier), REQ-147 (Company_List Track sort as final step; `TRACK_ORDER` moved to `shared/config.py`), REQ-148 (Tavily key pool with usage-limit detection, BUG-70). Root cause of the 2026-07-09 zero-success run documented as Tavily plan-limit exhaustion (not code) — the "usage limit" error text additionally evaded all quota-abort checks, fixed by the pool. Tests: +27. |
+| v2.6 | 2026-07-16 | Added "9.11 Concurrent-Run Safety": REQ-151 (exclusive per-run flock via `shared/run_lock.py`; manual runs fail fast, pipeline queues via `PATHFINDER_LOCK_WAIT=1`), REQ-152 (all read-only workbook loads snapshot to memory via `load_workbook_readonly` + retry). Root cause BUG-73: manual job_agent run overlapped the 6h-long 2026-07-16 scheduled pipeline — EOFError crash mid-read, duplicate scrape spend, write race. Tests: +9 (1042 total). |

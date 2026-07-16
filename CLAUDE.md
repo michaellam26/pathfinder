@@ -34,6 +34,7 @@ shared/              # Shared utilities reused across agents
   gemini_pool.py     # Gemini API key rotation + transient retry
   firecrawl_pool.py  # Firecrawl key rotation on 402/429 + exhaustion warning (BUG-68)
   tavily_pool.py     # Tavily key rotation on 402/429/usage-limit + exhaustion raise (BUG-70)
+  run_lock.py        # Cross-process run lock — one agent at a time (BUG-73); manual runs fail fast, pipeline queues via PATHFINDER_LOCK_WAIT=1
   rate_limiter.py    # Token-bucket rate limiter
   config.py          # Shared constants (MODEL, AUTO_ARCHIVE_THRESHOLD)
   prompts.py         # Shared LLM system prompts (RECRUITER, HM, TAILOR)
@@ -121,6 +122,11 @@ No build step. Run agents directly:
 source venv/bin/activate
 python agents/<agent_name>.py
 ```
+
+Agents hold an exclusive run lock (`logs/pathfinder.lock`, BUG-73) — a manual
+run while another agent (e.g. the 04:00 scheduled pipeline) is still going
+fails fast with a message naming the holder. Set `PATHFINDER_LOCK_WAIT=1` to
+queue behind it instead; the scheduled pipeline sets this itself.
 
 ## Custom Agents (`.claude/agents/`)
 

@@ -620,13 +620,13 @@ async def _main_inner(summary: RunSummary):
 
 def _print_top_results(xlsx_path: str, resume_id: str):
     """Print top-5 matches to console. ★ = fine evaluated, ~ = coarse only."""
-    from openpyxl import load_workbook
+    from shared.excel_store import load_workbook_readonly
     # BUG-51: dynamic column lookup instead of hardcoded indices
     col_rid   = MATCH_HEADERS.index("Resume ID") + 1
     col_url   = MATCH_HEADERS.index("JD URL") + 1
     col_score = MATCH_HEADERS.index("Score") + 1
     col_stage = MATCH_HEADERS.index("Stage") + 1
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Match_Results"]
         rows = []
@@ -651,4 +651,9 @@ def _print_top_results(xlsx_path: str, resume_id: str):
 
 
 if __name__ == "__main__":
+    from shared.run_lock import acquire_run_lock, AgentAlreadyRunning
+    try:
+        _run_lock = acquire_run_lock("match_agent")
+    except AgentAlreadyRunning as e:
+        raise SystemExit(f"🔒 {e}")
     asyncio.run(main())

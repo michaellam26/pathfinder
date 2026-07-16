@@ -85,6 +85,23 @@ class TestPipelineScriptMarkers(unittest.TestCase):
         self.assertRegex(open(ok).read().strip(),
                          r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 
+    def test_agents_run_with_lock_wait_mode(self):
+        """BUG-73: the pipeline must export PATHFINDER_LOCK_WAIT=1 so its
+        phases queue behind a run-lock holder instead of aborting the run."""
+        for name in ("company_agent.py", "job_agent.py",
+                     "match_agent.py", "resume_optimizer.py"):
+            path = os.path.join(self.dir, "agents", name)
+            with open(path, "w") as f:
+                f.write(
+                    "import os\n"
+                    "with open(os.path.join('logs', 'lock_wait_seen'), 'a') as fh:\n"
+                    "    fh.write(os.environ.get('PATHFINDER_LOCK_WAIT', '') + '\\n')\n"
+                )
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = open(os.path.join(self.dir, "logs", "lock_wait_seen")).read()
+        self.assertEqual(seen.split(), ["1", "1", "1", "1"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

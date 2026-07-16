@@ -1,5 +1,17 @@
 # Task Tracker
 
+## Completed (2026-07-16): Concurrent-run collision fix (BUG-73)
+
+**Trigger**: manual `job_agent` run (09:57) crashed with EOFError — it overlapped the still-running 04:00 scheduled pipeline (6h long from company-agent API retries); the pipeline's match agent rewrote the xlsx mid-read. Both job agents also scraped the same 387 JDs (duplicate spend).
+
+- [x] `shared/run_lock.py` — exclusive flock on `logs/pathfinder.lock` per agent run; fail-fast naming holder, `PATHFINDER_LOCK_WAIT=1` queues; kernel-released on any exit
+- [x] Wired into all 4 agents' `__main__`; `run_pipeline_scheduled.sh` exports `PATHFINDER_LOCK_WAIT=1`
+- [x] `shared/excel_store.py` — `load_workbook_readonly` (BytesIO snapshot + 3-attempt retry) at all 17 read-only sites + 2 agent-local sites; `get_company_archive_info` → single `iter_rows` pass
+- [x] Tests +9 (lock contention/wait/release, snapshot survives truncation, retry heal, pipeline env export); full suite 1042 passed / 1 skipped
+- [x] Live check: held lock + real `python agents/job_agent.py` → immediate exit 1 with 🔒 holder message
+- [x] Docs: BUGS BUG-73 (P1), CHANGELOG, REQUIREMENTS v2.6 (REQ-151/152 §9.11), CLAUDE.md (structure + Running Agents note)
+- [ ] Follow-up (noted in BUG-73): remaining 16 read helpers still use O(rows²) per-cell access on read-only sheets — functional + snapshot-protected, rewrite to `iter_rows` if runs slow down
+
 ## Completed (2026-07-13): JD dedup + intern filter (BUG-71/72, user Excel review)
 - [x] Dedupe `Skipped JD`: removed 3 duplicate rows (Uber×2 LinkedIn tracking-param variants, Tesla×1 apply/slug variant); backup `pathfinder_dashboard.backup-20260713.xlsx`
 - [x] `shared/excel_store.py` — `canonical_jd_url()`; `get_triaged_jd_urls` returns canonical set; `batch_upsert_jd_records` indexes by canonical URL

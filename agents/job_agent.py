@@ -2478,4 +2478,9 @@ async def _main_inner(summary: RunSummary):
     print(f"📊 Results: {xlsx_path}")
 
 if __name__ == "__main__":
+    from shared.run_lock import acquire_run_lock, AgentAlreadyRunning
+    try:
+        _run_lock = acquire_run_lock("job_agent")
+    except AgentAlreadyRunning as e:
+        raise SystemExit(f"🔒 {e}")
     asyncio.run(main())

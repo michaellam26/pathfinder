@@ -2,10 +2,17 @@
 Shared Excel persistence layer — used by all three agents.
 All functions load → modify → save on each call (safe for single-process use).
 job_agent wraps writes in an asyncio.Lock to prevent concurrent corruption.
+Cross-process concurrency is handled by shared/run_lock.py (BUG-73): agent
+entry points take an exclusive flock so two agents never touch the file at
+once; read paths additionally snapshot the file (load_workbook_readonly) so
+an unlocked reader can never crash mid-stream.
 """
 import os
 import re
 import json
+import time
+import zipfile
+from io import BytesIO
 from datetime import datetime, date
 from urllib.parse import urlsplit, parse_qsl, urlencode
 import openpyxl
@@ -17,6 +24,28 @@ from shared.config import TRACK_ORDER
 # ── Path ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXCEL_PATH   = os.path.join(PROJECT_ROOT, "pathfinder_dashboard.xlsx")
+
+
+def load_workbook_readonly(xlsx_path: str):
+    """BUG-73: read-only loads go through an in-memory snapshot of the file.
+
+    load_workbook(path, read_only=True) streams lazily from the open handle;
+    openpyxl's wb.save() in another process truncates the file in place, so a
+    lazy reader dies mid-stream (EOFError deep in zipfile) minutes into a
+    run. Snapshotting first makes the read atomic — catching a writer
+    mid-save fails the zip open immediately instead, which we retry.
+    """
+    last_err = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.5)
+        try:
+            with open(xlsx_path, "rb") as fh:
+                data = fh.read()
+            return load_workbook(BytesIO(data), read_only=True)
+        except (zipfile.BadZipFile, EOFError, KeyError) as e:
+            last_err = e
+    raise last_err
 
 # ── Sheet headers ─────────────────────────────────────────────────────────────
 # PRJ-004 (D-09/D-15): "AI Domain" → "Track" (6-bucket taxonomy), "AI TPM Jobs"
@@ -269,7 +298,7 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
 
 # ── Company helpers ───────────────────────────────────────────────────────────
 def count_company_rows(xlsx_path: str = EXCEL_PATH) -> int:
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Company_List"]
         return sum(1 for r in range(2, ws.max_row + 1) if ws.cell(r, 1).value)
@@ -278,7 +307,7 @@ def count_company_rows(xlsx_path: str = EXCEL_PATH) -> int:
 
 
 def get_company_rows(xlsx_path: str = EXCEL_PATH) -> list:
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws   = wb["Company_List"]
         rows = []
@@ -296,7 +325,7 @@ def get_company_rows_with_row_num(xlsx_path: str = EXCEL_PATH) -> list[tuple[int
     excel_row_number is the actual 1-based row index in the sheet (2 = first data row).
     Use this when you need to write back to a specific row via update_company_career_url.
     """
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws   = wb["Company_List"]
         rows = []
@@ -341,7 +370,7 @@ def upsert_companies(xlsx_path: str, companies_data: list):
 
 def get_company_names_without_tpm(xlsx_path: str = EXCEL_PATH) -> set:
     """Return a set of company names from the Company_Without_TPM sheet."""
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         if "Company_Without_TPM" not in wb.sheetnames:
             return set()
@@ -375,7 +404,7 @@ def get_incomplete_company_rows(xlsx_path: str = EXCEL_PATH) -> list:
     Consumed by company_agent.run_reenrich_business_focus.
     Returns [{"excel_row", "name", "career_url"}].
     """
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Company_List"]
         out = []
@@ -462,7 +491,7 @@ def sort_company_list_by_track(xlsx_path: str = EXCEL_PATH) -> int:
 # ── Archive helpers (REQ-063) ────────────────────────────────────────────────
 def get_archived_companies(xlsx_path: str = EXCEL_PATH) -> set:
     """Return set of company names where Auto Archived == 'yes'."""
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Company_List"]
         headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
@@ -508,23 +537,30 @@ def unarchive_company(xlsx_path: str, company_name: str) -> None:
 
 
 def get_company_archive_info(xlsx_path: str = EXCEL_PATH) -> dict:
-    """Return {company_name: {"no_tpm_count": int, "archived": str}} for all companies."""
-    wb = load_workbook(xlsx_path, read_only=True)
+    """Return {company_name: {"no_tpm_count": int, "archived": str}} for all companies.
+
+    BUG-73: single iter_rows pass — per-cell random access on a read-only
+    sheet re-parses the sheet XML from row 1 on every call (O(rows²)).
+    """
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Company_List"]
-        headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-        cnt_col  = headers.get("No TPM Count")
-        arch_col = headers.get("Auto Archived")
+        rows = ws.iter_rows(values_only=True)
+        header = next(rows, None) or ()
+        cols = {h: i for i, h in enumerate(header)}
+        cnt_i  = cols.get("No TPM Count")
+        arch_i = cols.get("Auto Archived")
         result = {}
-        if not cnt_col or not arch_col:
+        if cnt_i is None or arch_i is None:
             return result
-        for r in range(2, ws.max_row + 1):
-            name = str(ws.cell(r, 1).value or "").strip()
+        for row in rows:
+            name = str((row[0] if row else None) or "").strip()
             if not name:
                 continue
-            raw_cnt = ws.cell(r, cnt_col).value
+            raw_cnt = row[cnt_i] if cnt_i < len(row) else None
             cnt = int(raw_cnt) if isinstance(raw_cnt, (int, float)) and raw_cnt else 0
-            arch = str(ws.cell(r, arch_col).value or "").strip().lower()
+            raw_arch = row[arch_i] if arch_i < len(row) else None
+            arch = str(raw_arch or "").strip().lower()
             result[name] = {"no_tpm_count": cnt, "archived": arch}
         return result
     finally:
@@ -590,7 +626,7 @@ def get_triaged_jd_urls(xlsx_path: str = EXCEL_PATH) -> set:
     pipeline must never re-scrape them or re-add them to JD_Tracker. Callers
     must canonicalize before membership tests (BUG-71). Missing tabs are
     tolerated."""
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         urls = set()
         c_url = _JD_COL["JD URL"]
@@ -610,7 +646,7 @@ def get_triaged_jd_urls(xlsx_path: str = EXCEL_PATH) -> set:
 def get_jd_urls(xlsx_path: str = EXCEL_PATH) -> list:
     """Return URLs that have been successfully extracted (company != N/A/empty).
     Incomplete records (failed Gemini extraction) are excluded so they get retried."""
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["JD_Tracker"]
         c_url = _JD_COL["JD URL"]
@@ -630,7 +666,7 @@ def get_jd_url_meta(xlsx_path: str = EXCEL_PATH) -> dict:
     """Returns {url: {"hash": str, "age_days": float, "title": str}} for valid, complete JD rows.
     Skips rows where company is N/A, empty, or JSON ERROR, OR where location/tech/resp are
     missing/None/N/A (incomplete records). Incomplete records must be re-processed."""
-    wb  = load_workbook(xlsx_path, read_only=True)
+    wb  = load_workbook_readonly(xlsx_path)
     try:
         ws  = wb["JD_Tracker"]
         c_url  = _JD_COL["JD URL"]
@@ -706,7 +742,7 @@ def get_jd_rows_for_match(xlsx_path: str = EXCEL_PATH) -> list:
     per-track prompt pair. Reconstructs a match-ready JSON string from columns.
     """
     import logging as _log
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws   = wb["JD_Tracker"]
         c_url   = _JD_COL["JD URL"]
@@ -854,7 +890,7 @@ def get_incomplete_jd_rows(xlsx_path: str = EXCEL_PATH) -> list:
     (location, tech_stack, or responsibilities are empty/N/A/None/JSON ERROR).
     These records should be retried regardless of whether their URL is known.
     """
-    wb  = load_workbook(xlsx_path, read_only=True)
+    wb  = load_workbook_readonly(xlsx_path)
     try:
         ws  = wb["JD_Tracker"]
         c_url  = _JD_COL["JD URL"]
@@ -897,7 +933,7 @@ def count_tpm_jobs_by_company(xlsx_path: str = EXCEL_PATH) -> dict:
     rows. "qualified" counts rows whose Job Domain is one of the 5 track values
     (under REQ-004-09 that is every successfully classified row).
     """
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws     = wb["JD_Tracker"]
         c_url = _JD_COL["JD URL"]
@@ -926,7 +962,7 @@ def count_valid_tpm_jobs_by_company(xlsx_path: str = EXCEL_PATH) -> dict:
     Used by REQ-063 archive logic: only non-failed records count toward
     determining whether a company has TPM jobs.
     """
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["JD_Tracker"]
         c_url = _JD_COL["JD URL"]
@@ -1246,7 +1282,7 @@ def sort_jd_tracker_by_tier(xlsx_path: str = EXCEL_PATH) -> int:
 # ── Match helpers ─────────────────────────────────────────────────────────────
 def get_match_pairs(xlsx_path: str = EXCEL_PATH) -> dict:
     """Returns {(resume_id, jd_url): {"score": int, "hash": str, "stage": str}}."""
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws    = wb["Match_Results"]
         pairs = {}
@@ -1414,7 +1450,7 @@ def get_scored_matches(xlsx_path: str = EXCEL_PATH,
         ats_coverage_percent, recruiter_score, hm_score,
       }
     """
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Match_Results"]
         # Dynamic column lookup so old workbooks (pre-PR 2 migration) still work.
@@ -1465,7 +1501,7 @@ def get_tailored_match_pairs(xlsx_path: str = EXCEL_PATH) -> dict:
     wrote the .md file. Empty string for legacy rows (before this column was
     added) — the optimizer treats empty as "no expected hash, safe to write".
     """
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         if "Tailored_Match_Results" not in wb.sheetnames:
             return {}

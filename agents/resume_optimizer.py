@@ -682,7 +682,7 @@ def _print_summary(xlsx_path: str, resume_id: str):
     if not pairs:
         return
 
-    from openpyxl import load_workbook
+    from shared.excel_store import load_workbook_readonly
     # BUG-50: dynamic column lookup instead of hardcoded indices
     col_rid      = TAILORED_HEADERS.index("Resume ID") + 1
     col_company  = TAILORED_HEADERS.index("Company") + 1
@@ -690,7 +690,7 @@ def _print_summary(xlsx_path: str, resume_id: str):
     col_original = TAILORED_HEADERS.index("Original Score") + 1
     col_tailored = TAILORED_HEADERS.index("Tailored Score") + 1
     col_delta    = TAILORED_HEADERS.index("Score Delta") + 1
-    wb = load_workbook(xlsx_path, read_only=True)
+    wb = load_workbook_readonly(xlsx_path)
     try:
         ws = wb["Tailored_Match_Results"]
         rows = []
@@ -743,4 +743,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     _FORCE_REWRITE = args.force_rewrite
+    from shared.run_lock import acquire_run_lock, AgentAlreadyRunning
+    try:
+        _run_lock = acquire_run_lock("resume_optimizer")
+    except AgentAlreadyRunning as e:
+        raise SystemExit(f"🔒 {e}")
     asyncio.run(main())

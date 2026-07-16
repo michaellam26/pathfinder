@@ -13,6 +13,11 @@ set -o pipefail
 PROJECT_DIR="${PATHFINDER_PROJECT_DIR:-/Users/michaelnomad/pathfinder}"
 cd "$PROJECT_DIR"
 
+# BUG-73: agents take an exclusive run lock (shared/run_lock.py). The pipeline
+# queues behind a lock holder instead of failing the daily run; manual runs
+# (no env var) fail fast with a message naming the holder.
+export PATHFINDER_LOCK_WAIT=1
+
 mkdir -p logs
 LOG_FILE="logs/pipeline-$(date +%Y%m%d-%H%M%S).log"
 

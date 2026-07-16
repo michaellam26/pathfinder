@@ -41,6 +41,7 @@ from shared.excel_store import (
     classify_location, sort_jd_tracker_by_tier, sort_company_list_by_track,
     get_triaged_jd_urls, TRIAGE_SHEETS, canonical_jd_url,
     get_incomplete_company_rows, update_company_business_focus,
+    load_workbook_readonly,
     COMPANY_HEADERS, JD_HEADERS, MATCH_HEADERS, TAILORED_HEADERS, _JD_COL,
 )
 import openpyxl
@@ -3246,6 +3247,60 @@ class TestSortCompanyListByTrack(unittest.TestCase):
         self.assertEqual((n1, n2), (6, 6))
         self.assertEqual(first, self._rows())
         self.assertEqual(count_company_rows(self.path), 6)
+
+
+class TestLoadWorkbookReadonlySnapshot(unittest.TestCase):
+    """BUG-73: read-only loads snapshot the file into memory, so another
+    process's wb.save() (truncate + rewrite in place) can never crash a
+    reader mid-stream with EOFError."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_reader_survives_file_truncation_mid_read(self):
+        wb = load_workbook_readonly(self.path)
+        try:
+            # Simulate a concurrent wb.save(): truncate the file in place
+            # while the read-only workbook is still open.
+            with open(self.path, "wb") as fh:
+                fh.write(b"")
+            ws = wb["Company_List"]
+            rows = list(ws.iter_rows(values_only=True))
+            self.assertEqual(rows[0][0], "Company Name")
+        finally:
+            wb.close()
+
+    def test_corrupt_file_raises_after_retries(self):
+        import zipfile
+        with open(self.path, "wb") as fh:
+            fh.write(b"not a zip file")
+        with unittest.mock.patch("shared.excel_store.time.sleep") as slept:
+            with self.assertRaises(zipfile.BadZipFile):
+                load_workbook_readonly(self.path)
+        self.assertEqual(slept.call_count, 2)  # 3 attempts, 2 backoffs
+
+    def test_transient_corruption_recovers_on_retry(self):
+        """A writer caught mid-save yields a bad zip once; the retry sees
+        the completed file and succeeds."""
+        with open(self.path, "rb") as fh:
+            good = fh.read()
+        with open(self.path, "wb") as fh:
+            fh.write(good[: len(good) // 2])  # half-written save
+
+        def _heal(_):
+            with open(self.path, "wb") as fh:
+                fh.write(good)
+
+        with unittest.mock.patch("shared.excel_store.time.sleep",
+                                 side_effect=_heal):
+            wb = load_workbook_readonly(self.path)
+        self.assertIn("Company_List", wb.sheetnames)
+        wb.close()
 
 
 if __name__ == "__main__":

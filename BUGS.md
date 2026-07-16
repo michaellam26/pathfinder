@@ -1,16 +1,16 @@
 # Bug Tracker
 
-> Last updated: 2026-07-13 (JD_Tracker review follow-up: BUG-71 duplicate JDs via URL variants, BUG-72 intern roles scraped — both fixed)
+> Last updated: 2026-07-16 (BUG-73 concurrent-run collision — manual job_agent vs still-running scheduled pipeline: EOFError crash + duplicate API spend; fixed with run lock + snapshot reads)
 
 ## Summary
 
 | Priority | Open | Fixed |
 |----------|------|-------|
 | P0 Critical | 0 | 7 (BUG-01~03, BUG-32~33, BUG-56, BUG-65) |
-| P1 High      | 0 | 17 (BUG-04~11, BUG-27~28, BUG-34~38, BUG-66~67) |
+| P1 High      | 0 | 18 (BUG-04~11, BUG-27~28, BUG-34~38, BUG-66~67, BUG-73) |
 | P2 Medium    | 0 | 28 (BUG-12~20, BUG-29~30, BUG-39~49, BUG-55, BUG-68~72) |
 | P3 Low       | 6 (BUG-57~61, BUG-63) | 14 (BUG-21~26, BUG-31, BUG-50~54, BUG-62, BUG-64) |
-| **Total** | **6** | **66** |
+| **Total** | **6** | **67** |
 
 ---
 
@@ -178,6 +178,7 @@
 |---|------|-------------|--------|
 | BUG-66 | `agents/job_agent.py` extract prompt + `_gate_and_finalize` (new) + `retry_one` | **India/Europe JDs leaked into JD_Tracker.** Three combined causes: (a) the extraction prompt said "Extract ALL **US** locations", so foreign JDs got a blank location the geo gate couldn't see (`if loc` guard skipped blank); (b) the geo gate ran only on the `generic` scraper label — Microsoft/Tesla/Google/Workday/prefetched paths skipped it (hence Microsoft-Bangalore, Tesla-Berlin rows); (c) `retry_one` bypassed ALL write-time gates. Fix: prompt now extracts ALL locations verbatim (incl. country); the gate block factored into `_gate_and_finalize()` and applied unconditionally on every staging path incl. retries; blank/unknown locations are kept (`Data Quality="partial"` review path) — only confirmed out-of-region rows drop. Dead legacy `_is_us*`/pycountry code removed (`classify_region` is the live filter). Note: retry/custom paths now also drop non-WA/CA/TX US rows per REQ-004-12 — intended tightening. | Fixed |
 | BUG-67 | `agents/job_agent.py` posted-date chain; `shared/excel_store.py` `get_incomplete_jd_rows` | **Posted Date blank for Microsoft/Zebra/Oracle rows.** Causes: posted date came exclusively from ATS list-API metadata (LLM is forbidden) — Microsoft/Google/Tesla are custom scrapers with `list_fn: None`, Oracle is unrouted (generic path); Zebra IS Workday but `retry_one` **wiped the existing Posted Date on every rewrite** (it never set `posted_date`); no HTML/JSON-LD date parsing existed. Fix: shared `_parse_jsonld_jobposting()` (consolidates 4 near-duplicate JSON-LD blocks) now reads `datePosted`; scrape-time dates stashed in `_JSONLD_DATE_BY_URL`; date chain = list-meta → scrape stash → one plain-GET JSON-LD fetch → Tavily backfill → keep+flag (never a drop); `_parse_workday_posted_on` handles "Just Posted"; `retry_one` preserves the sheet's existing Posted Date via `get_incomplete_jd_rows` (now returns `posted_date`/`date_flag`). Oracle Cloud Recruiting list adapter judged non-trivial → out of scope (JSON-LD/flag path covers it). | Fixed |
+| BUG-73 | `shared/run_lock.py` (new); `agents/*` entry points; `scripts/run_pipeline_scheduled.sh`; `shared/excel_store.py` `load_workbook_readonly` (new) | **Concurrent agent runs collide on `pathfinder_dashboard.xlsx` — no cross-process lock existed.** Observed 2026-07-16: the 04:00 scheduled pipeline ran ~6h (company-agent API retries); a manual 09:57 `job_agent` run overlapped it — both scraped the same 387 JDs (duplicate Gemini/Firecrawl spend), and when the pipeline's match agent saved the workbook (openpyxl `wb.save()` truncates + rewrites in place), the manual run's lazy `read_only` stream in `get_company_archive_info` died with `EOFError` deep in zipfile after 15 min of work. Concurrent writers also silently lose rows (last save wins). Fix: (1) `shared/run_lock.py` — every agent entry point takes an exclusive `flock` on `logs/pathfinder.lock` for the whole run; manual runs fail fast naming the holder (agent/pid/start), the pipeline exports `PATHFINDER_LOCK_WAIT=1` to queue instead; kernel releases flock on any exit, so no stale locks. (2) All read-only workbook loads snapshot the file into memory first (`load_workbook_readonly`: BytesIO + 3-attempt retry on a half-written zip) so even an unlocked reader can never crash mid-stream. (3) Crash site `get_company_archive_info` rewritten to a single `iter_rows` pass — per-cell random access on a read-only sheet re-parses the sheet XML from row 1 per call (O(rows²)); the other 16 read helpers share this pattern (functional, snapshot-protected, but slow) — follow-up candidate. | Fixed |
 
 ### P2 — Medium
 

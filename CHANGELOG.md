@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## 2026-07-16
+
+### Cross-process run lock + crash-proof workbook reads (BUG-73)
+
+A manual `job_agent` run collided with the still-running scheduled pipeline
+(6h long due to API retries): both scraped the same 387 JDs (duplicate
+Gemini/Firecrawl spend) and the manual run crashed with `EOFError` when the
+pipeline's match agent rewrote `pathfinder_dashboard.xlsx` mid-read.
+
+**Fixes**:
+- **Run lock (`shared/run_lock.py`)**: every agent entry point takes an
+  exclusive `flock` on `logs/pathfinder.lock` for the whole run. A second
+  agent fails fast with a message naming the holder (agent/pid/start time);
+  `PATHFINDER_LOCK_WAIT=1` queues instead — exported by
+  `run_pipeline_scheduled.sh` so pipeline phases never abort on contention.
+  The kernel drops the flock on any process exit, so crashes can't leave a
+  stale lock.
+- **Snapshot reads (`shared/excel_store.py:load_workbook_readonly`)**: all
+  read-only workbook loads (17 in excel_store + 2 agent-local) now read the
+  file bytes into memory first, so a concurrent writer can never crash a
+  reader mid-stream; a half-written file fails the zip open immediately and
+  is retried (3 attempts).
+- **`get_company_archive_info`** rewritten to a single `iter_rows` pass —
+  per-cell access on a read-only sheet re-parses the sheet XML per call
+  (O(rows²)). The other read helpers share the pattern (correct but slow);
+  noted in BUGS.md as a follow-up.
+
+**Tests**: +9 (lock contention/fail-fast/wait-mode/release, snapshot
+survival under truncation, retry-on-half-written-file, pipeline env export).
+Full suite 1042 passed / 1 skipped.
+
 ## 2026-07-13
 
 ### Job agent: canonical-URL dedup (BUG-71) + intern filter (BUG-72)

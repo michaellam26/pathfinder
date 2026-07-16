@@ -60,6 +60,7 @@ from shared.tavily_pool import build_pool_from_env as build_tavily_pool_from_env
 from shared.config import MODEL, TRACK_ORDER
 from shared.prompts import SECURITY_CLAUSE
 from shared.run_summary import RunSummary
+from shared.run_lock import acquire_run_lock, AgentAlreadyRunning
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -1443,6 +1444,10 @@ if __name__ == "__main__":
                              "into the 6-track taxonomy (REQ-004-06). "
                              "Run AFTER manually pruning Company_List.")
     args = parser.parse_args()
+    try:
+        _run_lock = acquire_run_lock("company_agent")
+    except AgentAlreadyRunning as e:
+        raise SystemExit(f"🔒 {e}")
     if args.migrate_tracks:
         migrate_tracks()
     else:
