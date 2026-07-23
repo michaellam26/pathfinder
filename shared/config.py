@@ -1,7 +1,7 @@
 """Shared configuration constants."""
 import os
 
-MODEL = "gemini-3.1-flash-lite"
+MODEL = "gemini-3.5-flash-lite"
 
 AUTO_ARCHIVE_THRESHOLD = 3  # consecutive no-TPM runs before auto-archiving a company
 

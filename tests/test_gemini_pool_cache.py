@@ -69,7 +69,7 @@ class TestCreateCache(unittest.TestCase):
     def test_create_cache_returns_none_on_unsupported_model(self):
         client = MagicMock()
         client.caches.create.side_effect = Exception(
-            "Model gemini-3.1-flash-lite does not support caching")
+            "Model gemini-3.5-flash-lite does not support caching")
         genai_mod = MagicMock()
         genai_mod.Client.return_value = client
         genai_mod.types = MagicMock()
